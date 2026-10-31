@@ -1,0 +1,26 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+const dir=fs.mkdtempSync(path.join(os.tmpdir(),'weibo-fixed-policy-'));
+process.env.WEIBO_CONSOLE_DATA_DIR=dir;process.env.WEIBO_CONSOLE_TOPIC_MODE='fixed';process.env.WEIBO_CONSOLE_LICENSE='off';
+const d=await import('../src/db.js');
+const {createSnapshot,validateSnapshot,TaskRunner}=await import('../src/runner.js');
+const {FIXED_TOPIC,COMMENT_SECTIONS,isFixedTopic}=await import('../public/topic-policy.js');
+test.after(()=>{d.db.close();fs.rmSync(dir,{recursive:true,force:true});});
+test('固定模式仅接受苏新皓真实页面ID，默认超like，历史配置不改写',()=>{
+  const account=d.createAccount();const fixed=d.createTopic(FIXED_TOPIC),other=d.createTopic({name:'苏新皓',url:'https://weibo.com/p/100808other'});
+  d.addCommentMaterials(['甲','乙']);
+  const input={accountIds:[account.id],actionPlan:[{type:'comment',count:1}]};
+  const snapshot=createSnapshot(input,d.listAccounts(),d.listTopics());
+  assert.deepEqual(snapshot.topicIds,[fixed.id]);assert.equal(snapshot.commentSection,'超like');assert.deepEqual(validateSnapshot(snapshot),[]);
+  assert.equal(COMMENT_SECTIONS.length,12);assert.ok(COMMENT_SECTIONS.includes('创作🫙'));
+  assert.equal(isFixedTopic({url:FIXED_TOPIC.url+'/super_index'}),true);assert.equal(isFixedTopic({url:FIXED_TOPIC.url.replace('weibo.com','weibo.com.evil.test')}),false);
+  assert.throws(()=>createSnapshot({...input,topicIds:[other.id]},d.listAccounts(),d.listTopics()),/仅支持苏新皓/);
+  assert.ok(validateSnapshot({...snapshot,commentSection:'不存在'}).some(e=>e.includes('分区')));
+  const old=d.createJob({...snapshot,topicIds:[other.id]});d.updateJob(old.id,{status:'paused',pausedByUser:true});
+  const before=d.getJob(old.id).config;const runner=new TaskRunner({});
+  assert.throws(()=>runner.resume(old.id),/苏新皓/);assert.throws(()=>runner.assertMaySubmit(old.id),/苏新皓/);
+  assert.deepEqual(d.getJob(old.id).config,before);
+});

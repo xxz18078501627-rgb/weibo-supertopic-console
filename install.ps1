@@ -1,0 +1,40 @@
+# 一键安装：确保 Node 24（缺失则下载便携包到 .runtime\），再交给 bootstrap.mjs。
+$ErrorActionPreference = "Stop"
+Set-Location -LiteralPath $PSScriptRoot
+
+$NodeVersion = if ($env:WEIBO_NODE_VERSION) { $env:WEIBO_NODE_VERSION } else { "v24.22.2" }
+
+function Test-NodeOk {
+  $command = Get-Command node -ErrorAction SilentlyContinue
+  if (-not $command) { return $false }
+  try {
+    $major = [int](& node -p "process.versions.node.split('.')[0]")
+    return $major -ge 24
+  } catch { return $false }
+}
+
+function Ensure-Node {
+  if (Test-NodeOk) { return }
+  $portable = Join-Path $PSScriptRoot ".runtime\node\node.exe"
+  if (Test-Path $portable) {
+    $env:PATH = (Join-Path $PSScriptRoot ".runtime\node") + ";" + $env:PATH
+    if (Test-NodeOk) { return }
+  }
+  $arch = if ([Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
+  $name = "node-$NodeVersion-win-$arch"
+  $url = "https://nodejs.org/dist/$NodeVersion/$name.zip"
+  Write-Host "未检测到 Node 24，正在下载便携版：$url"
+  New-Item -ItemType Directory -Force -Path (Join-Path $PSScriptRoot ".runtime") | Out-Null
+  $zip = Join-Path $PSScriptRoot ".runtime\node.zip"
+  Invoke-WebRequest -Uri $url -OutFile $zip
+  Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $PSScriptRoot ".runtime") -Force
+  $extracted = Join-Path $PSScriptRoot ".runtime\$name"
+  if (Test-Path (Join-Path $PSScriptRoot ".runtime\node")) { Remove-Item -Recurse -Force (Join-Path $PSScriptRoot ".runtime\node") }
+  Rename-Item -LiteralPath $extracted -NewName "node"
+  Remove-Item -Force $zip
+  $env:PATH = (Join-Path $PSScriptRoot ".runtime\node") + ";" + $env:PATH
+  if (-not (Test-NodeOk)) { throw "便携 Node 安装失败" }
+}
+
+Ensure-Node
+& node bootstrap.mjs install @args

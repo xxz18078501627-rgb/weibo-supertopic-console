@@ -1,0 +1,11 @@
+node_modules/
+data/
+.playwright-cli/
+test-results/
+work/
+outputs/
+*.log
+.DS_Store
+.runtime/
+dist/
+tools/

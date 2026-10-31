@@ -1,0 +1,32 @@
+{
+  "name": "weibo-super-topic-console",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "本地运行的微博超话多账号任务控制台",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test --test-reporter=spec tests/core.test.js tests/verification.test.js tests/network.test.js tests/topic-policy.test.js tests/license.test.js tests/packaging.test.js",
+    "test:e2e": "node --test tests/ui.e2e.test.js",
+    "token": "node scripts/show-token.mjs",
+    "license": "node scripts/make-license.mjs",
+    "doctor": "node bootstrap.mjs doctor",
+    "bootstrap": "node bootstrap.mjs install",
+    "update": "node bootstrap.mjs update",
+    "build:release": "node scripts/build-release.mjs",
+    "release": "node scripts/release.mjs",
+    "install-service": "node scripts/service.mjs install",
+    "uninstall-service": "node scripts/service.mjs uninstall"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "playwright": "^1.64.1",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@playwright/cli": "^0.1.22"
+  }
+}
