@@ -32,7 +32,7 @@ const { dailySuccess, startRound, finishRound, listRoundReports, pendingRoundRep
 const { buildLanAccess } = await import('../src/lan-access.js');
 const { notifyRound } = await import('../src/notifications.js');
 const { dailyStopStatus, deadlineFor, DailyStopError } = await import('../src/daily-stop.js');
-const { IdentityMismatchError, RateLimitError, UnsupportedPageError, VerificationError, WeiboAdapter, classifyPostReceipt, commentRowMatches, isRateLimitMessage, normalizeWeiboNickname, normalizeWeiboText, postReadbackMatches, visibleCommentMatches, weiboShortIdToNumeric } = await import('../src/weibo-adapter.js');
+const { BODY_READ_TIMEOUT_MS, IdentityMismatchError, RateLimitError, UnsupportedPageError, VerificationError, WeiboAdapter, classifyPostReceipt, commentRowMatches, isRateLimitMessage, normalizeWeiboNickname, normalizeWeiboText, postReadbackMatches, readJsonBounded, settleBounded, visibleCommentMatches, weiboShortIdToNumeric } = await import('../src/weibo-adapter.js');
 
 test.beforeEach(() => { clearAllDataForTests(); db.exec('DELETE FROM account_groups'); setSetting('task_defaults', defaultTaskConfig); setSetting('task_templates', []); });
 test('记录全天聚合、游标分页、异常去重与任务计数', async () => {
@@ -1381,4 +1381,58 @@ test('同日签到成功后不会被后续 uncertain 覆盖', async () => {
   recordCheckin(account.id, topic.id, '2026-10-29', 'uncertain');
   recordCheckin(account.id, topic.id, '2026-10-29', 'succeeded');
   assert.equal(getCheckin(account.id, topic.id, '2026-10-29').status, 'succeeded');
+});
+
+test('响应体读取有上限：永不返回的 body 不会挂住调用方', async () => {
+  const started = Date.now();
+  assert.equal(await readJsonBounded({ json: () => new Promise(() => {}) }, 40), null);
+  assert.ok(Date.now() - started < 2000);
+  assert.deepEqual(await readJsonBounded({ json: async () => ({ ok: 1 }) }, 40), { ok: 1 });
+  assert.equal(await readJsonBounded({ json: async () => { throw new Error('bad body'); } }, 40), null);
+  assert.equal(await readJsonBounded(null, 40), null);
+  assert.ok(Number.isFinite(BODY_READ_TIMEOUT_MS) && BODY_READ_TIMEOUT_MS > 0);
+  const waited = Date.now();
+  assert.equal(await settleBounded(new Set([new Promise(() => {})]), 50), true);
+  assert.ok(Date.now() - waited < 2000);
+  assert.equal(await settleBounded(new Set(), 50), false);
+});
+
+test('发帖兜底搜索遇到永不返回的响应体仍能完成并匹配到帖子', async () => {
+  const created = createAccount();
+  updateAccountAuth(created.id, { status: 'valid', uid: '1234567890', nickname: '测试账号' });
+  const account = getAccount(created.id);
+  const topic = createTopic({ name: '苏新皓超话', url: 'https://weibo.com/p/100808abcdef' });
+  const content = '苏新皓[超话]测试文案';
+  const post = { idstr: '5000000000000001', created_at: new Date().toISOString(), text_raw: content, user: { idstr: '1234567890' } };
+  const listeners = new Set();
+  const page = {
+    isClosed: () => false,
+    frames: () => [],
+    on(event, fn) { if (event === 'response') listeners.add(fn); },
+    off(event, fn) { if (event === 'response') listeners.delete(fn); },
+    context: () => ({ pages: () => [page], request: { get: async () => ({ ok: () => false, json: async () => null }) } }),
+    url: () => topic.url,
+    goto: async () => {
+      // A body that never settles (cancelled navigation / long-poll) must not
+      // park the fallback search, while a normal payload is still collected.
+      for (const fn of [...listeners]) fn({ url: () => 'https://weibo.com/ajax/feed/hung', json: () => new Promise(() => {}) });
+      for (const fn of [...listeners]) fn({ url: () => 'https://weibo.com/ajax/statuses/list', json: async () => ({ data: { list: [post] } }) });
+    },
+    getByText: () => ({ count: async () => 1, nth: () => ({ isVisible: async () => true, click: async () => {} }) }),
+    waitForTimeout: async () => {},
+    mouse: { wheel: async () => {} },
+    evaluate: async fn => {
+      const source = String(fn);
+      if (source.includes('querySelectorAll')) return [];
+      if (source.includes('statuses/show')) return { data: post };
+      return null;
+    }
+  };
+  const adapter = new WeiboAdapter({ page: async () => page });
+  adapter.ensureIdentity = async () => {};
+  const started = Date.now();
+  const result = await adapter.findPublishedPost(account, { content, topic, startedAt: new Date().toISOString() });
+  assert.ok(Date.now() - started < 15000, '兜底搜索不应被单个响应体卡死');
+  assert.equal(result.state, 'succeeded');
+  assert.equal(result.matchedPostId, '5000000000000001');
 });

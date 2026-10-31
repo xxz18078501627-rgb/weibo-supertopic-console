@@ -83,6 +83,39 @@ async function firstVisible(locators) {
   return null;
 }
 
+// Response bodies need a separate CDP round-trip (Network.getResponseBody).
+// Weibo occasionally leaves one pending for good - a request cancelled by a
+// navigation, or a long-poll stream - and Playwright does not time that call
+// out, so every body read carries its own ceiling.
+export const BODY_READ_TIMEOUT_MS = 2000;
+export async function readJsonBounded(response, milliseconds = BODY_READ_TIMEOUT_MS) {
+  if (!response) return null;
+  let timer;
+  const limit = Math.max(1, Number(milliseconds) || BODY_READ_TIMEOUT_MS);
+  const timeout = new Promise(resolve => { timer = setTimeout(() => resolve(null), limit); });
+  try {
+    const read = Promise.resolve().then(() => response.json()).catch(() => null);
+    return await Promise.race([read, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Wait for a batch of background body reads, but never longer than the
+// ceiling: one stuck response must not park the caller forever.
+export async function settleBounded(pending, milliseconds = 3000) {
+  if (!pending || !pending.size) return false;
+  let timer;
+  const limit = Math.max(1, Number(milliseconds) || 3000);
+  const all = Promise.allSettled([...pending]);
+  const timeout = new Promise(resolve => { timer = setTimeout(() => resolve('timeout'), limit); });
+  try {
+    return await Promise.race([all, timeout]) === 'timeout';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function hasVerificationChallenge(page) {
   const frames = page.frames?.() || [page];
   for (const frame of frames) {
@@ -258,7 +291,7 @@ export async function verifyPublishedPost(page, browserManager, values, { attemp
     if (background && (page.isClosed?.() || browserManager.context !== context)) break;
     if (!background) await detectChallenge(page, browserManager);
     const post = background ? await context.request.get(`https://weibo.com/ajax/statuses/show?id=${encodeURIComponent(values.receiptId)}`, { timeout: 2000 }).then(async response => {
-      const payload = response.ok() ? await response.json() : null;
+      const payload = response.ok() ? await readJsonBounded(response) : null;
       return payload?.data || payload;
     }).catch(() => null) : await readPost(page, values.receiptId);
     if (post) {
@@ -559,7 +592,7 @@ export class WeiboAdapter {
     const pending = new Set();
     const listener = response => {
       if (!response.url().startsWith('https://weibo.com/ajax/')) return;
-      const read = response.json().then(collect).catch(() => {});
+      const read = readJsonBounded(response).then(collect).catch(() => {});
       pending.add(read); read.finally(() => pending.delete(read));
     };
     page.on('response', listener);
@@ -570,7 +603,7 @@ export class WeiboAdapter {
       if (latest) await latest.click();
       for (let batch = 0; batch < 3; batch++) {
         await page.waitForTimeout(700);
-        await Promise.all([...pending]);
+        await settleBounded(pending, 3000);
         const links = await page.evaluate(uid => [...document.querySelectorAll('a[href]')].map(a => {
           try { const match = new URL(a.href).pathname.match(/^\/(\d+)\/([A-Za-z0-9]+)$/); return match?.[1] === uid ? match[2] : null; } catch { return null; }
         }).filter(Boolean), String(account.uid));
@@ -804,9 +837,10 @@ export class WeiboAdapter {
     const receiptEvents = [];
     const listener = async response => {
       if (response.request().method() !== 'POST' || !/^\/ajax\/(statuses|stopic)\/(update|create|add)$/.test(new URL(response.url()).pathname)) return;
-      const payload = await response.json().catch(() => null);
+      const payload = await readJsonBounded(response);
       const result = classifyPostReceipt(payload, response.ok());
       receiptEvents.push({ at: Date.now(), status: response.status(), code: payload?.error_code ?? payload?.code ?? null, kind: result.kind });
+      if (!payload) this.log('warning', `发帖回执内容读取超时：HTTP ${response.status()}，按未知结果继续`, { accountId: account.id, topicId: topic.id });
       this.log('info', `发帖回执 #${receiptEvents.length}：HTTP ${response.status()}，业务码 ${payload?.error_code ?? payload?.code ?? '无'}，分类 ${result.kind}`, { accountId: account.id, topicId: topic.id });
       latest = { response, payload, result };
       if (result.kind === 'succeeded' && !accepted) {
@@ -816,9 +850,15 @@ export class WeiboAdapter {
       }
     };
     const responseSource = page.context?.() || page;
-    const stopListening = () => responseSource.off('response', listener);
+    // Unsubscribe from both the response stream and the page's close event.
+    // Leaving the close hook behind leaked one listener per post.
+    const onClose = () => stopListening();
+    const stopListening = () => {
+      responseSource.off('response', listener);
+      page.off?.('close', onClose);
+    };
     responseSource.on('response', listener);
-    page.once('close', stopListening);
+    page.on('close', onClose);
     if (this.taskOwner() !== 'manual') {
       const cleanup = setTimeout(stopListening, Math.max(1, Number(intervalSeconds) * 1000));
       cleanup.unref?.();
@@ -842,6 +882,7 @@ export class WeiboAdapter {
       if (Date.now() >= until) break;
       await page.waitForTimeout(Math.min(100, Math.max(1, until - Date.now())));
     } while (true);
+    if (!latest) this.log('warning', '点击发送后未捕获发帖回执，改为只读核对是否已发布', { accountId: account.id, topicId: topic.id, url: page.url() });
     latest = accepted || latest;
     const outcome = { response: latest?.response };
     if (outcome.restrictionMessage && isMutedMessage(outcome.restrictionMessage)) throw new MutedError(outcome.restrictionMessage, 'post', Boolean(outcome.response));
@@ -1075,7 +1116,7 @@ export class WeiboAdapter {
     if (outcome.restrictionMessage && isMutedMessage(outcome.restrictionMessage)) throw new MutedError(outcome.restrictionMessage, 'comment', Boolean(outcome.response));
     if (outcome.restrictionMessage && isRateLimitMessage(outcome.restrictionMessage)) throw new RateLimitError(outcome.restrictionMessage, 'comment', Boolean(outcome.response));
     const response = outcome.response;
-    const payload = await response?.json().catch(() => null);
+    const payload = await readJsonBounded(response);
     const classification = classifyCommentReceipt(payload, Boolean(response?.ok()));
     if (response) {
       const code = String(payload?.error_code ?? payload?.code ?? payload?.data?.error_code ?? '无').replace(/[^\w-]/g, '').slice(0, 40);
