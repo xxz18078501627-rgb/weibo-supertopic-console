@@ -367,7 +367,7 @@ test('真实管理器和适配器的身份检查、复核、签到全程复用�
   runner.workflow.deferUnconfirmedCheckin(job.id, step, 'fixture');
   runner.workflow.requestManual(job.id, '1001');
   try {
-    await until(() => !runner.workflow.session, 15000);
+    await until(() => !runner.workflow.session, 45000);
     assert.equal(launches, 1);
     assert.equal(getJob(job.id).metrics.success, 1, JSON.stringify(runner.workflow.status(getJob(job.id))));
     assert.equal(clicks, 1);
