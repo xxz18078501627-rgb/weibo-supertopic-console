@@ -1724,8 +1724,13 @@ setInterval(() => {
     load({ keep: true }).catch(() => {});
 }, 30000);
 async function boot() {
-  const license = await fetch("/api/license/status").then((r) => r.json());
-  if (!license.activated) return showActivate();
+  // 旧版后端没有 /api/license/status（会返回 401/404）；此时不能把“接口不存在”
+  // 当成“未激活”，否则手机等新打开的页面会被错误地拦在激活页。
+  const licenseResponse = await fetch("/api/license/status");
+  if (licenseResponse.ok) {
+    const license = await licenseResponse.json();
+    if (!license.activated) return showActivate();
+  }
   const r = await fetch("/api/session"),
     s = await r.json();
   const params = new URLSearchParams(location.search);
