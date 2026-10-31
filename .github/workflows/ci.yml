@@ -9,7 +9,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        # 只跑 macOS。Windows runner 历史上容易抖（临时目录清理、等待时间），
+        # 见 8a662c9 / 42d84b6。需要临时验证 Windows 时，把 windows-latest 加回列表即可。
+        os: [macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
