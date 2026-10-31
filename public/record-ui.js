@@ -140,7 +140,6 @@ export function createRecordUI({ request, reload, date, filter, changed, toast =
     const jobs = latest?.jobs || [];
     const total = pageCount(jobs, PAGE.jobs);
     list.innerHTML = pageOf(jobs, pages.jobs, PAGE.jobs).map(job => jobRow(job, latest?.recordView?.jobCounts)).join("") || "<div class='empty'>当天没有任务记录。</div>";
-    if (!jobs.length && !latest?.recordView?.archived) list.innerHTML = "<div class='empty'>当天没有任务记录。</div>";
     section.querySelector(".panel-pager")?.remove();
     section.insertAdjacentHTML("beforeend", pagerHtml("jobs", pages.jobs, total));
     const count = document.querySelector("#record-job-count");

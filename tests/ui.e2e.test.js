@@ -783,6 +783,33 @@ test('记录页在1440×900 一屏内显示四宫格并分页', async () => {
     assert.equal(box.rows, 7);
     assert.equal(box.issues, 6);
     assert.equal(box.overflowX, false);
+    const jobsPanel = await page.evaluate(() => {
+      const list = document.querySelector('#job-list');
+      const panel = document.querySelector('#record-jobs');
+      const pager = document.querySelector('#record-jobs .panel-pager');
+      const style = getComputedStyle(list);
+      return {
+        overflowY: style.overflowY,
+        flexGrow: style.flexGrow,
+        display: style.display,
+        gap: style.rowGap,
+        panelBottom: Math.round(panel.getBoundingClientRect().bottom),
+        pagerBottom: Math.round(pager.getBoundingClientRect().bottom),
+        text: pager.querySelector('span').textContent.trim(),
+        prevDisabled: pager.querySelector('[data-pager-prev]').disabled,
+        nextDisabled: pager.querySelector('[data-pager-next]').disabled,
+        rows: document.querySelectorAll('#job-list .record-job').length
+      };
+    });
+    assert.equal(jobsPanel.display, 'flex', '任务明细列表应与其余面板同为 flex 列');
+    assert.equal(jobsPanel.flexGrow, '1', '任务明细列表应撑满面板剩余高度');
+    assert.equal(jobsPanel.overflowY, 'auto', '任务明细列表应可滚动');
+    assert.equal(jobsPanel.gap, 'normal', '任务明细不应保留工作台列表的 grid 间距');
+    assert.ok(jobsPanel.panelBottom - jobsPanel.pagerBottom >= 0 && jobsPanel.panelBottom - jobsPanel.pagerBottom < 24, '分页条应贴在面板底部，实际间距 ' + (jobsPanel.panelBottom - jobsPanel.pagerBottom));
+    assert.equal(jobsPanel.rows, 1);
+    assert.equal(jobsPanel.text, '1 / 1');
+    assert.equal(jobsPanel.prevDisabled, true);
+    assert.equal(jobsPanel.nextDisabled, true, '只有一个任务时不应出现可翻页状态');
     const pager = await page.locator('#record-accounts .panel-pager span').innerText();
     assert.match(pager, /^1 \/ \d+$/);
     assert.equal(await page.locator('#record-accounts [data-pager-prev]').isDisabled(), true);
@@ -800,6 +827,38 @@ test('记录页在1440×900 一屏内显示四宫格并分页', async () => {
     await page.locator('#record-archived:not(.hidden)').waitFor();
     assert.match(await page.locator('#record-archived').innerText(), /详细记录已按 10 天保留清理/);
     assert.equal(await page.locator('#record-grid').isHidden(), true);
+    await page.setViewportSize({ width: 375, height: 812 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  } finally { await page.close(); }
+});
+
+test('任务明细面板可翻页且与其余面板同构', async () => {
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const testDate = '2027-06-15';
+  const stamp = testDate + 'T12:00:00.000+08:00';
+  const db = new DatabaseSync(path.join(tempDir, 'console.sqlite'));
+  const insertJob = db.prepare('INSERT OR REPLACE INTO jobs(id,status,config_json,cursor_json,metrics_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)');
+  for (let i = 0; i < 7; i += 1) insertJob.run('e2e-jobs-page-' + i, 'completed', '{}', '{}', JSON.stringify({ success: i + 1 }), stamp, stamp);
+  db.close();
+  try {
+    await page.request.post('http://127.0.0.1:' + port + '/api/login', { data: { token } });
+    await page.goto('http://127.0.0.1:' + port);
+    await page.locator('#nav [data-page="logs"]').click();
+    await page.locator('#record-date').fill(testDate);
+    await page.locator('#record-date').dispatchEvent('change');
+    await page.locator('#job-list .record-job').first().waitFor();
+    await page.waitForFunction(() => document.querySelectorAll('#job-list .record-job').length === 5);
+    assert.equal((await page.locator('#record-jobs .panel-pager span').innerText()).trim(), '1 / 2');
+    assert.equal(await page.locator('#record-jobs [data-pager-prev]').isDisabled(), true);
+    assert.equal(await page.locator('#record-jobs [data-pager-next]').isDisabled(), false);
+    await page.locator('#record-jobs [data-pager-next]').click();
+    await page.waitForFunction(() => document.querySelectorAll('#job-list .record-job').length === 2);
+    assert.equal((await page.locator('#record-jobs .panel-pager span').innerText()).trim(), '2 / 2');
+    assert.equal(await page.locator('#record-jobs [data-pager-next]').isDisabled(), true);
+    await page.locator('#record-jobs [data-pager-prev]').click();
+    await page.waitForFunction(() => document.querySelectorAll('#job-list .record-job').length === 5);
+    assert.equal((await page.locator('#record-jobs .panel-pager span').innerText()).trim(), '1 / 2');
+    assert.equal(await page.locator('#job-list').evaluate(node => getComputedStyle(node).overflowY), 'auto');
     await page.setViewportSize({ width: 375, height: 812 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
   } finally { await page.close(); }
