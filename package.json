@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "本地运行的微博超话多账号任务控制台",
+  "repository": "https://github.com/xxz18078501627-rgb/weibo-supertopic-console",
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
