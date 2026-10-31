@@ -2,6 +2,7 @@
   "name": "weibo-super-topic-console",
   "version": "1.0.0",
   "private": true,
+  "license": "SEE LICENSE IN LICENSE",
   "type": "module",
   "description": "本地运行的微博超话多账号任务控制台",
   "repository": "https://github.com/xxz18078501627-rgb/weibo-supertopic-console",
