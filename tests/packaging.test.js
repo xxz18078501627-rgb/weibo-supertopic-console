@@ -46,4 +46,8 @@ test('打包剥离后只保留文案与配置', () => {
   }
 });
 
-test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+test.after(async () => {
+  await new Promise(resolve => setTimeout(resolve, 200));
+  try { db.db.close(); } catch {}
+  try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch {}
+});

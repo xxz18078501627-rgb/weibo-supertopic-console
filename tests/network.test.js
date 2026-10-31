@@ -14,7 +14,11 @@ const { WeiboAdapter, VerificationError } = await import('../src/weibo-adapter.j
 const runners = [];
 test.beforeEach(() => d.clearAllDataForTests());
 test.afterEach(() => { for (const runner of runners.splice(0)) runner.network.clear(); });
-test.after(() => { d.db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+test.after(async () => {
+  await new Promise(resolve => setTimeout(resolve, 500));
+  try { d.db.close(); } catch {}
+  try { fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch {}
+});
 const until = async predicate => { for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 10)); } throw Error('等待测试任务结束超时'); };
 function fixture(adapter = {}) {
   const account = d.createAccount('网络测试'); d.updateAccountAuth(account.id, { status: 'valid', uid: '1234567890' });

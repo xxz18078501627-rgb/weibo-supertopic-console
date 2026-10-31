@@ -117,7 +117,11 @@ test('可见验收窗口只首次前置且不最小化，普通任务仍无头',
   const normal = new BrowserManager(async ({ options }) => { calls.push(options); return context; }, { headless: true });
   await normal.page(account); assert.equal(calls[1].headless, true); await normal.close();
 });
-test.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+test.after(async () => {
+  await new Promise(resolve => setTimeout(resolve, 300));
+  try { dbModule.db.close(); } catch {}
+  try { fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch {}
+});
 
 const cutoff = Date.parse('2030-03-15T23:59:00+08:00');
 function cutoffFixture(actionPlan = [{ type: 'post', count: 1, intervalSeconds: 0 }]) {

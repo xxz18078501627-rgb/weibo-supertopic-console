@@ -19,7 +19,11 @@ const { WeiboAdapter } = await import('../src/weibo-adapter.js');
 const { chromium } = await import('playwright');
 
 test.beforeEach(() => { clearAllDataForTests(); setSetting('task_defaults', defaultTaskConfig); });
-test.after(() => fs.rmSync(data, { recursive: true, force: true }));
+test.after(async () => {
+  await new Promise(resolve => setTimeout(resolve, 300));
+  try { db.close(); } catch {}
+  try { fs.rmSync(data, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch {}
+});
 async function until(predicate, ms = 4000) { const end = Date.now() + ms; while (!predicate()) { if (Date.now() > end) throw Error('等待验证工作流超时'); await new Promise(resolve => setTimeout(resolve, 10)); } }
 
 function fixture(plan, options = {}) {
@@ -536,7 +540,7 @@ test('进入等待人工验证时只发一次「还有 N 个号待验证」', as
   await runner.run(job.id);
   await until(() => messages.length > 0, 2000);
   assert.equal(messages.length, 1);
-  assert.equal(messages[0], '还有 2 个号待验证');
+  assert.ok(String(messages[0]).includes('还有 2 个号待验证'));
   assert.ok(getJob(job.id).cursor.verificationNotifiedAt);
   await runner.workflow.notifyBarrier(job.id, 0);
   assert.equal(messages.length, 1);

@@ -8,7 +8,7 @@ process.env.WEIBO_CONSOLE_DATA_DIR=dir;process.env.WEIBO_CONSOLE_TOPIC_MODE='fix
 const d=await import('../src/db.js');
 const {createSnapshot,validateSnapshot,TaskRunner}=await import('../src/runner.js');
 const {FIXED_TOPIC,COMMENT_SECTIONS,isFixedTopic}=await import('../public/topic-policy.js');
-test.after(()=>{d.db.close();fs.rmSync(dir,{recursive:true,force:true});});
+test.after(()=>{try{d.db.close();}catch{}try{fs.rmSync(dir,{recursive:true,force:true,maxRetries:10,retryDelay:100});}catch{}});
 test('固定模式仅接受苏新皓真实页面ID，默认超like，历史配置不改写',()=>{
   const account=d.createAccount();const fixed=d.createTopic(FIXED_TOPIC),other=d.createTopic({name:'苏新皓',url:'https://weibo.com/p/100808other'});
   d.addCommentMaterials(['甲','乙']);
