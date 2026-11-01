@@ -6,7 +6,9 @@
 
 1. 从 GitHub Releases 下载 `weibo-console-<版本>.zip` 并解压。
 2. Mac：`bash install.sh`；Windows：`powershell -ExecutionPolicy Bypass -File install.ps1`。
-3. 打开 http://localhost:4178 ，粘贴管理员提供的**激活码**，再用管理员给的**访问口令**登录。
+3. 打开 http://localhost:4178 ，确认本地服务页面可访问；首次安装显示激活页即完成安装验收。
+
+安装仅准备本地运行环境、启动服务并配置开机自启，不包含扫码登录微博、创建任务或执行签到、发帖、评论。激活软件、输入访问口令、登录账号及运行任务由用户在安装完成后另行决定。
 
 安装脚本会自动准备便携 Node 24、依赖和浏览器；详细步骤与排障见 [INSTALL.md](INSTALL.md)，给 agent 的说明见 [AGENTS.md](AGENTS.md)。
 
