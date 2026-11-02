@@ -38,7 +38,7 @@ function run(command, args, { timeout = 180000, allowFailure = false } = {}) {
     child.stderr.on('data', chunk => { output += chunk; });
     const timer = setTimeout(() => { child.kill(); reject(new Error(`Timed out: ${command}\n${output}`)); }, timeout);
     child.once('error', error => { clearTimeout(timer); reject(error); });
-    child.once('close', code => {
+    child.once('exit', code => {
       clearTimeout(timer);
       if (code && !allowFailure) reject(new Error(`Exit ${code}: ${command} ${args.join(' ')}\n${output}`));
       else resolve({ code, output });
@@ -89,6 +89,7 @@ try {
   await checkPage();
   console.log('Scheduled task restart and health check passed');
 } catch (error) {
+  console.error('Smoke failure:', error.stack);
   console.error((await run('schtasks.exe', ['/Query', '/TN', env.WEIBO_CONSOLE_SERVICE_NAME, '/FO', 'LIST', '/V'], { allowFailure: true })).output);
   for (const name of ['service.log', 'service-error.log']) {
     const file = path.join(root, 'data', name);
@@ -96,7 +97,8 @@ try {
   }
   throw error;
 } finally {
-  await run(process.execPath, ['bootstrap.mjs', 'service', 'uninstall'], { allowFailure: true });
+  const uninstalled = await run(process.execPath, ['bootstrap.mjs', 'service', 'uninstall'], { allowFailure: true });
+  console.log('Uninstall:', uninstalled.output);
   let stopped = false;
   for (let attempt = 0; attempt < 50; attempt++) {
     try { await fetch(address, { signal: AbortSignal.timeout(300) }); }

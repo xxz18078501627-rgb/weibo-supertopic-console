@@ -72,9 +72,20 @@ function startupPath() {
 }
 
 function runWindowsLauncher(launcher) {
-  const child = spawn('wscript.exe', [launcher], { detached: true, stdio: 'ignore', windowsHide: true });
+  const child = spawn(nodeBin, [path.join(root, 'scripts', 'service-runner.mjs'), String(port), dataDir], { detached: true, stdio: 'ignore', windowsHide: true });
   child.on('error', error => { console.error('后台启动失败：' + error.message); process.exitCode = 1; });
   child.unref();
+}
+
+export function windowsTaskXml(launcher, sid) {
+  const esc = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+  return `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${esc(sid)}</UserId></LogonTrigger></Triggers>
+<Principals><Principal id="Author"><UserId>${esc(sid)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
+<Actions Context="Author"><Exec><Command>${esc(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe'))}</Command><Arguments>${esc('"' + launcher + '"')}</Arguments><WorkingDirectory>${esc(root)}</WorkingDirectory></Exec></Actions>
+</Task>`;
 }
 
 async function stopWindows() {
@@ -131,7 +142,11 @@ async function install() {
     let scheduled = false;
     if (process.env.WEIBO_CONSOLE_SERVICE_MODE !== 'startup') {
       try {
-        execFileSync('schtasks.exe', ['/Create', '/F', '/SC', 'ONLOGON', '/TN', taskName, '/TR', `wscript.exe "${launcher}"`], { stdio: 'pipe' });
+        const identity = execFileSync('whoami.exe', ['/user', '/fo', 'csv', '/nh'], { encoding: 'utf8' }).match(/S-1-[\d-]+/);
+        if (!identity) throw new Error('无法确定当前用户 SID');
+        const xmlFile = path.join(dataDir, 'service-task.xml');
+        fs.writeFileSync(xmlFile, Buffer.from('\uFEFF' + windowsTaskXml(launcher, identity[0]), 'utf16le'));
+        execFileSync('schtasks.exe', ['/Create', '/F', '/TN', taskName, '/XML', xmlFile], { stdio: 'pipe' });
         scheduled = true;
       } catch { console.log('无法创建计划任务，改用当前用户的登录启动文件夹（无需管理员权限）。'); }
     }

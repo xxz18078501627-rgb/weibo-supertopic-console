@@ -1,4 +1,4 @@
-# 一键安装：确保 Node 24（缺失则下载便携包到 .runtime\），再交给 bootstrap.mjs。
+﻿# 一键安装：确保 Node 24（缺失则下载便携包到 .runtime\），再交给 bootstrap.mjs。
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -33,7 +33,11 @@ function Ensure-Node {
   $checksumLine = $checksums -split "`n" | Where-Object { $_.TrimEnd().EndsWith("  $name.zip") } | Select-Object -First 1
   if (-not $checksumLine) { throw "Node 校验清单中没有 $name.zip" }
   $expectedHash = ($checksumLine -split '\s+')[0]
-  if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expectedHash.ToLowerInvariant()) { throw "Node 下载校验失败，请重新安装" }
+  $stream = [IO.File]::OpenRead($zip)
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try { $actualHash = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace("-", "").ToLowerInvariant() }
+  finally { $stream.Dispose(); $sha.Dispose() }
+  if ($actualHash -ne $expectedHash.ToLowerInvariant()) { throw "Node 下载校验失败，请重新安装" }
   Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $PSScriptRoot ".runtime") -Force
   $extracted = Join-Path $PSScriptRoot ".runtime\$name"
   if (Test-Path (Join-Path $PSScriptRoot ".runtime\node")) { Remove-Item -Recurse -Force (Join-Path $PSScriptRoot ".runtime\node") }
