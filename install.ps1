@@ -1,5 +1,7 @@
 # 一键安装：确保 Node 24（缺失则下载便携包到 .runtime\），再交给 bootstrap.mjs。
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Set-Location -LiteralPath $PSScriptRoot
 
 $NodeVersion = if ($env:WEIBO_NODE_VERSION) { $env:WEIBO_NODE_VERSION } else { "v24.22.2" }

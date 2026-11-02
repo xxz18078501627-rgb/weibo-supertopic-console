@@ -89,6 +89,7 @@ try {
   await checkPage();
   console.log('Scheduled task restart and health check passed');
 } catch (error) {
+  console.error((await run('schtasks.exe', ['/Query', '/TN', env.WEIBO_CONSOLE_SERVICE_NAME, '/FO', 'LIST', '/V'], { allowFailure: true })).output);
   for (const name of ['service.log', 'service-error.log']) {
     const file = path.join(root, 'data', name);
     if (fs.existsSync(file)) console.error(name + '\n' + fs.readFileSync(file, 'utf8'));

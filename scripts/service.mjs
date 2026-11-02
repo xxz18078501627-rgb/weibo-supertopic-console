@@ -137,13 +137,14 @@ async function install() {
     }
     if (scheduled) {
       try { execFileSync('schtasks.exe', ['/End', '/TN', taskName], { stdio: 'ignore' }); } catch {}
-      execFileSync('schtasks.exe', ['/Run', '/TN', taskName], { stdio: 'inherit' });
       if (fs.existsSync(startupPath())) fs.unlinkSync(startupPath());
     } else {
       fs.mkdirSync(path.dirname(startupPath()), { recursive: true });
       fs.copyFileSync(launcher, startupPath());
-      runWindowsLauncher(launcher);
     }
+    // Start in the installer's user session; ONLOGON handles future logins.
+    // A task can be registered even when no interactive logon token is present.
+    runWindowsLauncher(launcher);
     const pid = await waitHealthy(previous);
     console.log(`已安装登录自启${scheduled ? '计划任务' : '启动文件'}：${taskName}，PID ${pid}`);
     console.log(`控制台地址：http://localhost:${port}`);
@@ -207,8 +208,7 @@ export async function main() {
       const domain = `gui/${process.getuid()}`;
       execFileSync('/bin/launchctl', ['kickstart', '-k', `${domain}/${label}`]);
     } else if (process.platform === 'win32') {
-      if (fs.existsSync(startupPath())) runWindowsLauncher(windowsLauncher());
-      else execFileSync('schtasks.exe', ['/Run', '/TN', taskName], { stdio: 'inherit' });
+      runWindowsLauncher(windowsLauncher());
     }
     const pid = await waitHealthy(previous);
     console.log('服务已重启，PID ' + pid);

@@ -53,7 +53,7 @@
 
 Release 同时提供 `weibo-console-1.0.1.manifest.json`，其中包含安装包大小与 SHA256。Mac 可运行 `shasum -a 256 weibo-console-1.0.1.zip`，Windows 可运行 `Get-FileHash .\weibo-console-1.0.1.zip -Algorithm SHA256`，与 manifest 中的 `sha256` 对照。
 
-本次自动化验证环境为 macOS / Node 24 / Google Chrome，未做 Windows 实机验收；Windows 安装入口保持兼容。
+原始 v1.0.1 发布时仅验证 macOS / Node 24 / Google Chrome；此次 Windows 修订与验收范围见下节。
 
 ## 2026-11-02：v1.0.1 同版本修复（已装旧包的 Windows 用户）
 
