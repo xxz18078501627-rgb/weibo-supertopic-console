@@ -85,7 +85,7 @@ function run(command, args, options = {}) {
 
 function checkLogs({ root, data }) {
   const result = JSON.parse(fs.readFileSync(path.join(data, 'service.log'), 'utf8').trim());
-  assert.equal(fs.realpathSync(result.cwd), fs.realpathSync(root));
+  assert.equal(fs.realpathSync.native(result.cwd), fs.realpathSync.native(root));
   assert.equal(result.port, '54321');
   assert.equal(result.data, data);
   assert.equal(result.showToken, '0');
