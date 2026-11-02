@@ -12,6 +12,10 @@ const source = path.resolve(import.meta.dirname, '..');
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'weibo-install-'));
 const root = path.join(temp, "中文 user's workspace", 'weibo-supertopic-console-main');
 const env = { ...process.env, WEIBO_CONSOLE_SERVICE_NAME: `WeiboConsoleSmoke-${process.pid}`, WEIBO_CONSOLE_NOTIFY: 'off' };
+// Force the no-Node path as well: the installer must download portable Node.
+for (const name of Object.keys(env).filter(name => name.toLowerCase() === 'path')) {
+  env[name] = env[name].split(path.delimiter).filter(folder => !fs.existsSync(path.join(folder.replace(/^"|"$/g, ''), 'node.exe'))).join(path.delimiter);
+}
 // Test the shipped defaults: activation must remain enabled.
 delete env.WEIBO_CONSOLE_LICENSE;
 delete env.WEIBO_CONSOLE_DATA_DIR;
@@ -57,6 +61,12 @@ try {
   const installed = await run('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(root, 'install.ps1')]);
   console.log(installed.output);
   assert.equal(installed.code, 0);
+  assert.ok(fs.existsSync(path.join(root, '.runtime', 'node', 'node.exe')));
+  if (env.WEIBO_CONSOLE_SERVICE_MODE === 'startup') {
+    assert.ok(fs.existsSync(path.join(env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', `${env.WEIBO_CONSOLE_SERVICE_NAME}.vbs`)));
+  } else {
+    await run('schtasks.exe', ['/Query', '/TN', env.WEIBO_CONSOLE_SERVICE_NAME]);
+  }
   await checkPage();
   const { chromium } = await import(pathToFileURL(path.join(root, 'node_modules', 'playwright', 'index.mjs')));
   const { config } = await import(pathToFileURL(path.join(root, 'src', 'config.js')));

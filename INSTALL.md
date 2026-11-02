@@ -55,6 +55,20 @@ Release 同时提供 `weibo-console-1.0.1.manifest.json`，其中包含安装包
 
 本次自动化验证环境为 macOS / Node 24 / Google Chrome，未做 Windows 实机验收；Windows 安装入口保持兼容。
 
+## 2026-11-02：v1.0.1 同版本修复（已装旧包的 Windows 用户）
+
+本次保持版本号 1.0.1，重新发布 ZIP 和 SHA256。旧包中的更新器遇到相同版本会直接退出，因此旧包上运行 `update` 或加 `--force` 均不能取得修复。
+
+1. 从 v1.0.1 Release 重新下载 `weibo-console-1.0.1.zip`，解压到临时目录。
+2. 如旧工作台仍能打开，先安全暂停任务并结束扫码及人工验证。关闭原前台终端中的服务；若为后台进程，先由 agent 核对其安装目录和空闲状态，再安全停止，不直接强制终止其他程序。
+3. 将新包的程序文件复制到**原安装目录**。必须排除 `data/`、`node_modules/`、`.runtime/` 和 `.git/`；不要把新包的种子数据库覆盖到旧 `data/`，也不要另开一份安装后误以为原账号丢失。
+4. 在原目录运行 `powershell -ExecutionPolicy Bypass -File install.ps1`。脚本会补齐依赖并安装自启；计划任务权限不足时自动使用当前用户的登录启动文件夹，无需管理员权限。
+5. 确认 http://localhost:4178 可访问。已有激活状态和登录目录保留，不需要重新激活、扫码或执行任务来验收。
+
+如使用便携 Node、在新终端中找不到 `node` 命令，可用 `.\.runtime\node\node.exe bootstrap.mjs doctor` 等同运行维护命令。修订版支持 `node bootstrap.mjs update --force` 重装相同版本，但此选项不适用于尚未替换程序文件的旧版更新器。
+
+Windows CI 使用真实 Windows runner 验证便携 Node 下载、依赖安装、两种登录自启方式、浏览器激活页及服务重启/卸载；不代表对所有用户电脑、杀毒软件和网络环境逐一验收。
+
 ## 卸载
 
 - 关掉自启：`node bootstrap.mjs service uninstall`

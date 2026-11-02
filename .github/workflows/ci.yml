@@ -15,6 +15,9 @@ jobs:
       - run: npm ci
       - run: node --test tests/service.test.js
       - run: node tests/windows-install.smoke.mjs
+      - run: node tests/windows-install.smoke.mjs
+        env:
+          WEIBO_CONSOLE_SERVICE_MODE: startup
 
   test:
     strategy:

@@ -2,7 +2,7 @@
 
 这是一个只在本机运行的控制台。它使用独立 Chrome 登录目录管理多个微博账号，并按“轮次 → 超话 → 账号 → 操作段”的顺序串行执行签到、文字发帖和评论。
 
-当前版本：**v1.0.1**（2026-11-02）。本次更新改进发布结果识别、人工验证、页面故障恢复与统计展示；完整变更、兼容性及接口说明见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本：**v1.0.1 Windows 修订版**（2026-11-02，同版本替换下载包）。修复 Windows 依赖安装、后台启动、健康检查和重启，保留此前发布结果识别、人工验证、页面恢复与统计改进；完整变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 安装（Mac / Windows 通用）
 
@@ -35,7 +35,7 @@ node bootstrap.mjs doctor          # 体检：Node / 依赖 / 浏览器 / 端口
 node bootstrap.mjs service install # 开机自启（Mac launchd / Windows 计划任务）
 ```
 
-从 v1.0.0 更新后，首次启动会自动补充数据库字段并迁移旧的待验证展示状态，无需重新添加账号或扫码登录。请先在页面安全暂停当前任务，再更新；安装与升级细节见 [INSTALL.md](INSTALL.md)。
+从 v1.0.0 更新后，首次启动会自动补充数据库字段并迁移旧的待验证展示状态，无需重新添加账号或扫码登录。请先在页面安全暂停当前任务，再更新。已下载旧 v1.0.1 的用户需重新下载修订包，按 [INSTALL.md](INSTALL.md) 的“同版本修复”步骤在原目录替换程序；旧更新器会跳过同版本，直接执行 update 不会取得本次修复。
 
 ## 开发
 
@@ -93,7 +93,7 @@ npm run token
 安装脚本默认安装自启；也可手动：
 
 ```bash
-npm run install-service     # Mac: launchd；Windows: 计划任务
+npm run install-service     # Mac: launchd；Windows: 计划任务，权限不足时改用当前用户启动文件夹
 npm run uninstall-service
 ```
 
@@ -114,4 +114,4 @@ npm test
 npm run test:e2e
 ```
 
-测试使用临时数据和模拟微博页面，不需要真实账号。当前 GitHub CI 在 macOS / Node 24 上运行单元测试；端到端测试目前使用 macOS 的 Google Chrome 路径。本次发布不包含 Windows 实机验收。
+测试使用临时数据和模拟微博页面，不需要真实账号。GitHub CI 运行 macOS / Node 24 单元测试，以及 Windows 原生服务测试和全新安装验收：中文及空格目录、便携 Node、依赖安装、计划任务与当前用户启动文件夹、浏览器激活页、重启和卸载。端到端任务测试使用 macOS Google Chrome 与模拟微博页面；安装验收不使用真实微博账号。

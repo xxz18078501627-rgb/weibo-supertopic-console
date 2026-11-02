@@ -145,7 +145,7 @@ async function install() {
       runWindowsLauncher(launcher);
     }
     const pid = await waitHealthy(previous);
-    console.log(`已安装登录自启任务：${taskName}，PID ${pid}`);
+    console.log(`已安装登录自启${scheduled ? '计划任务' : '启动文件'}：${taskName}，PID ${pid}`);
     console.log(`控制台地址：http://localhost:${port}`);
     return;
   }
