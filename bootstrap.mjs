@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync, spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
+const root = fs.realpathSync.native(path.dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.WEIBO_CONSOLE_DATA_DIR || path.join(root, 'data');
 const port = Number(process.env.WEIBO_CONSOLE_PORT || 4178);
 const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';

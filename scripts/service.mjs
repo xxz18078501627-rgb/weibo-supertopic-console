@@ -6,7 +6,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { controlService } from './service-control.mjs';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const root = fs.realpathSync.native(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
 const label = 'com.local.weibo-super-topic-console';
 const taskName = process.env.WEIBO_CONSOLE_SERVICE_NAME || 'WeiboSupertopicConsole';
 const port = Number(process.env.WEIBO_CONSOLE_PORT || 4178);
@@ -71,7 +71,7 @@ function startupPath() {
   return path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', `${taskName}.vbs`);
 }
 
-function runWindowsLauncher(launcher) {
+function startWindowsRunner() {
   const child = spawn(nodeBin, [path.join(root, 'scripts', 'service-runner.mjs'), String(port), dataDir], { detached: true, stdio: 'ignore', windowsHide: true });
   child.on('error', error => { console.error('后台启动失败：' + error.message); process.exitCode = 1; });
   child.unref();
@@ -159,7 +159,7 @@ async function install() {
     }
     // Start in the installer's user session; ONLOGON handles future logins.
     // A task can be registered even when no interactive logon token is present.
-    runWindowsLauncher(launcher);
+    startWindowsRunner();
     const pid = await waitHealthy(previous);
     console.log(`已安装登录自启${scheduled ? '计划任务' : '启动文件'}：${taskName}，PID ${pid}`);
     console.log(`控制台地址：http://localhost:${port}`);
@@ -223,7 +223,8 @@ export async function main() {
       const domain = `gui/${process.getuid()}`;
       execFileSync('/bin/launchctl', ['kickstart', '-k', `${domain}/${label}`]);
     } else if (process.platform === 'win32') {
-      runWindowsLauncher(windowsLauncher());
+      windowsLauncher();
+      startWindowsRunner();
     }
     const pid = await waitHealthy(previous);
     console.log('服务已重启，PID ' + pid);
@@ -231,4 +232,4 @@ export async function main() {
   else { console.error('用法：node scripts/service.mjs install|uninstall|status|restart'); process.exit(1); }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();
+if (process.argv[1] && fs.realpathSync.native(process.argv[1]) === fs.realpathSync.native(fileURLToPath(import.meta.url))) await main();

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const root = fs.realpathSync.native(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
 const dataDir = process.argv[3] || process.env.WEIBO_CONSOLE_DATA_DIR || path.join(root, 'data');
 const runtime = path.join(dataDir, 'service-runtime.json');
 fs.mkdirSync(dataDir, { recursive: true });

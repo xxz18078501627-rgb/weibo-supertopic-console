@@ -149,7 +149,9 @@ test('真实服务通过私有控制通道安全退出，激活保持启用且�
     assert.equal(await controlService(data, root, runtime.childPid + 1), null);
     const refused = await fetch(`http://127.0.0.1:${runtime.controlPort}/stop`, { method: 'POST', headers: { Authorization: 'Bearer wrong' } });
     assert.equal(refused.status, 403);
-    assert.equal((await controlService(data, root, runtime.childPid)).ok, true);
+    const alias = path.join(data, 'project-link');
+    fs.symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    assert.equal((await controlService(data, alias, runtime.childPid)).ok, true);
     assert.equal(await exited, 0);
     assert.equal(fs.existsSync(path.join(data, 'service-runtime.json')), false);
   } finally {
