@@ -226,17 +226,31 @@ test('超时边缘才读出验证码回执，人工随后出现成功提示仍�
   const delayBody = response => {
     if (new URL(response.url()).pathname !== '/ajax/statuses/update') return;
     const read = response.json.bind(response);
-    response.json = async () => { await new Promise(resolve => setTimeout(resolve, 180)); return read(); };
+    // Hold an admitted response until the collector actually expires. Fixed
+    // 80/180ms sleeps could expire before Chrome had even sent the request.
+    response.json = async () => {
+      while (page.context().listenerCount('response') > baselineListeners) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      return read();
+    };
   };
   page.context().on('response', delayBody);
+  const baselineListeners = page.context().listenerCount('response');
+  const receiptSaved = Promise.withResolvers();
   const adapter = new WeiboAdapter({ page: async () => page, context: page.context() });
   adapter.ensureIdentity = async () => {};
   try {
     await assert.rejects(adapter.withChallengeMode('manual', () => adapter.post({ id: 'fixture', uid: '1001' },
       { name: '苏新皓', url: 'https://weibo.com/p/100808fixture' }, '本次正文',
-      { receiptTimeoutMs: 80, onReceipt: receipt => receipts.push(receipt) })), error => error.code === 'verification_required');
+      { receiptTimeoutMs: 1000, onReceipt: receipt => { receipts.push(receipt); receiptSaved.resolve(); } })), error => error.code === 'verification_required');
     await page.evaluate(() => { const notice = document.createElement('div'); notice.setAttribute('role', 'status'); notice.textContent = '发布成功'; document.body.append(notice); });
-    await page.waitForTimeout(300);
+    let saveTimer;
+    try {
+      await Promise.race([receiptSaved.promise, new Promise((_, reject) => {
+        saveTimer = setTimeout(() => reject(new Error('人工验证后的成功提示未保存')), 5000);
+      })]);
+    } finally { clearTimeout(saveTimer); }
     assert.equal(receipts.length, 1); assert.equal(receipts[0].successSource, 'page_notice');
     assert.equal(await page.evaluate(() => window.sendClicks), 1);
   } finally { await adapter.manualPostReceipt?.stop(); page.context().off('response', delayBody); await page.close(); }
@@ -298,6 +312,7 @@ test('网络三态提示、状态乱序、前台重同步及实时断线后的�
     await page.goto(`http://127.0.0.1:${port}`);
     await page.locator('#run-detail').waitFor();
     assert.match(await page.locator('#run-detail').innerText(), /网络中断/);
+    await page.waitForFunction(() => typeof window.testEvents?.onerror === 'function');
     job.status = 'running'; job.wait_reason = null;
     job.cursor.networkRecovery = { state: 'online', probeState: 'unknown', lastCheckedAt: stamp, lastProbe: { code: 'PROBE_CONTEXT_CHANGED' } };
     payload = { ...payload, stateVersion: 1001 };

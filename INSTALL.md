@@ -10,13 +10,13 @@
 
 ## Mac
 
-1. 下载并解压 `weibo-console-<版本>.zip`。
+1. 从 GitHub Releases 下载并解压 `weibo-console-1.0.1.zip`。
 2. 打开「终端」，`cd` 到解压出来的目录。
 3. 运行：`bash install.sh`
 
 ## Windows
 
-1. 下载并解压 `weibo-console-<版本>.zip`。
+1. 从 GitHub Releases 下载并解压 `weibo-console-1.0.1.zip`。
 2. 在解压目录空白处按住 Shift 右键 →「在此处打开 PowerShell 窗口」。
 3. 运行：`powershell -ExecutionPolicy Bypass -File install.ps1`
 
@@ -37,10 +37,22 @@
 
 ## 常见问题
 
-- **端口 4178 被占用**：说明已经有一份在跑，直接打开 http://localhost:4178 即可。
-- **页面打不开**：`node bootstrap.mjs doctor` 看哪项不通过；缺浏览器会自动装 Chromium。
+- **端口 4178 被占用**：先确认是否为已有工作台；若是，直接打开 http://localhost:4178 ，不要停止现有任务。若为其他程序，另设端口。
+- **页面打不开**：`node bootstrap.mjs doctor` 看哪项不通过；可用 `node bootstrap.mjs doctor --fix` 修复依赖或安装缺少的浏览器。
 - **手机打开不了**：确认同一 Wi-Fi；点页面右上角「手机访问」扫码。
 - **更新**：`node bootstrap.mjs update`（账号、文案、激活状态都会保留）。
+
+## 从 v1.0.0 升级到 v1.0.1
+
+1. 在页面中安全暂停正在执行的任务，结束扫码或人工验证会话。
+2. 在原安装目录运行 `node bootstrap.mjs update --check` 确认最新版本，再运行 `node bootstrap.mjs update`。
+3. 服务重新启动后刷新页面。更新保留原 `data/`，账号、文案、任务、激活状态和浏览器登录目录无需重建；首次启动会自动补充数据库结构并迁移旧的待验证记录。手动暂停的任务由你决定何时继续。
+
+新版本会把“待验证”与“待核对”分开计数；普通发帖、评论结果不明确时保留待核对并继续后续步骤，不自动重发。人工验证时仍会观察本次提交的成功结果。详细变化见 [CHANGELOG.md](CHANGELOG.md)。
+
+Release 同时提供 `weibo-console-1.0.1.manifest.json`，其中包含安装包大小与 SHA256。Mac 可运行 `shasum -a 256 weibo-console-1.0.1.zip`，Windows 可运行 `Get-FileHash .\weibo-console-1.0.1.zip -Algorithm SHA256`，与 manifest 中的 `sha256` 对照。
+
+本次自动化验证环境为 macOS / Node 24 / Google Chrome，未做 Windows 实机验收；Windows 安装入口保持兼容。
 
 ## 卸载
 

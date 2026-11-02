@@ -12,7 +12,8 @@ const target = process.argv[2] || path.join(root, 'dist', 'seed', 'console.sqlit
 
 const CLEAR = [
   'accounts', 'account_groups', 'account_restrictions', 'jobs', 'action_logs', 'system_logs',
-  'checkins', 'comment_history', 'task_step_state', 'task_rounds', 'verification_cards', 'daily_stats'
+  'checkins', 'comment_history', 'task_step_state', 'task_rounds', 'verification_cards', 'daily_stats',
+  'post_result_repairs'
 ];
 const DROP_SETTINGS = ['account_deletion_v3', 'last_comment_material_id', 'last_comment_text', 'retention_v1'];
 const KEEP_TABLES = ['post_materials', 'comment_materials', 'shared_post_materials', 'topics'];

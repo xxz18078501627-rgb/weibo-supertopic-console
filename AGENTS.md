@@ -48,4 +48,14 @@
 
 ## 发布（仅维护者）
 
-`npm run build:release` 生成 `dist/weibo-console-<version>.zip`（内含干净种子库）；`npm run release -- --bump patch --notes "..."` 打 tag 并用 `gh` 上传 Release。
+版本变更与兼容性说明统一维护在 `CHANGELOG.md`，并同步 README、INSTALL 与 GitHub Release。正式发布按以下顺序执行：
+
+1. 保存当前改动，整合远端最新 `main`，不要覆盖已有提交或标签。
+2. 用 `npm version <version> --no-git-tag-version --ignore-scripts` 同步 package 与锁文件；完成文档、单元测试和 `npm run test:e2e`。
+3. 设置 `WEIBO_SEED_SOURCE` 为上一正式 Release 中提取并校验过的干净种子库，再运行 `npm run build:release`。不要使用本机真实 `data/` 打包。构建输出 ZIP 与 manifest（大小、SHA256），安装包包含 CHANGELOG；检查账号、任务、日志、修复记录、登录目录、口令及激活文件均未带入。
+4. 提交最终代码后普通推送到 `main`，等待同一提交的 CI 成功，再为它创建并推送版本标签。
+5. 用 `gh release create <tag> <zip> <manifest> --verify-tag --latest --title <title> --notes-file <notes>` 发布，最后核对提交、标签、Latest、附件与 SHA256。`gh` 可使用系统命令或仓库本地 `tools/gh`。
+
+任一步骤失败即停止，不强制推送、不移动已有标签、不把占位说明当作正式发布说明。现有 `npm run release` 快捷脚本不会等待 CI，也会忽略部分 Git 错误，因此正式发布采用上述分步流程。
+
+发布测试只能使用临时数据目录与模拟页面；不要修改用户真实数据库、登录态或正在运行的服务。v1.0.1 的自动兼容迁移与本地接口扩展见 `CHANGELOG.md`。

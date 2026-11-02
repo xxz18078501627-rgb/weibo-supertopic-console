@@ -19,6 +19,10 @@ test('打包剥离后只保留文案与配置', () => {
   db.addPostMaterials(['保留的发帖文案一', '保留的发帖文案二']);
   db.addCommentMaterials(['保留的评论文案一', '保留的评论文案二']);
   db.log('info', '这条日志不应出现在安装包里');
+  db.db.prepare(`INSERT INTO post_result_repairs
+    (action_id,job_id,previous_state,next_state,original_error,receipt_id,receipt_url,reason,repaired_at)
+    VALUES(?,?,?,?,?,?,?,?,?)`).run('private-action', 'private-job', 'uncertain', 'succeeded',
+      '测试昵称的历史异常', '9999999', 'https://weibo.com/detail/9999999', '个人发帖核对记录', new Date().toISOString());
 
   const target = path.join(dir, 'seed', 'console.sqlite');
   execFileSync(process.execPath, [path.resolve(import.meta.dirname, '..', 'scripts', 'scrub-data.mjs'), target], {
@@ -28,7 +32,7 @@ test('打包剥离后只保留文案与配置', () => {
 
   const seed = new DatabaseSync(target);
   try {
-    for (const table of ['accounts', 'jobs', 'action_logs', 'system_logs', 'checkins', 'comment_history', 'task_step_state', 'verification_cards']) {
+    for (const table of ['accounts', 'account_groups', 'account_restrictions', 'jobs', 'action_logs', 'system_logs', 'checkins', 'comment_history', 'task_step_state', 'task_rounds', 'verification_cards', 'daily_stats', 'post_result_repairs']) {
       const exists = seed.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table);
       if (!exists) continue;
       assert.equal(seed.prepare('SELECT COUNT(*) n FROM ' + table).get().n, 0, table + ' 应为空');
@@ -41,6 +45,11 @@ test('打包剥离后只保留文案与配置', () => {
     assert.equal(dump.includes('9999999'), false);
     const templates = seed.prepare("SELECT value FROM settings WHERE key='task_templates'").get();
     if (templates) assert.equal(JSON.parse(templates.value).every(item => (item.config?.accountIds || []).length === 0), true);
+    assert.equal(db.db.prepare('SELECT COUNT(*) n FROM post_result_repairs').get().n, 1, '源库的修复记录不应被修改');
+    const bytes = fs.readFileSync(target);
+    for (const marker of ['private-action', 'private-job', '测试昵称', '个人发帖核对记录']) {
+      assert.equal(bytes.includes(Buffer.from(marker)), false, marker + ' 不应残留在种子库文件中');
+    }
   } finally {
     seed.close();
   }
