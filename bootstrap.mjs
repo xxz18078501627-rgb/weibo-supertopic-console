@@ -5,11 +5,13 @@ import path from 'node:path';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.WEIBO_CONSOLE_DATA_DIR || path.join(root, 'data');
 const port = Number(process.env.WEIBO_CONSOLE_PORT || 4178);
 const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const require = createRequire(import.meta.url);
 const repoSlug = process.env.WEIBO_CONSOLE_REPO || readRepoSlug();
 const releaseApi = process.env.WEIBO_CONSOLE_RELEASE_API || (repoSlug ? `https://api.github.com/repos/${repoSlug}/releases/latest` : '');
 
@@ -41,10 +43,8 @@ function hasDeps() {
 }
 
 function chromiumInstalled() {
-  const dirs = [process.env.PLAYWRIGHT_BROWSERS_PATH, path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright'), path.join(os.homedir(), '.cache', 'ms-playwright'), path.join(process.env.LOCALAPPDATA || '', 'ms-playwright')].filter(Boolean);
-  return dirs.some(dir => {
-    try { return fs.readdirSync(dir).some(name => /^chromium-/.test(name)); } catch { return false; }
-  });
+  try { return fs.existsSync(require('playwright').chromium.executablePath()); }
+  catch { return false; }
 }
 
 function chromePath() {

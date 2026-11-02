@@ -38,7 +38,8 @@ if (process.platform === 'win32') {
   execFileSync('/usr/bin/zip', ['-qr', zipPath, path.basename(staging)], { cwd: dist, stdio: 'inherit' });
 }
 const sha256 = createHash('sha256').update(fs.readFileSync(zipPath)).digest('hex');
-const manifest = { version, file: path.basename(zipPath), sha256, size: fs.statSync(zipPath).size, builtAt: new Date().toISOString() };
+const revision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+const manifest = { version, revision, file: path.basename(zipPath), sha256, size: fs.statSync(zipPath).size, builtAt: new Date().toISOString() };
 fs.writeFileSync(path.join(dist, `weibo-console-${version}.manifest.json`), JSON.stringify(manifest, null, 2));
 console.log('打包完成：' + zipPath);
 console.log('sha256: ' + sha256);
