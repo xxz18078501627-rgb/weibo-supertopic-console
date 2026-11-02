@@ -40,6 +40,7 @@ function run(command, args, { timeout = 180000, allowFailure = false } = {}) {
     child.once('error', error => { clearTimeout(timer); reject(error); });
     child.once('exit', code => {
       clearTimeout(timer);
+      child.stdout.destroy(); child.stderr.destroy();
       if (code && !allowFailure) reject(new Error(`Exit ${code}: ${command} ${args.join(' ')}\n${output}`));
       else resolve({ code, output });
     });
@@ -88,6 +89,20 @@ try {
   await run(process.execPath, ['bootstrap.mjs', 'service', 'restart']);
   await checkPage();
   console.log('Scheduled task restart and health check passed');
+
+  // Execute the same Unicode launcher used at logon, with portable Node.
+  await run(process.execPath, ['bootstrap.mjs', 'service', 'stop']);
+  const logon = spawn('cscript.exe', ['//B', '//Nologo', path.join(root, 'data', 'start-console.vbs')], { cwd: os.tmpdir(), env, windowsHide: true, stdio: 'ignore' });
+  const logonExit = new Promise((resolve, reject) => { logon.once('error', reject); logon.once('exit', resolve); });
+  let logonReady = false;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try { await checkPage(); logonReady = true; break; } catch {}
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.ok(logonReady, 'Logon launcher must start the portable Node service');
+  await run(process.execPath, ['bootstrap.mjs', 'service', 'stop']);
+  assert.equal(await logonExit, 0);
+  console.log('Native logon launcher with portable Node passed');
 } catch (error) {
   console.error('Smoke failure:', error.stack);
   console.error((await run('schtasks.exe', ['/Query', '/TN', env.WEIBO_CONSOLE_SERVICE_NAME, '/FO', 'LIST', '/V'], { allowFailure: true })).output);

@@ -46,7 +46,7 @@
 ## 从 v1.0.0 升级到 v1.0.1
 
 1. 在页面中安全暂停正在执行的任务，结束扫码或人工验证会话。
-2. 在原安装目录运行 `node bootstrap.mjs update --check` 确认最新版本，再运行 `node bootstrap.mjs update`。
+2. Mac 用户在原安装目录运行 `node bootstrap.mjs update --check`，再运行 `node bootstrap.mjs update`。原始 Windows 安装脚本也有依赖启动缺陷，请按下节手动替换程序文件并重跑 install.ps1。
 3. 服务重新启动后刷新页面。更新保留原 `data/`，账号、文案、任务、激活状态和浏览器登录目录无需重建；首次启动会自动补充数据库结构并迁移旧的待验证记录。手动暂停的任务由你决定何时继续。
 
 新版本会把“待验证”与“待核对”分开计数；普通发帖、评论结果不明确时保留待核对并继续后续步骤，不自动重发。人工验证时仍会观察本次提交的成功结果。详细变化见 [CHANGELOG.md](CHANGELOG.md)。

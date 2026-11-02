@@ -90,11 +90,11 @@ export function windowsTaskXml(launcher, sid) {
 
 async function stopWindows() {
   const previous = listenerPid();
-  if (previous) {
-    const stopped = await controlService(dataDir, root, previous);
-    if (!stopped) throw new Error(`无法安全控制端口 ${port} 的旧进程（PID ${previous}），未强制终止。请先在页面安全暂停任务并结束会话，再手动关闭旧服务。`);
-    for (let attempt = 0; attempt < 100 && listenerPid() === previous; attempt++) await new Promise(resolve => setTimeout(resolve, 100));
-    if (listenerPid() === previous) throw new Error('旧服务未退出，未强制终止进程');
+  const stopped = await controlService(dataDir, root, previous);
+  if (previous && !stopped) throw new Error(`无法安全控制端口 ${port} 的旧进程（PID ${previous}），未强制终止。请先在页面安全暂停任务并结束会话，再手动关闭旧服务。`);
+  if (stopped) {
+    for (let attempt = 0; attempt < 100 && listenerPid() === stopped.pid; attempt++) await new Promise(resolve => setTimeout(resolve, 100));
+    if (listenerPid() === stopped.pid) throw new Error('旧服务未退出，未强制终止进程');
   }
   try { execFileSync('schtasks.exe', ['/End', '/TN', taskName], { stdio: 'ignore' }); } catch {}
   return previous;
@@ -232,4 +232,5 @@ export async function main() {
   else { console.error('用法：node scripts/service.mjs install|uninstall|status|restart'); process.exit(1); }
 }
 
-if (process.argv[1] && fs.realpathSync.native(process.argv[1]) === fs.realpathSync.native(fileURLToPath(import.meta.url))) await main();
+const isMain = import.meta.main ?? (process.argv[1] && fs.realpathSync.native(process.argv[1]).toLowerCase() === fs.realpathSync.native(fileURLToPath(import.meta.url)).toLowerCase());
+if (isMain) await main();

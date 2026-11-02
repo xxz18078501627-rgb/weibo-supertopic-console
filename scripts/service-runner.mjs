@@ -47,7 +47,9 @@ child = spawn(process.execPath, [path.join(root, 'src', 'server.js')], {
 });
 fs.closeSync(stdout);
 fs.closeSync(stderr);
-fs.writeFileSync(runtime, JSON.stringify({ root, pid: process.pid, childPid: child.pid, controlPort: control.address().port, key }), { mode: 0o600 });
+const runtimeTemp = `${runtime}.${process.pid}.tmp`;
+fs.writeFileSync(runtimeTemp, JSON.stringify({ root, pid: process.pid, childPid: child.pid, controlPort: control.address().port, key }), { mode: 0o600 });
+fs.renameSync(runtimeTemp, runtime);
 child.on('message', message => {
   const item = pending.get(message?.id);
   if (!item || message.type !== 'weibo-service-stop-result') return;
