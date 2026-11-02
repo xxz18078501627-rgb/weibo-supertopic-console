@@ -38,3 +38,4 @@ function Ensure-Node {
 
 Ensure-Node
 & node bootstrap.mjs install @args
+exit $LASTEXITCODE

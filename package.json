@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node --test --test-reporter=spec tests/core.test.js tests/verification.test.js tests/network.test.js tests/topic-policy.test.js tests/license.test.js tests/packaging.test.js tests/navigation-adapter.test.js tests/navigation-recovery.test.js tests/post-results.test.js tests/post-receipts.test.js tests/post-success-notice.test.js",
+    "test": "node --test --test-reporter=spec tests/core.test.js tests/verification.test.js tests/network.test.js tests/topic-policy.test.js tests/license.test.js tests/packaging.test.js tests/navigation-adapter.test.js tests/navigation-recovery.test.js tests/post-results.test.js tests/post-receipts.test.js tests/post-success-notice.test.js tests/service.test.js",
     "test:e2e": "node --test tests/ui.e2e.test.js",
     "token": "node scripts/show-token.mjs",
     "license": "node scripts/make-license.mjs",

@@ -2,25 +2,30 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { controlService } from './service-control.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const label = 'com.local.weibo-super-topic-console';
-const taskName = 'WeiboSupertopicConsole';
+const taskName = process.env.WEIBO_CONSOLE_SERVICE_NAME || 'WeiboSupertopicConsole';
 const port = Number(process.env.WEIBO_CONSOLE_PORT || 4178);
-const dataDir = path.join(root, 'data');
+const dataDir = process.env.WEIBO_CONSOLE_DATA_DIR || path.join(root, 'data');
 const action = process.argv[2] || 'install';
 const nodeBin = process.execPath;
 const serverEntry = path.join(root, 'src', 'server.js');
 
-function has(cmd) {
-  try { execFileSync('/usr/bin/which', [cmd], { stdio: 'ignore' }); return true; } catch { return false; }
-}
-
-function listenerPid() {
+export function listenerPid({ platform = process.platform, run = execFileSync, listenPort = port } = {}) {
   try {
-    const output = execFileSync('/usr/sbin/lsof', ['-nP', `-tiTCP:${port}`, '-sTCP:LISTEN'], { encoding: 'utf8' }).trim();
+    if (platform === 'win32') {
+      const output = run('netstat.exe', ['-ano'], { encoding: 'utf8', windowsHide: true, timeout: 5000 });
+      for (const line of output.split(/\r?\n/)) {
+        const [protocol, local, , state, pid] = line.trim().split(/\s+/);
+        if (protocol === 'TCP' && local?.endsWith(`:${listenPort}`) && state === 'LISTENING') return Number(pid) || null;
+      }
+      return null;
+    }
+    const output = run('/usr/sbin/lsof', ['-nP', `-tiTCP:${listenPort}`, '-sTCP:LISTEN'], { encoding: 'utf8', timeout: 5000 }).trim();
     return Number(output.split('\n')[0]) || null;
   } catch { return null; }
 }
@@ -46,20 +51,42 @@ async function assertIdle() {
   return pid;
 }
 
-async function waitHealthy(previousPid) {
-  for (let attempt = 0; attempt < 100; attempt++) {
-    const pid = listenerPid();
+export async function waitHealthy(previousPid, { findPid = listenerPid, request = fetch, attempts = 100, interval = 150 } = {}) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const pid = findPid();
     if (pid && pid !== previousPid) {
-      const response = await fetch(`http://localhost:${port}/api/license/status`).catch(() => null);
+      const response = await request(`http://127.0.0.1:${port}/api/license/status`, { signal: AbortSignal.timeout(1000) }).catch(() => null);
       if (response?.ok) return pid;
     }
-    await new Promise(resolve => setTimeout(resolve, 150));
+    await new Promise(resolve => setTimeout(resolve, interval));
   }
-  throw new Error('新版服务未通过启动健康检查');
+  throw new Error(`新版服务未通过启动健康检查。请先运行 node bootstrap.mjs start 查看启动错误；后台日志：${path.join(dataDir, 'service-error.log')} 和 ${path.join(dataDir, 'service.log')}`);
 }
 
 function macPlistPath() {
   return path.join(os.homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
+}
+
+function startupPath() {
+  return path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', `${taskName}.vbs`);
+}
+
+function runWindowsLauncher(launcher) {
+  const child = spawn('wscript.exe', [launcher], { detached: true, stdio: 'ignore', windowsHide: true });
+  child.on('error', error => { console.error('后台启动失败：' + error.message); process.exitCode = 1; });
+  child.unref();
+}
+
+async function stopWindows() {
+  const previous = listenerPid();
+  if (previous) {
+    const stopped = await controlService(dataDir, root, previous);
+    if (!stopped) throw new Error(`无法安全控制端口 ${port} 的旧进程（PID ${previous}），未强制终止。请先在页面安全暂停任务并结束会话，再手动关闭旧服务。`);
+    for (let attempt = 0; attempt < 100 && listenerPid() === previous; attempt++) await new Promise(resolve => setTimeout(resolve, 100));
+    if (listenerPid() === previous) throw new Error('旧服务未退出，未强制终止进程');
+  }
+  try { execFileSync('schtasks.exe', ['/End', '/TN', taskName], { stdio: 'ignore' }); } catch {}
+  return previous;
 }
 
 function macPlist() {
@@ -80,25 +107,43 @@ function macPlist() {
 </dict></plist>\n`;
 }
 
-function windowsLauncher() {
-  const launcher = path.join(dataDir, 'start-console.vbs');
-  const log = path.join(dataDir, 'service.log');
-  fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(launcher, [
+export function windowsLauncher({ directory = dataDir, projectRoot = root, executable = nodeBin, listenPort = port } = {}) {
+  const launcher = path.join(directory, 'start-console.vbs');
+  const vbString = value => `"${String(value).replaceAll('"', '""')}"`;
+  const command = [executable, path.join(projectRoot, 'scripts', 'service-runner.mjs'), String(listenPort), directory].map(value => `"${value}"`).join(' ');
+  fs.mkdirSync(directory, { recursive: true });
+  const source = [
     'Set sh = CreateObject("WScript.Shell")',
-    `sh.Run """${nodeBin}"" ""${serverEntry}"" >> ""${log}"" 2>&1", 0, False`,
+    `sh.CurrentDirectory = ${vbString(projectRoot)}`,
+    `WScript.Quit sh.Run(${vbString(command)}, 0, True)`,
     ''
-  ].join('\r\n'), { encoding: 'utf8' });
+  ].join('\r\n');
+  // WScript reads Unicode scripts with a BOM; UTF-8 breaks Chinese paths.
+  fs.writeFileSync(launcher, Buffer.from('\uFEFF' + source, 'utf16le'));
   return launcher;
 }
 
 async function install() {
-  const previous = await assertIdle();
+  const previous = process.platform === 'win32' ? listenerPid() : await assertIdle();
   if (process.platform === 'win32') {
+    if (previous) throw new Error(`端口 ${port} 已有进程（PID ${previous}），未停止它。请确认并安全停止旧服务后再安装自启。`);
     const launcher = windowsLauncher();
-    execFileSync('schtasks.exe', ['/Create', '/F', '/SC', 'ONLOGON', '/TN', taskName, '/TR', `wscript.exe "${launcher}"`], { stdio: 'inherit' });
-    try { execFileSync('schtasks.exe', ['/End', '/TN', taskName], { stdio: 'ignore' }); } catch {}
-    execFileSync('schtasks.exe', ['/Run', '/TN', taskName], { stdio: 'inherit' });
+    let scheduled = false;
+    if (process.env.WEIBO_CONSOLE_SERVICE_MODE !== 'startup') {
+      try {
+        execFileSync('schtasks.exe', ['/Create', '/F', '/SC', 'ONLOGON', '/TN', taskName, '/TR', `wscript.exe "${launcher}"`], { stdio: 'pipe' });
+        scheduled = true;
+      } catch { console.log('无法创建计划任务，改用当前用户的登录启动文件夹（无需管理员权限）。'); }
+    }
+    if (scheduled) {
+      try { execFileSync('schtasks.exe', ['/End', '/TN', taskName], { stdio: 'ignore' }); } catch {}
+      execFileSync('schtasks.exe', ['/Run', '/TN', taskName], { stdio: 'inherit' });
+      if (fs.existsSync(startupPath())) fs.unlinkSync(startupPath());
+    } else {
+      fs.mkdirSync(path.dirname(startupPath()), { recursive: true });
+      fs.copyFileSync(launcher, startupPath());
+      runWindowsLauncher(launcher);
+    }
     const pid = await waitHealthy(previous);
     console.log(`已安装登录自启任务：${taskName}，PID ${pid}`);
     console.log(`控制台地址：http://localhost:${port}`);
@@ -122,10 +167,11 @@ async function install() {
   console.log(`控制台地址：http://localhost:${port}`);
 }
 
-function uninstall() {
+async function uninstall() {
   if (process.platform === 'win32') {
-    try { execFileSync('schtasks.exe', ['/End', '/TN', taskName], { stdio: 'ignore' }); } catch {}
+    await stopWindows();
     try { execFileSync('schtasks.exe', ['/Delete', '/TN', taskName, '/F'], { stdio: 'inherit' }); } catch {}
+    if (fs.existsSync(startupPath())) fs.unlinkSync(startupPath());
     console.log('已移除登录自启任务。');
     return;
   }
@@ -143,14 +189,31 @@ function uninstall() {
 
 function status() {
   if (process.platform === 'win32') {
+    if (fs.existsSync(startupPath())) { console.log('已安装当前用户登录自启：' + startupPath()); return; }
     try { execFileSync('schtasks.exe', ['/Query', '/TN', taskName], { stdio: 'inherit' }); } catch { console.log('未安装'); }
     return;
   }
   console.log(fs.existsSync(macPlistPath()) ? '已安装：' + macPlistPath() : '未安装');
 }
 
-if (action === 'install') await install();
-else if (action === 'uninstall') uninstall();
-else if (action === 'status') status();
-else if (action === 'restart') { const previous = await assertIdle(); if (process.platform === 'darwin') { const domain = `gui/${process.getuid()}`; try { execFileSync('/bin/launchctl', ['kickstart', '-k', `${domain}/${label}`]); } catch {} } else if (process.platform === 'win32') { try { execFileSync('schtasks.exe', ['/End', '/TN', taskName], { stdio: 'ignore' }); } catch {} execFileSync('schtasks.exe', ['/Run', '/TN', taskName], { stdio: 'inherit' }); } const pid = await waitHealthy(previous); console.log('服务已重启，PID ' + pid); }
-else { console.error('用法：node scripts/service.mjs install|uninstall|status|restart'); process.exit(1); }
+export async function main() {
+  if (action === 'install') await install();
+  else if (action === 'uninstall') await uninstall();
+  else if (action === 'status') status();
+  else if (action === 'stop' && process.platform === 'win32') await stopWindows();
+  else if (action === 'restart') {
+    const previous = process.platform === 'win32' ? await stopWindows() : await assertIdle();
+    if (process.platform === 'darwin') {
+      const domain = `gui/${process.getuid()}`;
+      execFileSync('/bin/launchctl', ['kickstart', '-k', `${domain}/${label}`]);
+    } else if (process.platform === 'win32') {
+      if (fs.existsSync(startupPath())) runWindowsLauncher(windowsLauncher());
+      else execFileSync('schtasks.exe', ['/Run', '/TN', taskName], { stdio: 'inherit' });
+    }
+    const pid = await waitHealthy(previous);
+    console.log('服务已重启，PID ' + pid);
+  }
+  else { console.error('用法：node scripts/service.mjs install|uninstall|status|restart'); process.exit(1); }
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();

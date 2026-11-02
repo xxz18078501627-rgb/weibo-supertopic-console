@@ -616,8 +616,10 @@ server.listen(config.port, config.host, async () => {
   if (latest) runner.workflow.reopenUnconfirmedCheckins(latest.id);
 });
 
-for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.on(signal, async () => {
+let stopping = false;
+async function shutdown() {
+    if (stopping) return;
+    stopping = true;
     clearInterval(dailyStopTimer);
     runner.network.clear();
     runner.navigation.clear();
@@ -626,5 +628,13 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     await loginBrowserManager.close();
     for (const client of sseClients) client.end();
     server.close(() => process.exit(0));
-  });
 }
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, shutdown);
+// Only the private parent/child IPC channel can request service shutdown.
+process.on('message', message => {
+  if (message?.type !== 'weibo-service-stop' || !process.send) return;
+  const job = getActiveJob();
+  const verification = runner.workflow.status(job || listJobs(1)[0]);
+  const busy = loginService.active || browserManager.status().busy || loginBrowserManager.status().busy || verification?.session || job?.status === 'running' || runner.repairing;
+  process.send({ type: 'weibo-service-stop-result', id: message.id, ok: !busy, error: busy ? '浏览器或任务仍在执行，请先安全暂停任务并结束会话' : undefined }, () => { if (!busy) void shutdown(); });
+});

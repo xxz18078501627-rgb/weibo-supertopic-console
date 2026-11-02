@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync, spawn } from 'node:child_process';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
-const dataDir = path.join(root, 'data');
+const dataDir = process.env.WEIBO_CONSOLE_DATA_DIR || path.join(root, 'data');
 const port = Number(process.env.WEIBO_CONSOLE_PORT || 4178);
 const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const repoSlug = process.env.WEIBO_CONSOLE_REPO || readRepoSlug();
@@ -27,6 +27,12 @@ function readRepoSlug() {
 }
 
 function run(cmd, args, options = {}) {
+  if (process.platform === 'win32' && cmd === npmBin) {
+    const npmCli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    if (!fs.existsSync(npmCli)) throw new Error('当前 Node 缺少 npm，请重新运行 install.ps1 安装完整 Node');
+    execFileSync(process.execPath, [npmCli, ...args], { cwd: root, stdio: 'inherit', ...options });
+    return;
+  }
   execFileSync(cmd, args, { cwd: root, stdio: 'inherit', ...options });
 }
 
@@ -144,7 +150,8 @@ async function latestRelease() {
 function extract(zipPath, target) {
   fs.mkdirSync(target, { recursive: true });
   if (process.platform === 'win32') {
-    run('powershell.exe', ['-NoProfile', '-Command', `Expand-Archive -LiteralPath '${zipPath}' -DestinationPath '${target}' -Force`]);
+    const quote = value => "'" + value.replaceAll("'", "''") + "'";
+    run('powershell.exe', ['-NoProfile', '-Command', `Expand-Archive -LiteralPath ${quote(zipPath)} -DestinationPath ${quote(target)} -Force`]);
   } else {
     run('/usr/bin/unzip', ['-q', '-o', zipPath, '-d', target]);
   }
@@ -166,7 +173,7 @@ async function update() {
   const tag = String(release.tag_name || '').replace(/^v/, '');
   console.log(`当前版本 ${current}，最新版本 ${tag || release.name}`);
   if (flags.has('--check')) return;
-  if (tag && tag === current) { console.log('已经是最新版本。'); return; }
+  if (tag && tag === current && !flags.has('--force')) { console.log('已经是最新版本。同版本修复包可运行 node bootstrap.mjs update --force 重新安装。'); return; }
   const asset = (release.assets || []).find(item => /^weibo-console-.*\.zip$/.test(item.name));
   if (!asset) throw new Error('Release 中没有找到安装包');
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'weibo-update-'));
@@ -182,10 +189,11 @@ async function update() {
   extract(zipPath, temp);
   const folder = fs.readdirSync(temp, { withFileTypes: true }).find(item => item.isDirectory() && item.name.startsWith('weibo-console'));
   if (!folder) throw new Error('安装包结构不正确');
+  if (process.platform === 'win32') service('stop');
   copyTree(path.join(temp, folder.name), root);
   run(npmBin, ['ci', '--omit=dev']);
   console.log('程序文件已更新，data 与登录状态保持不变。');
-  try { service('restart'); } catch (error) { console.log('服务未自动重启：' + error.message); }
+  service(process.platform === 'win32' ? 'install' : 'restart');
 }
 
 function token() {

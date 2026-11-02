@@ -39,6 +39,7 @@
 
 - **端口 4178 被占用**：先确认是否为已有工作台；若是，直接打开 http://localhost:4178 ，不要停止现有任务。若为其他程序，另设端口。
 - **页面打不开**：`node bootstrap.mjs doctor` 看哪项不通过；可用 `node bootstrap.mjs doctor --fix` 修复依赖或安装缺少的浏览器。
+- **Windows 提示“成功创建计划任务”，随后健康检查失败**：计划任务创建成功不代表工作台已启动。v1.0.1 的 Windows 后台脚本存在监听进程检测与启动问题。先在原目录运行 `node bootstrap.mjs start`，保持终端打开并访问 http://localhost:4178；若前台也失败，查看该终端的实际启动错误。不要删除或重建 `data/`。取得修复后的程序文件后，先在页面安全暂停任务、结束扫码及人工验证，再在前台终端按 Ctrl+C 停止，运行 `node bootstrap.mjs service install`。修复后的后台错误写入 `data/service-error.log`，普通输出写入 `data/service.log`；排障时勿转发口令或激活信息。
 - **手机打开不了**：确认同一 Wi-Fi；点页面右上角「手机访问」扫码。
 - **更新**：`node bootstrap.mjs update`（账号、文案、激活状态都会保留）。
 
