@@ -5,6 +5,7 @@ import { config, defaultTaskConfig } from './config.js';
 import { id, json, now } from './util.js';
 import { migrateSharedMaterials, migrateAccountDeletion } from './migrations.js';
 import { normalizeTaskSettings } from '../public/defaults.js';
+import { displayStateSql, resultMetrics } from './result-state.js';
 
 fs.mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
 fs.mkdirSync(path.join(config.dataDir, 'profiles'), { recursive: true, mode: 0o700 });
@@ -119,6 +120,7 @@ CREATE TABLE IF NOT EXISTS system_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_logs_created ON system_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_actions_job ON action_logs(job_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_actions_step ON action_logs(job_id, step_key);
 `);
 
 // Keep numbering facts with the action; existing databases are upgraded in place.
@@ -126,8 +128,18 @@ for (const sql of [
   'ALTER TABLE action_logs ADD COLUMN sequence_number INTEGER',
   'ALTER TABLE action_logs ADD COLUMN sequence_confirmed INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE action_logs ADD COLUMN receipt_id TEXT',
-  'ALTER TABLE action_logs ADD COLUMN receipt_url TEXT'
+  'ALTER TABLE action_logs ADD COLUMN receipt_url TEXT',
+  'ALTER TABLE action_logs ADD COLUMN attempt_id TEXT',
+  'ALTER TABLE action_logs ADD COLUMN submitted_at TEXT',
+  'ALTER TABLE action_logs ADD COLUMN success_source TEXT',
+  'ALTER TABLE action_logs ADD COLUMN verification_pending INTEGER NOT NULL DEFAULT 0'
 ]) { try { db.exec(sql); } catch {} }
+
+db.exec(`CREATE TABLE IF NOT EXISTS post_result_repairs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, action_id TEXT NOT NULL, job_id TEXT NOT NULL,
+  previous_state TEXT NOT NULL, next_state TEXT NOT NULL, original_error TEXT,
+  receipt_id TEXT, receipt_url TEXT, reason TEXT, repaired_at TEXT NOT NULL
+);`);
 
 const settingStmt = db.prepare('SELECT value FROM settings WHERE key = ?');
 const upsertSettingStmt = db.prepare(`
@@ -474,7 +486,7 @@ function normalizeJob(row) {
   return {
     ...row,
     config: json(row.config_json, {}), cursor: json(row.cursor_json, { stepIndex: 0 }),
-    metrics: json(row.metrics_json, {}), pausedByUser: Boolean(row.paused_by_user), stopRequested: Boolean(row.stop_requested)
+    metrics: resultMetrics(db, row.id, json(row.metrics_json, {})), pausedByUser: Boolean(row.paused_by_user), stopRequested: Boolean(row.stop_requested)
   };
 }
 
@@ -502,19 +514,33 @@ export function createActionLog(data) {
 export function updateActionLog(actionId, patch) {
   const row = db.prepare('SELECT * FROM action_logs WHERE id=?').get(actionId);
   if (!row) return null;
+  // An attempt token fences old asynchronous callbacks, including after a
+  // user explicitly confirms that an earlier attempt was not published.
+  if (patch.attemptId && patch.attemptId !== row.attempt_id) return row;
+  if (['post','comment'].includes(row.kind) && row.state === 'succeeded') {
+    if (patch.state && patch.state !== 'succeeded') return row;
+    if (patch.sequenceConfirmed === false) return row;
+  }
   const state = patch.state ?? row.state;
-  db.prepare(`UPDATE action_logs SET state=?,target_id=?,content=?,url=?,error=?,sequence_number=?,sequence_confirmed=?,receipt_id=?,receipt_url=?,completed_at=? WHERE id=?`).run(
+  db.prepare(`UPDATE action_logs SET state=?,target_id=?,content=?,url=?,error=?,sequence_number=?,sequence_confirmed=?,receipt_id=?,receipt_url=?,completed_at=?,submitted_at=?,success_source=?,verification_pending=? WHERE id=?`).run(
     state, patch.targetId ?? row.target_id, patch.content ?? row.content, patch.url ?? row.url,
     patch.error ?? row.error, 'sequenceNumber' in patch ? patch.sequenceNumber : row.sequence_number,
     patch.sequenceConfirmed == null ? row.sequence_confirmed : Number(Boolean(patch.sequenceConfirmed)),
     patch.receiptId ?? row.receipt_id, patch.receiptUrl ?? row.receipt_url,
-    ['succeeded','failed','uncertain','skipped','cancelled'].includes(state) ? now() : row.completed_at, actionId
+    'completedAt' in patch ? patch.completedAt : row.state === 'succeeded' ? row.completed_at : ['succeeded','failed','uncertain','skipped','cancelled'].includes(state) ? now() : row.completed_at,
+    patch.submittedAt ?? row.submitted_at, patch.successSource ?? row.success_source,
+    state === 'succeeded' ? 0 : patch.verificationPending == null ? row.verification_pending : Number(Boolean(patch.verificationPending)), actionId
   );
   return db.prepare('SELECT * FROM action_logs WHERE id=?').get(actionId);
 }
 
+export function beginPostAttempt(actionId, attemptId) {
+  db.prepare("UPDATE action_logs SET attempt_id=?,submitted_at=NULL WHERE id=? AND kind IN ('post','comment') AND state IN ('prepared','verification_wait')").run(attemptId, actionId);
+  return getActionLog(actionId);
+}
+
 export function listActionLogs(jobId, limit = 200) {
-  return db.prepare(`SELECT l.*,a.name account_name,t.name topic_name FROM action_logs l
+  return db.prepare(`SELECT l.*,${displayStateSql(db)} display_state,a.name account_name,t.name topic_name FROM action_logs l
     LEFT JOIN accounts a ON a.id=l.account_id LEFT JOIN topics t ON t.id=l.topic_id
     WHERE l.job_id=? ORDER BY l.started_at DESC LIMIT ?`).all(jobId, limit);
 }
@@ -583,14 +609,14 @@ export function listSystemLogs(limit = 200) {
 
 export function listRecordsByShanghaiDate(date, limit = 500) {
   const logs = db.prepare(`SELECT l.*,a.name account_name,t.name topic_name FROM system_logs l LEFT JOIN accounts a ON a.id=l.account_id LEFT JOIN topics t ON t.id=l.topic_id WHERE strftime('%Y-%m-%d', l.created_at, '+8 hours')=? ORDER BY l.created_at DESC LIMIT ?`).all(date, limit);
-  const actions = db.prepare(`SELECT l.*,a.name account_name,t.name topic_name FROM action_logs l LEFT JOIN accounts a ON a.id=l.account_id LEFT JOIN topics t ON t.id=l.topic_id WHERE strftime('%Y-%m-%d', l.started_at, '+8 hours')=? ORDER BY l.started_at DESC LIMIT ?`).all(date, limit);
+  const actions = db.prepare(`SELECT l.*,${displayStateSql(db)} display_state,a.name account_name,t.name topic_name FROM action_logs l LEFT JOIN accounts a ON a.id=l.account_id LEFT JOIN topics t ON t.id=l.topic_id WHERE strftime('%Y-%m-%d', l.started_at, '+8 hours')=? ORDER BY l.started_at DESC LIMIT ?`).all(date, limit);
   const jobs = db.prepare(`SELECT * FROM jobs WHERE strftime('%Y-%m-%d', created_at, '+8 hours')=? ORDER BY created_at DESC LIMIT ?`).all(date, limit).map(normalizeJob);
   return { logs, actions, jobs };
 }
 
 // 全天按任务聚合，绕开 listRecordsByShanghaiDate 的 500 条窗口。
 export function countActionsByJob(date) {
-  const rows = db.prepare("SELECT job_id,state,COUNT(*) total FROM action_logs WHERE strftime('%Y-%m-%d',started_at,'+8 hours')=? GROUP BY job_id,state").all(date);
+  const rows = db.prepare(`SELECT l.job_id,${displayStateSql(db)} state,COUNT(*) total FROM action_logs l WHERE strftime('%Y-%m-%d',l.started_at,'+8 hours')=? GROUP BY l.job_id,(${displayStateSql(db)})`).all(date);
   const map = {};
   for (const row of rows) {
     const bucket = map[row.job_id] || (map[row.job_id] = { succeeded: 0, failed: 0, uncertain: 0, skipped: 0 });

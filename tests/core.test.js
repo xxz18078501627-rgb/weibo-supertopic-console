@@ -417,7 +417,10 @@ test('每日成功统计不受500条限制，签到同UID去重，待核对复�
   assert.equal(dailySuccess('2026-10-29').comment, 1);
 });
 
-test('每轮报告保存墙钟耗时、异常详情、确认状态和系统通知去重', async () => {
+test('每轮报告保存墙钟耗时、异常详情、确认状态和系统通知去重', async t => {
+  const notifySetting = process.env.WEIBO_CONSOLE_NOTIFY;
+  delete process.env.WEIBO_CONSOLE_NOTIFY;
+  t.after(() => { if (notifySetting == null) delete process.env.WEIBO_CONSOLE_NOTIFY; else process.env.WEIBO_CONSOLE_NOTIFY = notifySetting; });
   const account = createAccount('历史昵称'); const topic = createTopic({ name: '测试', url: 'https://example.test' });
   const job = createJob(createSnapshot({ accountIds: [account.id], topicIds: [topic.id] }, listAccounts(), listTopics()));
   startRound(job.id, 0, new Date(Date.now() - 10000).toISOString());
@@ -1431,7 +1434,7 @@ test('发帖兜底搜索遇到永不返回的响应体仍能完成并匹配到�
   const adapter = new WeiboAdapter({ page: async () => page });
   adapter.ensureIdentity = async () => {};
   const started = Date.now();
-  const result = await adapter.findPublishedPost(account, { content, topic, startedAt: new Date().toISOString() });
+  const result = await adapter.findPublishedPost(account, { content, topic, startedAt: new Date(Date.parse(post.created_at) - 1000).toISOString() });
   assert.ok(Date.now() - started < 15000, '兜底搜索不应被单个响应体卡死');
   assert.equal(result.state, 'succeeded');
   assert.equal(result.matchedPostId, '5000000000000001');

@@ -5,6 +5,7 @@ const localTime = value => (value ? new Intl.DateTimeFormat("zh-CN", { timeZone:
 const esc = (x = "") => String(x ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const kind = x => ({ checkin: "签到", post: "发帖", comment: "评论" })[x] || "";
 const stateName = x => ({ succeeded: "成功", failed: "失败", uncertain: "待核对", submitted: "待核对", skipped: "跳过", verification_wait: "待验证", prepared: "准备中", cancelled: "取消" })[x] || x || "";
+const displayState = action => action.display_state || action.state;
 const jobStatus = x => ({ running: "运行中", waiting: "等待中", paused: "已暂停", completed: "已完成", stopped: "已中止", failed: "失败" })[x] || x || "";
 const timeOf = x => (x ? new Date(x).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }) : "");
 const PAGE = { issues: 6, accounts: 7, jobs: 5, flow: 7, dialog: 20 };
@@ -76,7 +77,8 @@ export function createRecordUI({ request, reload, date, filter, changed, toast =
   function uncertainRow(action) {
     const target = action.target_id ? '目标 ' + action.target_id : (action.content ? String(action.content).slice(0, 42) : '');
     const reason = action.error || action.reason || '提交结果未确认';
-    return "<article class='record-uncertain-row'><div class='record-uncertain-main'><strong>" + esc(action.account_name || '账号') + "</strong><span class='result warning'>" + esc(kind(action.kind) + ' · 待核对') + "</span><small>" + esc(timeOf(action.started_at)) + " · " + esc(reason) + "</small>" + (target ? "<small class='record-uncertain-target'>" + esc(target) + "</small>" : '') + "</div>" + (['post','comment'].includes(action.kind) ? "<button type='button' class='quiet' data-recheck-action='" + esc(action.id) + "' data-recheck-job='" + esc(action.job_id) + "'>复核</button>" : '') + "</article>";
+    const shownState = displayState(action);
+    return "<article class='record-uncertain-row'><div class='record-uncertain-main'><strong>" + esc(action.account_name || '账号') + "</strong><span class='result " + shownState + "'>" + esc(kind(action.kind) + ' · ' + stateName(shownState)) + "</span><small>" + esc(timeOf(action.started_at)) + " · " + esc(reason) + "</small>" + (target ? "<small class='record-uncertain-target'>" + esc(target) + "</small>" : '') + "</div>" + (['post','comment'].includes(action.kind) ? "<button type='button' class='quiet' data-recheck-action='" + esc(action.id) + "' data-recheck-job='" + esc(action.job_id) + "'>复核</button>" : '') + "</article>";
   }
   function jobRow(job, counts) {
     const c = counts?.[job.id];
@@ -88,7 +90,7 @@ export function createRecordUI({ request, reload, date, filter, changed, toast =
     return "<article class='record-row record-job' data-record-job='" + esc(job.id) + "' tabindex='0' role='button'><strong>" + esc(jobStatus(job.status)) + "</strong><time>" + esc(localTime(job.created_at)) + "</time><span class='record-job-counts'>成功 " + success + " · 失败 " + failed + " · 待核对 " + uncertain + " · 跳过 " + skipped + "</span><em>" + esc(duration(spent)) + "</em></article>";
   }
   function flowRow(row) {
-    const label = row.source === "action" ? kind(row.kind) + " · " + stateName(row.state) : esc(row.type || "记录");
+    const label = row.source === "action" ? kind(row.kind) + " · " + stateName(displayState(row)) : esc(row.type || "记录");
     return "<article class='record-row record-flow-row'><time>" + esc(timeOf(row.created_at || row.started_at)) + "</time><strong>" + esc(row.account_name || "系统") + "</strong><span>" + label + "</span></article>";
   }
 
@@ -110,7 +112,7 @@ export function createRecordUI({ request, reload, date, filter, changed, toast =
     const list = document.querySelector("#record-account-list");
     if (!section || !list) return;
     const uncertain = latest?.recordView?.uncertain
-      || (latest?.actions || []).filter(action => ['uncertain', 'submitted'].includes(action.state));
+      || (latest?.actions || []).filter(action => ['uncertain', 'submitted'].includes(displayState(action)));
     const heading = section.querySelector('.panel-head h2');
     if (uncertain.length) {
       if (heading) heading.textContent = '待核对操作';
@@ -187,7 +189,7 @@ export function createRecordUI({ request, reload, date, filter, changed, toast =
   }
 
   function detailRow(row) {
-    const label = row.source === "action" ? kind(row.kind) + " · " + stateName(row.state) : row.type || "记录";
+    const label = row.source === "action" ? kind(row.kind) + " · " + stateName(displayState(row)) : row.type || "记录";
     return "<article class='record-detail-row'><header><b>" + esc(row.account_name || "系统") + "</b><time>" + esc(timeOf(row.created_at || row.started_at)) + "</time><span>" + esc(label) + "</span></header>" + (row.topic_name ? "<small>" + esc(row.topic_name) + "</small>" : "") + (row.message || row.error ? "<p>" + esc(row.message || row.error) + "</p>" : "") + (row.content ? "<details><summary>文案</summary><p>" + esc(row.content) + "</p></details>" : "") + (/^https?:\/\//.test(row.url || "") ? "<a href='" + esc(row.url) + "' target='_blank' rel='noreferrer'>目标帖</a>" : "") + "</article>";
   }
   function paintDialog(title, body, footer) {

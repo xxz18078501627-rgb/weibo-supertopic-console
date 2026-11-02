@@ -1,4 +1,5 @@
 import { db, countActionsByJob } from './db.js';
+import { displayStateSql } from './result-state.js';
 
 export const ISSUE_PRIORITY = ['待验证', '待核对', '失败', '禁言', '频繁', '网络异常', '异常'];
 const SOURCE_RANK = { system: 0, action: 1, verification: 2, restriction: 3 };
@@ -98,18 +99,19 @@ export function recordView(date, { query = '', abnormalOnly = false, identity = 
     issueEvents.push({ identity: account?.identity || '', name: account?.name || '系统', uid: account?.uid || '', type, kind: kind || '', at: stamp(row), source, account });
   };
 
-  const actions = db.prepare("SELECT l.*,t.name topic_name FROM action_logs l LEFT JOIN topics t ON t.id=l.topic_id WHERE strftime('%Y-%m-%d',l.started_at,'+8 hours')=? ORDER BY l.started_at DESC,l.id DESC").all(date);
+  const actions = db.prepare(`SELECT l.*,${displayStateSql(db)} display_state,t.name topic_name FROM action_logs l LEFT JOIN topics t ON t.id=l.topic_id WHERE strftime('%Y-%m-%d',l.started_at,'+8 hours')=? ORDER BY l.started_at DESC,l.id DESC`).all(date);
   const entries = [];
   for (const action of actions) {
     const account = ensure(action.account_id, action.job_id);
     const at = stamp(action);
     touchName(account, account?.name, at);
-    const row = { ...action, source: 'action', identity: account?.identity || '', account_name: account?.name || '系统', uid: account?.uid || '', level: levelFor(action.state), created_at: action.started_at, message: action.error || '', type: problemType(action.error, action.state) };
+    const state = action.display_state;
+    const row = { ...action, source: 'action', identity: account?.identity || '', account_name: account?.name || '系统', uid: account?.uid || '', level: levelFor(state), created_at: action.started_at, message: action.error || '', type: state === 'verification_wait' ? '待验证' : ['uncertain','submitted'].includes(state) ? '待核对' : problemType(action.error, state) };
     row.at = at; row.sortId = detailKey(row, at);
     entries.push(row);
     if (account) {
       account.records.push(row);
-      if (account.counts[action.kind]?.[action.state] != null) account.counts[action.kind][action.state]++;
+      if (account.counts[action.kind]?.[state] != null) account.counts[action.kind][state]++;
     }
     if (['failed', 'uncertain', 'submitted', 'verification_wait'].includes(action.state) || (action.state === 'skipped' && /禁言|频繁/.test(action.error || ''))) addIssue(account, row.type, action.kind, row, 'action');
   }
@@ -195,9 +197,11 @@ export function recordView(date, { query = '', abnormalOnly = false, identity = 
     accounts: selected.map(({ records, aliases, ...account }) => account),
     issues: visibleIssues.map(({ lastTime, kinds, ...issue }) => ({ ...issue, kind: kinds[0] || '', kinds })),
     uncertain: actions
-      .filter(action => ['uncertain', 'submitted'].includes(action.state))
+      .filter(action => ['uncertain', 'submitted'].includes(action.display_state))
       .map(action => ({
         id: action.id,
+        state: action.state,
+        display_state: action.display_state,
         job_id: action.job_id,
         kind: action.kind,
         account_id: action.account_id,

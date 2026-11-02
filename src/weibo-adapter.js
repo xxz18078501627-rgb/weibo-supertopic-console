@@ -1,11 +1,15 @@
 import { serializeError } from './util.js';
 import { DailyStopError } from './daily-stop.js';
+import { gotoChecked, isNavigationError, safeNavigationUrl, NavigationUnavailableError } from './navigation.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
+import { createPostReceiptCollector } from './post-receipts.js';
+import { createPostSuccessNoticeObserver, createCommentSuccessNoticeObserver } from './post-success-notice.js';
 const challengeMode = new AsyncLocalStorage();
 
 async function submitBeforeDeadline(button, onSubmit, deadlineAt) {
   const deadline = Number(deadlineAt);
-  if (!Number.isFinite(deadline)) { onSubmit(); await button.click(); return; }
+  if (!Number.isFinite(deadline)) { await onSubmit(); await button.click(); return; }
   // Playwright may wait for actionability after a click request. A capture-phase
   // fence also checks the clock at the actual browser event, not only in Node.
   await button.click({ trial: true });
@@ -22,7 +26,7 @@ async function submitBeforeDeadline(button, onSubmit, deadlineAt) {
     for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) document.addEventListener(type, guard.listener, true);
   }, deadline);
   try {
-    onSubmit();
+    await onSubmit();
     await button.click({ timeout: Math.max(1, Math.min(5000, deadline - Date.now())) });
     if (await handle.evaluate(element => element.__workbenchSubmitGuard?.blocked).catch(() => false)) {
       const error = new DailyStopError(); error.unsubmitted = true; throw error;
@@ -162,6 +166,75 @@ async function detectChallenge(page, browserManager) {
   }
 }
 
+const UNLOADED_URL = /^(?:about:(?:blank|srcdoc)|chrome-error:|chrome:)/i;
+const ERROR_PAGE_TEXT = /(?:ERR_(?:INTERNET_DISCONNECTED|NAME_NOT_RESOLVED|CONNECTION_[A-Z_]+|PROXY_[A-Z_]+|TUNNEL_[A-Z_]+|CERT_[A-Z_]+)|This site can.t be reached|网页无法打开|无法访问此网站|未连接到互联网|网络连接错误|页面不存在|出错了)/i;
+
+function parsePageUrl(value) {
+  try { return new URL(String(value || '')); } catch { return null; }
+}
+
+function isUnloadedPageUrl(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return true;
+  if (UNLOADED_URL.test(raw)) return true;
+  return !parsePageUrl(raw);
+}
+
+async function pageHasVisibleChallenge(page) {
+  // Test doubles and lightweight adapters may not expose locator APIs. Treat
+  // that as "cannot confirm a challenge" rather than crashing the caller.
+  if (typeof page?.frames !== 'function' || typeof page?.locator !== 'function') return false;
+  return hasVerificationChallenge(page).catch(() => false);
+}
+
+// Read-only description of what the browser is currently showing.  A 200
+// response alone is not proof that a usable Weibo page was painted: Chrome
+// error documents, blank tabs and empty shells all need to be rejected.
+async function inspectPageHealth(page) {
+  const url = String(page?.url?.() || '');
+  if (isUnloadedPageUrl(url)) return { ok: false, unloaded: true, url };
+  let snapshot;
+  try {
+    snapshot = await page.evaluate(() => {
+      const bodyText = String(document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+      return {
+        readyState: document.readyState,
+        title: String(document.title || ''),
+        text: bodyText.slice(0, 400),
+        textLength: bodyText.length,
+        htmlLength: Number((document.documentElement?.innerHTML || '').length),
+        body: Boolean(document.body),
+        hasConfig: Boolean(window.$CONFIG),
+        uid: String(window.$CONFIG?.uid || window.$CONFIG?.user?.idstr || window.$CONFIG?.user?.id || ''),
+        loginForm: Boolean(document.querySelector('form[action*="login" i], input[name="username" i], [node-type="loginName"], [class*="loginForm" i], [class*="login-form" i]')),
+        challengeHint: /安全验证|请完成验证|验证码|账号存在风险/.test(bodyText)
+          || Boolean(document.querySelector('iframe[src*="captcha"], [class*="geetest_panel"], .yidun_modal__wrap'))
+      };
+    });
+  } catch (error) {
+    return { ok: false, unreadable: true, error, url };
+  }
+  if (!snapshot || !snapshot.body || snapshot.readyState === 'loading' || snapshot.htmlLength < 50 || snapshot.textLength < 2) {
+    return { ok: false, empty: true, snapshot, url };
+  }
+  // Body text only counts for a short error document; a normal feed post may
+  // legitimately contain words such as "页面不存在".
+  if (ERROR_PAGE_TEXT.test(snapshot.title)
+    || (snapshot.textLength < 200 && ERROR_PAGE_TEXT.test(snapshot.text))) {
+    return { ok: false, errorPage: true, snapshot, url };
+  }
+  return { ok: true, snapshot, url };
+}
+
+function trustedWeiboNavigationUrl(value) {
+  const url = parsePageUrl(value);
+  if (!url || url.protocol !== 'https:') return null;
+  if (url.username || url.password) return null;
+  if (url.hostname !== 'weibo.com' && !url.hostname.endsWith('.weibo.com')) return null;
+  if (url.port && url.port !== '443') return null;
+  return url;
+}
+
 const BASE62 = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
 export function weiboShortIdToNumeric(shortId) {
   const input = String(shortId || '');
@@ -271,16 +344,50 @@ function postContentTopicMatches(post, { uid, content, topicName }) {
     page_id: post?.page_id, page: post?.page, annotations: post?.annotations
   }));
   const hasTopic = Boolean(marker && (raw.includes(marker) || raw.includes(bracketMarker) || topicData.includes(marker) || topicData.includes(bracketMarker)));
-  return Boolean(expectedContent && hasTopic && raw.includes(expectedContent));
+  // The composer prepends exactly one topic marker. Keep user-authored
+  // markers in the body, and never match a different post by a substring.
+  const bodies = [raw];
+  for (const prefix of [`#${bracketMarker}#`, bracketMarker, `#${marker}#`, marker]) {
+    if (prefix && raw.startsWith(prefix)) bodies.push(raw.slice(prefix.length));
+  }
+  return Boolean(expectedContent && hasTopic && bodies.includes(expectedContent));
 }
 
 const receiptUrl = id => `https://weibo.com/detail/${id}`;
 
-async function readPost(page, id) {
-  const payload = await page.evaluate(async receiptId => {
-    const response = await fetch(`/ajax/statuses/show?id=${encodeURIComponent(receiptId)}`, { credentials: 'include' });
-    return response.ok ? response.json() : null;
-  }, String(id)).catch(() => null);
+async function boundedRead(operation, signal, timeoutMs = 3000) {
+  if (signal?.aborted) return null;
+  let timer, abort;
+  const cancelled = new Promise(resolve => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+    abort = () => resolve(null);
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+  try { return await Promise.race([Promise.resolve().then(operation).catch(() => null), cancelled]); }
+  finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); }
+}
+
+export function postTimeWindow({ submittedAt, startedAt, completedAt } = {}) {
+  const submitted = Date.parse(submittedAt), started = Date.parse(startedAt), completed = Date.parse(completedAt);
+  // A timestamp earlier than this attempt is never evidence of its success.
+  // Server timestamps with insufficient precision remain uncertain instead of
+  // expanding the window backwards and claiming a pre-existing identical post.
+  return { from: Number.isFinite(submitted) ? submitted : started,
+    to: Number.isFinite(submitted) ? submitted + 120000 : (Number.isFinite(completed) ? completed : started) + 30000 };
+}
+const withinPostWindow = (post, window) => {
+  const created = Date.parse(post?.created_at);
+  return Number.isFinite(created) && Number.isFinite(window.from) && Number.isFinite(window.to) && created >= window.from && created <= window.to;
+};
+
+async function readPost(page, id, { signal } = {}) {
+  const payload = await boundedRead(() => page.evaluate(async receiptId => {
+    const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 2500);
+    try {
+      const response = await fetch(`/ajax/statuses/show?id=${encodeURIComponent(receiptId)}`, { credentials: 'include', signal: controller.signal });
+      return response.ok ? await response.json() : null;
+    } finally { clearTimeout(timer); }
+  }, String(id)), signal);
   return payload?.data || payload || null;
 }
 
@@ -374,7 +481,7 @@ export function verificationMessageFromReceipt(payload) {
   return message || (code === '20067' || (validation && typeof validation === 'object' && ['exception_key','challenge','alitest'].some(key => key in validation)) ? '微博要求安全验证（回执验证字段）' : '');
 }
 
-export function classifyPostReceipt(payload, httpOk = true) {
+function classifyReceiptWithId(payload, httpOk = true) {
   const item = payload?.data || payload;
   const id = String(item?.idstr || item?.mid || item?.id || '');
   const denied = payload?.success === false || payload?.ok === false || payload?.ok === 0 || payload?.data?.ok === 0;
@@ -390,11 +497,33 @@ export function classifyPostReceipt(payload, httpOk = true) {
   return { kind: 'unknown' };
 }
 
+export function classifyPostReceipt(payload, httpOk = true) {
+  // A contradictory envelope (e.g. success=true plus captcha/ok=0) cannot
+  // acknowledge this post. Keep comment's existing classifier independent.
+  const verification = verificationMessageFromReceipt(payload);
+  if (verification) return { kind: 'verification', reason: verification,
+    explicitlyUnpublished: payload?.success === false || payload?.ok === false || payload?.ok === 0 || payload?.data?.ok === 0 };
+  const muted = mutedMessageFromReceipt(payload);
+  if (muted) return { kind: 'muted', reason: muted };
+  const frequent = rateMessageFromReceipt(payload);
+  if (frequent) return { kind: 'frequent', reason: frequent };
+  const denied = [payload, payload?.data].some(item => item?.success === false || item?.ok === false || item?.ok === 0 || item?.ok === '0');
+  if (denied) {
+    const reason = receiptMessage(payload, value => Boolean(value.trim()));
+    return reason ? { kind: 'failed', reason } : { kind: 'unknown' };
+  }
+  const result = classifyReceiptWithId(payload, httpOk);
+  if (result.kind !== 'unknown') return result;
+  const explicitSuccess = [payload, payload?.data].some(item => item?.ok === 1 || item?.ok === '1' || item?.success === true)
+    || String(payload?.code || '') === '100000';
+  return httpOk && !denied && explicitSuccess ? { kind: 'succeeded', id: null, explicitSuccess: true } : result;
+}
+
 export function classifyCommentReceipt(payload, httpOk = true) {
   // Comment and post endpoints use the same security envelope. In particular,
   // ok=0 / HTTP 400 can mean captcha or an account-wide restriction, not that
   // this post's author must be avoided by every account in the round.
-  return classifyPostReceipt(payload, httpOk);
+  return classifyReceiptWithId(payload, httpOk);
 }
 
 async function visibleRestrictionMessage(page, predicate) {
@@ -517,6 +646,146 @@ export class WeiboAdapter {
       for (const session of sessions) void session.detach().catch(() => {});
     }
   }
+  // Read-only navigation probe used by recovery.  It never clicks, submits or
+  // creates a manual page, and it never closes a manual/login page or context.
+  // A manual owner may already show a repaired page: inspect that page in place
+  // so a human fix can turn into `ready` without a busy deadlock.
+  async probeNavigation(account, { url = 'https://weibo.com/', signal } = {}) {
+    const started = Date.now(), manager = this.browserManager;
+    const target = trustedWeiboNavigationUrl(url);
+    const targetKey = safeNavigationUrl(target?.href || url);
+    const result = (state, extra = {}) => {
+      const status = Number(extra.httpStatus);
+      return {
+        state,
+        netCode: extra.netCode || null,
+        httpStatus: Number.isFinite(status) && status > 0 ? status : null,
+        url: targetKey,
+        checkedAt: new Date().toISOString(),
+        latencyMs: Date.now() - started
+      };
+    };
+    if (!target) return result('unavailable', { netCode: 'PROBE_URL_REJECTED' });
+    if (signal?.aborted) return result('unavailable', { netCode: 'PROBE_CANCELLED' });
+    if (manager.owner === 'login') return result('busy');
+
+    const classify = async page => {
+      const health = await inspectPageHealth(page);
+      if (!health.ok) {
+        if (health.snapshot?.challengeHint && await pageHasVisibleChallenge(page)) return result('verification');
+        return result('unavailable', {
+          netCode: health.errorPage ? 'PROBE_ERROR_PAGE' : health.unloaded ? 'PROBE_PAGE_UNLOADED' : 'PROBE_PAGE_EMPTY'
+        });
+      }
+      const current = parsePageUrl(page.url?.());
+      const host = current?.hostname || '';
+      if (health.snapshot.challengeHint && await pageHasVisibleChallenge(page)) return result('verification');
+      if (host !== 'weibo.com') {
+        if (host === 'passport.weibo.com' || /signin|login|sso/i.test(current?.pathname || '')) return result('authentication');
+        return result('unavailable', { netCode: 'PROBE_UNEXPECTED_HOST' });
+      }
+      if (health.snapshot.loginForm) return result('authentication');
+      if (safeNavigationUrl(current?.href) !== targetKey) return result('unavailable', { netCode: 'PROBE_UNEXPECTED_REDIRECT' });
+      if (!health.snapshot.hasConfig) return result('unavailable', { netCode: 'PROBE_PAGE_NOT_RECOGNIZED' });
+      const uid = String(health.snapshot.uid || '');
+      if (!/^\d+$/.test(uid) || uid === '0') return result('authentication');
+      if (account?.uid && String(account.uid) !== uid) return result('authentication');
+      return result('ready');
+    };
+
+    if (manager.owner === 'manual') {
+      const context = manager.context, generation = manager.generation || 0;
+      if (!context || String(manager.accountId) !== String(account?.id)) return result('busy');
+      const pages = context.pages?.() || [];
+      const page = pages.find(item => !item.isClosed?.() && safeNavigationUrl(item.url?.()) === targetKey);
+      if (!page) return result('busy');
+      let manualTimer;
+      let state;
+      try {
+        state = await Promise.race([
+          classify(page).catch(() => result('busy')),
+          new Promise(resolve => { manualTimer = setTimeout(() => resolve(result('busy')), 10000); })
+        ]);
+      } finally { clearTimeout(manualTimer); }
+      if (manager.context !== context || manager.owner !== 'manual' || (manager.generation || 0) !== generation) return result('busy');
+      // A manual page that is merely still loading stays busy; only terminal
+      // classifications (or a healthy ready page) are meaningful to recovery.
+      return ['ready', 'verification', 'authentication'].includes(state.state) ? state : result('busy');
+    }
+    if (manager.owner && manager.owner !== 'runner') return result('busy');
+    if (manager.context && manager.owner !== 'runner') return result('busy');
+    if (manager.context && manager.accountId && account?.id && String(manager.accountId) !== String(account.id)) return result('busy');
+
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    let timer, tempPage = null;
+    const aborted = () => result('unavailable', { netCode: signal?.aborted ? 'PROBE_CANCELLED' : 'PROBE_TIMEOUT' });
+    const abortPromise = new Promise(resolve => {
+      const onAbort = () => { void tempPage?.close?.().catch(() => {}); resolve(aborted()); };
+      if (controller.signal.aborted) onAbort();
+      else controller.signal.addEventListener('abort', onAbort, { once: true });
+    });
+    timer = setTimeout(() => controller.abort(), 10000);
+    try {
+      let context = manager.context;
+      if (!context) {
+        if (!account?.id) return result('unavailable', { netCode: 'PROBE_ACCOUNT_UNAVAILABLE' });
+        const picked = await Promise.race([
+          manager.open(account, 'runner').then(opened => ({ opened }), error => ({ error })),
+          abortPromise
+        ]);
+        if (picked.state) return picked;
+        if (picked.error) {
+          return /busy|正在被.*使用/i.test(String(picked.error?.message || ''))
+            ? result('busy') : result('unavailable', { netCode: 'PROBE_CONTEXT_UNAVAILABLE' });
+        }
+        context = picked.opened;
+        if (!context) return result('unavailable', { netCode: 'PROBE_CONTEXT_UNAVAILABLE' });
+      }
+      const generation = manager.generation || 0, contextRef = context;
+      const contextValid = () => manager.context === contextRef
+        && (manager.generation || 0) === generation
+        && manager.owner === 'runner'
+        && (!account?.id || String(manager.accountId) === String(account.id));
+      const work = async () => {
+        if (controller.signal.aborted) return aborted();
+        if (!contextValid()) return result('busy');
+        try { tempPage = await contextRef.newPage(); }
+        catch { return result('unavailable', { netCode: 'PROBE_PAGE_UNAVAILABLE' }); }
+        if (controller.signal.aborted || !contextValid()) {
+          await tempPage.close?.().catch(() => {});
+          return controller.signal.aborted ? aborted() : result('busy');
+        }
+        try {
+          // Never just hit robots.txt: this must load the real document so the
+          // page classification below can reject blank/error/non-business pages.
+          await gotoChecked(tempPage, target.href, { stage: 'probe', timeout: 9000 });
+        } catch (error) {
+          if (!contextValid()) return result('busy');
+          if (isNavigationError(error)) return result('unavailable', { netCode: error.netCode, httpStatus: error.httpStatus });
+          const netCode = String(error?.message || '').match(/\b(?:net::)?(ERR_[A-Z0-9_]+)\b/)?.[1] || 'PROBE_NAVIGATION_FAILED';
+          return result('unavailable', { netCode });
+        }
+        if (controller.signal.aborted) return aborted();
+        if (!contextValid()) return result('busy');
+        try {
+          const classified = await classify(tempPage);
+          return contextValid() ? classified : result('busy');
+        }
+        catch { return result('unavailable', { netCode: 'PROBE_PAGE_UNREADABLE' }); }
+      };
+      return await Promise.race([
+        work().catch(() => result('unavailable', { netCode: 'PROBE_EXCEPTION' })),
+        abortPromise
+      ]);
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      if (tempPage && !tempPage.isClosed?.()) await tempPage.close?.().catch(() => {});
+    }
+  }
   withChallengeMode(mode, callback) { return challengeMode.run(mode, callback); }
   taskOwner() { return challengeMode.getStore() === 'manual' ? 'manual' : 'runner'; }
   async minimizeTask() {
@@ -527,9 +796,14 @@ export class WeiboAdapter {
   async openVerification(account, topic, action) {
     // The workflow has already finished the background step before calling
     // this.  Opening a manual context is the only path that may be visible.
+    const pending = this.currentSubmission(action);
     const page = await this.browserManager.page(account, 'manual');
+    if (pending?.page === page && !page.isClosed?.()) {
+      await this.browserManager.foreground?.(page);
+      return page;
+    }
     const url = action?.url && /^https:\/\/weibo\.com\//.test(action.url) ? action.url : topic.url;
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await gotoChecked(page, url, { stage: 'verification-open' });
     await this.browserManager.foreground?.(page);
     return page;
   }
@@ -553,37 +827,48 @@ export class WeiboAdapter {
     return result.state === 'succeeded' ? { state: 'succeeded', url: action.receipt_url || receiptUrl(receiptId) } : { state: 'uncertain', reason: result.reason };
   }
 
-  async findUniqueRecentPost(account, { content, topicName, pages = 3 } = {}) {
+  async findUniqueRecentPost(account, { content, topicName, pages = 3, startedAt, submittedAt, completedAt, signal, assertRunning = () => {} } = {}) {
+    assertRunning();
     await this.ensureIdentity(account);
-    const page = await this.browserManager.page(account, 'runner');
+    const page = await this.browserManager.page(account, this.taskOwner());
     const matches = new Map();
+    const window = postTimeWindow({ startedAt, submittedAt, completedAt });
     for (let index = 1; index <= pages; index += 1) {
-      const payload = await page.evaluate(async ({ uid, page: pageNo }) => {
-        const response = await fetch(`/ajax/statuses/mymblog?uid=${encodeURIComponent(uid)}&page=${pageNo}&feature=0`, { credentials: 'include' });
-        return response.ok ? response.json() : null;
-      }, { uid: account.uid, page: index }).catch(() => null);
+      assertRunning(); if (signal?.aborted) break;
+      const payload = await boundedRead(() => page.evaluate(async ({ uid, page: pageNo }) => {
+        const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 2500);
+        try {
+          const response = await fetch(`/ajax/statuses/mymblog?uid=${encodeURIComponent(uid)}&page=${pageNo}&feature=0`, { credentials: 'include', signal: controller.signal });
+          return response.ok ? await response.json() : null;
+        } finally { clearTimeout(timer); }
+      }, { uid: account.uid, page: index }), signal);
       const data = payload?.data || payload || {};
       const posts = data.list || data.statuses || data.data || [];
       for (const post of posts) {
-        if (!postContentTopicMatches(post, { uid: account.uid, content, topicName })) continue;
+        if (!withinPostWindow(post, window) || !postContentTopicMatches(post, { uid: account.uid, content, topicName })) continue;
         const id = String(post.idstr || post.id || '');
         if (id) matches.set(id, post);
       }
     }
     if (matches.size !== 1) return { state: 'uncertain', reason: matches.size ? '近期微博存在多个相同正文候选，保留待核对' : '近期微博未找到唯一匹配候选，保留待核对' };
     const [receiptId, post] = matches.entries().next().value;
-    return { state: 'succeeded', receiptId, receiptUrl: receiptUrl(receiptId), url: post.mblogid ? `https://weibo.com/${account.uid}/${post.mblogid}` : receiptUrl(receiptId) };
+    assertRunning();
+    return { state: 'succeeded', receiptId, receiptUrl: receiptUrl(receiptId), createdAt: post.created_at, url: post.mblogid ? `https://weibo.com/${account.uid}/${post.mblogid}` : receiptUrl(receiptId) };
   }
 
-  async findPublishedPost(account, { content, topic, startedAt, syncToHome = false } = {}) {
+  async findPublishedPost(account, { content, topic, startedAt, submittedAt, completedAt, syncToHome = false, signal,
+    assertRunning = () => {}, maxBatches = 3 } = {}) {
+    assertRunning();
     await this.ensureIdentity(account);
+    assertRunning();
     const page = await this.browserManager.page(account, this.taskOwner());
+    const window = postTimeWindow({ startedAt, submittedAt, completedAt });
     const candidates = new Map(), matches = new Map();
     const collect = value => {
       if (!value || typeof value !== 'object') return;
       if (String(value.user?.idstr || value.user?.id || '') === String(account.uid) && (value.text_raw || value.text)) {
         const id = String(value.idstr || value.id || '');
-        if (/^\d{10,}$/.test(id)) candidates.set(id, value);
+        if (/^\d{10,}$/.test(id) && withinPostWindow(value, window)) candidates.set(id, value);
         return;
       }
       if (Array.isArray(value)) value.forEach(collect);
@@ -591,37 +876,56 @@ export class WeiboAdapter {
     };
     const pending = new Set();
     const listener = response => {
-      if (!response.url().startsWith('https://weibo.com/ajax/')) return;
+      if (signal?.aborted) return;
+      try {
+        const url = new URL(response.url());
+        if (url.origin !== 'https://weibo.com' || !/^(?:\/ajax\/|\/ajax_proxy\/chaohua\/|\/p\/aj\/)/.test(url.pathname)) return;
+      } catch { return; }
       const read = readJsonBounded(response).then(collect).catch(() => {});
       pending.add(read); read.finally(() => pending.delete(read));
     };
     page.on('response', listener);
     try {
-      await page.goto(topic.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await gotoChecked(page, topic.url, { stage: 'topic-page', timeout: 10000 });
+      assertRunning();
       await detectChallenge(page, this.browserManager);
-      const latest = await firstVisible([page.getByText('最新', { exact: true })]);
+      const latestLocator = page.getByText('最新', { exact: true });
+      // The /p/ document loads its tabs asynchronously after domcontentloaded.
+      // Starting the scan before that leaves the page on the popular feed.
+      if (latestLocator.first) await latestLocator.first().waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+      assertRunning();
+      const latest = await firstVisible([latestLocator]);
       if (latest) await latest.click();
-      for (let batch = 0; batch < 3; batch++) {
+      if (page.mouse.move) {
+        const size = page.viewportSize?.() || await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+        if (size) await page.mouse.move(Math.round(size.width * 0.55), Math.round(size.height * 0.65));
+      }
+      for (let batch = 0; batch < maxBatches; batch++) {
+        assertRunning(); if (signal?.aborted) break;
         await page.waitForTimeout(700);
         await settleBounded(pending, 3000);
         const links = await page.evaluate(uid => [...document.querySelectorAll('a[href]')].map(a => {
           try { const match = new URL(a.href).pathname.match(/^\/(\d+)\/([A-Za-z0-9]+)$/); return match?.[1] === uid ? match[2] : null; } catch { return null; }
         }).filter(Boolean), String(account.uid));
-        for (const id of links) candidates.set(weiboShortIdToNumeric(id), null);
-        if (batch < 2) await page.mouse.wheel(0, 1400);
+        for (const id of links || []) { const numeric = weiboShortIdToNumeric(id); if (!candidates.has(numeric)) candidates.set(numeric, null); }
+        if (batch < maxBatches - 1) await page.mouse.wheel(0, 1400);
       }
     } finally { page.off('response', listener); }
-    const start = Date.parse(startedAt);
-    for (const [id] of [...candidates].slice(0, 150)) {
-      const post = await readPost(page, id);
-      const created = Date.parse(post?.created_at);
-      if (Number.isFinite(start) && (!Number.isFinite(created) || Math.abs(created - start) > 10 * 60 * 1000)) continue;
+    for (const [id, cached] of [...candidates].slice(0, 150)) {
+      assertRunning(); if (signal?.aborted) break;
+      const post = cached && !cached.isLongText ? cached : await readPost(page, id, { signal });
+      if (!withinPostWindow(post, window)) continue;
       if (postReadbackMatches(post, { receiptId: id, uid: account.uid, content, topicName: topic.name })) matches.set(id, post);
     }
-    if (!matches.size && syncToHome) return this.findUniqueRecentPost(account, { content, topicName: topic.name });
+    assertRunning();
+    this.log('info', `发帖只读核对：候选 ${candidates.size}，唯一匹配 ${matches.size}`, { accountId: account.id, topicId: topic.id });
+    if (signal?.aborted) return { state: 'uncertain', reason: '只读核对超时或已取消' };
+    if (!matches.size && syncToHome) return this.findUniqueRecentPost(account, { content, topicName: topic.name,
+      startedAt, submittedAt, completedAt, signal, assertRunning, pages: Math.min(20, maxBatches) });
     if (matches.size !== 1) return { state: 'uncertain', reason: matches.size ? '超话内有多个相同文案候选，保留待核对' : '超话内未找到唯一匹配，不能据此确认未发布' };
     const [id] = matches.keys();
-    return { state: 'succeeded', url: receiptUrl(id), receiptUrl: receiptUrl(id), matchedPostId: id, source: 'topic_unique_match' };
+    return { state: 'succeeded', url: receiptUrl(id), receiptUrl: receiptUrl(id), receiptId: id, matchedPostId: id,
+      createdAt: matches.get(id).created_at, source: 'topic_unique_match' };
   }
 
   async verifyCheckin(account, topic) {
@@ -637,7 +941,7 @@ export class WeiboAdapter {
     onPage(page);
     onStage('navigate-home');
     // Reuse an existing login before asking the user to scan again.
-    await page.goto('https://weibo.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await gotoChecked(page, 'https://weibo.com/', { stage: 'login-home' });
     await page.waitForFunction(() => Boolean(window.$CONFIG), null, { timeout: 4000 }).catch(() => {});
     const identity = await this.readIdentity(page).catch(() => ({ status: 'invalid' }));
     if (identity.status === 'valid') {
@@ -645,7 +949,7 @@ export class WeiboAdapter {
       return { page };
     }
     onStage('navigate-qr');
-    await page.goto('https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog&url=https%3A%2F%2Fweibo.com%2F', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await gotoChecked(page, 'https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog&url=https%3A%2F%2Fweibo.com%2F', { stage: 'login-qr' });
     onStage('qr-page-ready');
     // The initial window activation happens before navigation. Restore it again
     // after the actual QR login page has loaded so it does not recede behind the
@@ -680,12 +984,69 @@ export class WeiboAdapter {
   async readIdentity(page) {
     // The server-rendered desktop config identifies the logged-in viewer, not the
     // author of a visited profile. Waiting on the passport page never navigates it.
-    if (new URL(page.url()).hostname !== 'weibo.com') return { status: 'invalid' };
-    const viewer = await page.evaluate(() => {
-      const config = window.$CONFIG;
-      return config ? { uid: String(config.uid || config.user?.idstr || config.user?.id || ''), nickname: config.user?.screen_name || '' } : null;
-    });
-    if (!viewer) throw new AdapterError('微博页面尚未加载登录信息', 'network_error');
+    const currentUrl = String(page.url?.() || '');
+    const parsed = parsePageUrl(currentUrl);
+    if (!parsed || isUnloadedPageUrl(currentUrl)) {
+      throw new NavigationUnavailableError('微博页面未能加载，无法读取登录身份', {
+        navigationUrl: currentUrl, stage: 'identity', netCode: 'PAGE_UNLOADED'
+      });
+    }
+    // A real passport/login redirect is a signed-out state, not a broken page.
+    if (parsed.hostname !== 'weibo.com') {
+      if (parsed.hostname === 'passport.weibo.com' || parsed.hostname === 'passport.weibo.cn') return { status: 'invalid' };
+      throw new NavigationUnavailableError('微博页面跳转至非登录业务页，身份暂不可读', { navigationUrl: 'https://weibo.com/', stage: 'identity', netCode: 'PAGE_UNEXPECTED_HOST' });
+    }
+    let viewer;
+    try {
+      viewer = await page.evaluate(() => {
+        const config = window.$CONFIG;
+        const bodyText = String(document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+        return {
+          uid: String(config?.uid || config?.user?.idstr || config?.user?.id || ''),
+          nickname: config?.user?.screen_name || '',
+          hasConfig: Boolean(config),
+          readyState: document.readyState,
+          body: Boolean(document.body),
+          title: String(document.title || ''),
+          textLength: bodyText.length,
+          htmlLength: Number((document.documentElement?.innerHTML || '').length),
+          loginForm: Boolean(document.querySelector('form[action*="login" i], input[name="username" i], [node-type="loginName"], [class*="loginForm" i], [class*="login-form" i]')),
+          challengeHint: /安全验证|请完成验证|验证码|账号存在风险/.test(bodyText)
+            || Boolean(document.querySelector('iframe[src*="captcha"], [class*="geetest_panel"], .yidun_modal__wrap'))
+        };
+      });
+    } catch (error) {
+      if (/Execution context was destroyed|Cannot find context|Target closed|Navigation failed/i.test(String(error?.message || ''))) {
+        throw new NavigationUnavailableError('微博页面在读取身份时发生跳转或关闭', {
+          navigationUrl: currentUrl, stage: 'identity', netCode: 'PAGE_UNLOADED'
+        });
+      }
+      throw error;
+    }
+    // Fields are absent on lightweight test doubles; only reject when the real
+    // document reports an unloaded or error state.
+    if (viewer && (viewer.body === false || viewer.readyState === 'loading' || (viewer.htmlLength != null && viewer.htmlLength < 50))) {
+      throw new NavigationUnavailableError('微博页面尚未完整加载，无法读取登录身份', {
+        navigationUrl: currentUrl, stage: 'identity', netCode: 'PAGE_EMPTY'
+      });
+    }
+    if (viewer && ERROR_PAGE_TEXT.test(String(viewer.title || ''))) {
+      throw new NavigationUnavailableError('微博返回了错误页，无法读取登录身份', {
+        navigationUrl: currentUrl, stage: 'identity', netCode: 'PAGE_ERROR'
+      });
+    }
+    // A visible captcha is a verification state, never a logout.  Hidden
+    // template text alone must not trigger it, so confirm with the same widget
+    // detector used by the rest of the adapter.
+    if (viewer?.challengeHint && await pageHasVisibleChallenge(page)) {
+      throw new VerificationError('微博要求进行安全验证，请完成验证后重试');
+    }
+    if (!viewer || (!viewer.hasConfig && !viewer.uid)) {
+      if (viewer?.loginForm) return { status: 'invalid' };
+      throw new NavigationUnavailableError('微博页面尚未加载登录信息', {
+        navigationUrl: currentUrl, stage: 'identity', netCode: 'PAGE_NOT_RECOGNIZED'
+      });
+    }
     const uid = viewer.uid;
     if (!uid || !/^\d+$/.test(uid) || uid === '0') return { status: 'invalid' };
     let nickname = viewer.nickname;
@@ -719,8 +1080,8 @@ export class WeiboAdapter {
 
   async getIdentity(account, owner = 'login') {
     const page = await this.browserManager.page(account, owner);
-    if (owner === 'runner' && new URL(page.url()).hostname !== 'weibo.com') {
-      await page.goto('https://weibo.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    if (owner === 'runner' && parsePageUrl(page.url?.())?.hostname !== 'weibo.com') {
+      await gotoChecked(page, 'https://weibo.com/', { stage: 'identity-home' });
     }
     return this.readIdentity(page);
   }
@@ -747,11 +1108,25 @@ export class WeiboAdapter {
     return resolved;
   }
 
-  async closeManual(context) { await this.browserManager.closeManual?.(context); }
+  async closeManual(context) {
+    try {
+      for (const handle of [this.manualPostReceipt, this.manualCommentReceipt]) {
+        if (!context || handle?.page?.context?.() === context) await handle?.stop?.();
+      }
+    } finally {
+      await this.browserManager.closeManual?.(context);
+    }
+  }
+
+  currentSubmission(action) {
+    const handle = action?.kind === 'comment' ? this.manualCommentReceipt : this.manualPostReceipt;
+    return handle && handle.actionId === action?.id && handle.attemptId === action?.attempt_id
+      && !handle.page?.isClosed?.() ? handle : null;
+  }
 
   async pageFor(account, topic) {
     const page = await this.browserManager.page(account, this.taskOwner());
-    await page.goto(topic.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await gotoChecked(page, topic.url, { stage: 'topic-page' });
     await detectChallenge(page, this.browserManager);
     return page;
   }
@@ -765,7 +1140,7 @@ export class WeiboAdapter {
       ? await this.browserManager.page(account, this.taskOwner())
       : await this.pageFor(account, topic);
     if (reusePage && page.url() !== topic.url) {
-      await page.goto(topic.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await gotoChecked(page, topic.url, { stage: 'topic-page' });
     }
     await detectChallenge(page, this.browserManager);
     await page.locator('[class*="signBtn"]').first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
@@ -789,11 +1164,12 @@ export class WeiboAdapter {
     return { state: 'uncertain', url: page.url(), reason: '点击签到后未验收到“已签到”状态' };
   }
 
-  async post(account, topic, text, { onSubmit = () => {}, onReceipt = () => {}, syncToHome = false, deadlineAt, intervalSeconds = 10 } = {}) {
-    this.manualPostReceipt?.stop();
+  async post(account, topic, text, { onSubmit = () => {}, onReceipt = () => {}, syncToHome = false, deadlineAt,
+    attemptId = randomUUID(), actionId = null, receiptTimeoutMs = 15000, signal } = {}) {
+    await this.manualPostReceipt?.stop();
     await this.ensureIdentity(account);
     const page = await this.browserManager.page(account, this.taskOwner());
-    await page.goto('https://weibo.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await gotoChecked(page, 'https://weibo.com/', { stage: 'post-home' });
     await detectChallenge(page, this.browserManager);
     const target = topic.url.match(/\/p\/(100808\w+)/)?.[1];
     if (!target) throw new UnsupportedPageError('超话链接缺少可核对的目标标识');
@@ -831,84 +1207,77 @@ export class WeiboAdapter {
     if ((await sync.isChecked()) !== syncToHome) throw new UnsupportedPageError('无法确认主页同步设置，未发送');
     const publish = dialog.getByRole('button', { name: /^(发送|发布)$/ });
     if (await publish.count() !== 1 || !await publish.isEnabled()) throw new UnsupportedPageError('发博窗口的发送按钮不可用，未发送');
-    // Keep listening after the first captcha response: completing the widget
-    // can publish automatically without a second click.
-    let latest = null, accepted = null;
-    const receiptEvents = [];
-    const listener = async response => {
-      if (response.request().method() !== 'POST' || !/^\/ajax\/(statuses|stopic)\/(update|create|add)$/.test(new URL(response.url()).pathname)) return;
-      const payload = await readJsonBounded(response);
-      const result = classifyPostReceipt(payload, response.ok());
-      receiptEvents.push({ at: Date.now(), status: response.status(), code: payload?.error_code ?? payload?.code ?? null, kind: result.kind });
-      if (!payload) this.log('warning', `发帖回执内容读取超时：HTTP ${response.status()}，按未知结果继续`, { accountId: account.id, topicId: topic.id });
-      this.log('info', `发帖回执 #${receiptEvents.length}：HTTP ${response.status()}，业务码 ${payload?.error_code ?? payload?.code ?? '无'}，分类 ${result.kind}`, { accountId: account.id, topicId: topic.id });
-      latest = { response, payload, result };
-      if (result.kind === 'succeeded' && !accepted) {
-        accepted = latest;
-        try { onReceipt({ receiptId: result.id, receiptUrl: receiptUrl(result.id), url: receiptUrl(result.id), state: 'succeeded', error: '' }); }
-        catch (error) { if (!(error instanceof DailyStopError)) this.log('warning', `发布回执保存失败：${error.message}`); }
+    let savedSuccess = null, savingSuccess = null;
+    const saveSuccess = receipt => {
+      if (savingSuccess) return savingSuccess;
+      savedSuccess = receipt;
+      savingSuccess = Promise.resolve().then(() => onReceipt(receipt));
+      // Both observers may discover the same success concurrently. Persist it
+      // once, and let their read/drain methods report a persistence failure.
+      return savingSuccess;
+    };
+    const notice = await createPostSuccessNoticeObserver(page, { attemptId, onSuccess: saveSuccess });
+    const collector = createPostReceiptCollector({
+      page, attemptId, submittedText: await editor.inputValue(), topicId: target,
+      onReceipt: saveSuccess, classify: classifyPostReceipt, readJson: readJsonBounded, receiptTimeoutMs, signal,
+      log: event => this.log('info', `发帖回执：${JSON.stringify({ actionId, ...event })}`, { accountId: account.id, topicId: topic.id })
+    });
+    this.manualPostReceipt = { kind: 'post', actionId, page, attemptId, stop: async () => { collector.stop(); await notice.stop(); },
+      read: async () => { await acceptedResult(); return collector.read(); }, events: collector.events };
+    let handedOff = false;
+    const acceptedResult = async () => {
+      await notice.read();
+      if (!savedSuccess && !collector.accepted) return null;
+      try { await savingSuccess; }
+      catch (cause) { throw Object.assign(new Error('发布成功回执保存异常，禁止重新发送', { cause }), { code: 'receipt_persistence_failed' }); }
+      if (collector.saveError) throw Object.assign(new Error('发布成功回执保存异常，禁止重新发送'), { code: 'receipt_persistence_failed', needsReadback: true });
+      return { state: 'succeeded', receiptId: savedSuccess?.receiptId || null,
+        receiptUrl: savedSuccess?.receiptUrl || null, url: savedSuccess?.url || null,
+        successSource: savedSuccess?.successSource || 'api_receipt' };
+    };
+    try {
+      await submitBeforeDeadline(publish, async () => { await notice.begin(); await onSubmit(); collector.begin(); }, deadlineAt);
+      while (!collector.expired && !signal?.aborted) {
+        if (await acceptedResult()) break;
+        try { await detectChallenge(page, this.browserManager); }
+        catch (error) { if (await acceptedResult()) break; throw error; }
+        if (await acceptedResult()) break;
+        const result = collector.read()?.result;
+        if (result?.kind === 'verification') throw new VerificationError(result.reason);
+        if (['muted', 'frequent'].includes(result?.kind)) break;
+        if (collector.expired) break;
+        await page.waitForTimeout(100);
       }
-    };
-    const responseSource = page.context?.() || page;
-    // Unsubscribe from both the response stream and the page's close event.
-    // Leaving the close hook behind leaked one listener per post.
-    const onClose = () => stopListening();
-    const stopListening = () => {
-      responseSource.off('response', listener);
-      page.off?.('close', onClose);
-    };
-    responseSource.on('response', listener);
-    page.on('close', onClose);
-    if (this.taskOwner() !== 'manual') {
-      const cleanup = setTimeout(stopListening, Math.max(1, Number(intervalSeconds) * 1000));
-      cleanup.unref?.();
+      await collector.drain();
+      const success = await acceptedResult();
+      if (success) return success;
+      const latest = collector.read(), classification = latest?.result;
+      const denied = latest?.payload?.success === false || latest?.payload?.ok === false || latest?.payload?.ok === 0 || latest?.payload?.data?.ok === 0;
+      if (classification?.kind === 'verification') throw new VerificationError(classification.reason);
+      if (classification?.kind === 'muted') throw new MutedError(classification.reason, 'post', denied);
+      if (classification?.kind === 'frequent') throw new RateLimitError(classification.reason, 'post', denied);
+      if (classification?.kind === 'failed') return { state: 'failed', url: null, reason: classification.reason || '微博明确拒绝发布' };
+      const muted = await visibleMutedMessage(page);
+      if (muted) throw new MutedError(muted, 'post', false);
+      const frequent = await visibleRateMessage(page);
+      if (frequent) throw new RateLimitError(frequent, 'post', false);
+      return { state: 'uncertain', url: null,
+        reason: '已提交，但未收到明确成功或失败提示，请人工核对' };
+    } catch (error) {
+      // The page probe can fail while a receipt's body is still being read.
+      await collector.drain();
+      const success = await acceptedResult();
+      if (success) return success;
+      if (error instanceof VerificationError) {
+        // This composer may auto-submit when the user solves its widget. Do
+        // not mark it unpublished or create a new attempt in the meantime.
+        collector.handoff(); handedOff = true;
+        error.submittedUncertain = true;
+      }
+      throw error;
+    } finally {
+      if (!handedOff) { await collector.finish(); await notice.stop(); }
     }
-    this.manualPostReceipt = { page, stop: stopListening, read: () => accepted || latest, events: receiptEvents };
-    await submitBeforeDeadline(publish, onSubmit, deadlineAt);
-    const until = Date.now() + Math.max(0, Number(intervalSeconds) * 1000);
-    let verification = '';
-    do {
-      if (accepted) break;
-      try { await detectChallenge(page, this.browserManager); }
-      catch (error) {
-        const payload = latest?.payload;
-        const rejected = payload?.ok === 0 || payload?.ok === false || payload?.success === false;
-        if (error instanceof VerificationError && rejected && this.taskOwner() !== 'manual') error.explicitlyUnpublished = true;
-        throw error;
-      }
-      verification = latest?.result?.kind === 'verification' ? latest.result.reason : '';
-      if (verification) { const error = new VerificationError(verification); error.explicitlyUnpublished = this.taskOwner() !== 'manual' && latest.result.explicitlyUnpublished; throw error; }
-      if (['muted','frequent'].includes(latest?.result?.kind)) break;
-      if (Date.now() >= until) break;
-      await page.waitForTimeout(Math.min(100, Math.max(1, until - Date.now())));
-    } while (true);
-    if (!latest) this.log('warning', '点击发送后未捕获发帖回执，改为只读核对是否已发布', { accountId: account.id, topicId: topic.id, url: page.url() });
-    latest = accepted || latest;
-    const outcome = { response: latest?.response };
-    if (outcome.restrictionMessage && isMutedMessage(outcome.restrictionMessage)) throw new MutedError(outcome.restrictionMessage, 'post', Boolean(outcome.response));
-    if (outcome.restrictionMessage && isRateLimitMessage(outcome.restrictionMessage)) throw new RateLimitError(outcome.restrictionMessage, 'post', Boolean(outcome.response));
-    const submitted = outcome.response;
-    const data = latest?.payload;
-    const mutedMessage = accepted ? '' : mutedMessageFromReceipt(data) || await visibleMutedMessage(page);
-    if (mutedMessage) throw new MutedError(mutedMessage, 'post', Boolean(submitted));
-    const rateMessage = accepted ? '' : rateMessageFromReceipt(data) || await visibleRateMessage(page);
-    if (isRateLimitMessage(rateMessage)) throw new RateLimitError(rateMessage, 'post', Boolean(submitted));
-    const item = data?.data || data;
-    const statusId = accepted?.result.id;
-    const publishedUrl = statusId ? receiptUrl(statusId) : null;
-    if (statusId) onReceipt({ receiptId: String(statusId), receiptUrl: publishedUrl, url: publishedUrl });
-    const rejected = latest?.result?.kind === 'failed';
-    if (rejected) return { state: 'failed', url: page.url(), reason: '微博回执明确表示发帖未被接受' };
-    if (!submitted?.ok() || !statusId) return { state: 'uncertain', url: page.url(), reason: '已提交，但未取得可核实的微博编号' };
-    // A successful publishing receipt with a concrete status ID is durable
-    // evidence that the operation was accepted.  Do not hold up every later
-    // task while Weibo's eventually-consistent detail endpoint catches up.
-    // The audit is read-only and deliberately cannot downgrade this accepted
-    // post or race with the scheduler.
-    void verifyPublishedPost(page, this.browserManager, { receiptId: String(statusId), uid: account.uid, content: text, topicName: topic.name }, { background: true })
-      .then(result => { if (result.state !== 'succeeded') this.log('warning', `发帖回执详情异步核验未完成：${result.reason}`, { accountId: account.id, topicId: topic.id, url: publishedUrl }); })
-      .catch(error => this.log('warning', `发帖回执详情异步核验异常：${error.message}`, { accountId: account.id, topicId: topic.id, url: publishedUrl }));
-    return { state: 'succeeded', url: publishedUrl, receiptId: String(statusId), receiptUrl: publishedUrl };
   }
 
   async collectCandidates(account, topic, { section = '最新', limit = 50, onBatch = null, assertRunning = () => {} } = {}) {
@@ -1028,7 +1397,7 @@ export class WeiboAdapter {
   // a comment arriving between the list scan and submission.
   async inspectCandidate(account, candidate, { inFeed = false } = {}) {
     const page = await this.browserManager.page(account, this.taskOwner());
-    if (!inFeed) await page.goto(candidate.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    if (!inFeed) await gotoChecked(page, candidate.url, { stage: 'candidate-page' });
     await detectChallenge(page, this.browserManager);
     const expectedId = String(candidate.id || '');
     const statusId = /^\d+$/.test(expectedId) ? expectedId : weiboShortIdToNumeric(expectedId);
@@ -1049,7 +1418,7 @@ export class WeiboAdapter {
     const identity = knownIdentity || await this.ensureIdentity(account);
     const page = await this.browserManager.page(account, this.taskOwner());
     if (new URL(page.url()).href !== new URL(candidate.url).href) {
-      await page.goto(candidate.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await gotoChecked(page, candidate.url, { stage: 'comment-page' });
     }
     await detectChallenge(page, this.browserManager);
     const authorUid = candidate.authorUid || new URL(candidate.url).pathname.match(/^\/(\d+)\//)?.[1] || '';
@@ -1093,9 +1462,10 @@ export class WeiboAdapter {
     return { state: 'uncertain', url: candidate.url, reason: '按倒序查看最新 50 条评论，仍未找到昵称和完整文案均匹配的评论' };
   }
 
-  async comment(account, candidate, content, { onSubmit = () => {}, deadlineAt } = {}) {
+  async comment(account, candidate, content, { onSubmit = () => {}, onReceipt = () => {}, attemptId = randomUUID(), actionId = null, deadlineAt } = {}) {
+    await this.manualCommentReceipt?.stop?.();
     const page = await this.browserManager.page(account, this.taskOwner());
-    await page.goto(candidate.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await gotoChecked(page, candidate.url, { stage: 'comment-page' });
     await detectChallenge(page, this.browserManager);
     await page.locator('textarea[placeholder*="评论"]').first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
     const editor = await firstVisible([
@@ -1108,15 +1478,37 @@ export class WeiboAdapter {
     const submit = await firstVisible([region.getByRole('button', { name: /^(评论|发送)$/ }), region.getByText(/^(评论|发送)$/, { exact: true })]);
     if (!submit) throw new UnsupportedPageError('已经填写评论，但没有识别到评论按钮');
     if (!await submit.isEnabled()) throw new UnsupportedPageError('评论按钮不可点击，未发送');
+    let saved = null, saving = null, submitted = false, handedOff = false, signalNotice;
+    const noticeSignal = new Promise(resolve => { signalNotice = resolve; });
+    const notice = await createCommentSuccessNoticeObserver(page, { attemptId, onSuccess: receipt => {
+      if (saving) return saving;
+      saved = { ...receipt, url: candidate.url };
+      saving = Promise.resolve().then(() => onReceipt(saved));
+      void saving.then(() => signalNotice({}), () => signalNotice({}));
+      return saving;
+    } });
+    const acceptedResult = async () => {
+      await notice.read();
+      if (!saved) return null;
+      try { await saving; }
+      catch (cause) { throw Object.assign(new Error('评论成功回执保存异常，禁止重新评论', { cause }), { code: 'receipt_persistence_failed' }); }
+      return { ...saved, state: 'succeeded' };
+    };
+    this.manualCommentReceipt = { kind: 'comment', actionId, attemptId, page,
+      read: () => notice.read(), stop: () => notice.stop() };
+    try {
     const receipt = page.waitForResponse(r => r.request().method() === 'POST' && /^\/ajax\/comments\/(create|reply|add)$/.test(new URL(r.url()).pathname), { timeout: 15000 }).catch(() => null);
-    await submitBeforeDeadline(submit, onSubmit, deadlineAt);
+    await submitBeforeDeadline(submit, async () => { await notice.begin(); await onSubmit(); submitted = true; }, deadlineAt);
     await page.waitForTimeout(300);
+    if (await acceptedResult()) return acceptedResult();
     await detectChallenge(page, this.browserManager);
-    const outcome = await waitForReceiptOrRateLimit(page, receipt);
+    const outcome = await Promise.race([waitForReceiptOrRateLimit(page, receipt), noticeSignal]);
+    if (await acceptedResult()) return acceptedResult();
     if (outcome.restrictionMessage && isMutedMessage(outcome.restrictionMessage)) throw new MutedError(outcome.restrictionMessage, 'comment', Boolean(outcome.response));
     if (outcome.restrictionMessage && isRateLimitMessage(outcome.restrictionMessage)) throw new RateLimitError(outcome.restrictionMessage, 'comment', Boolean(outcome.response));
     const response = outcome.response;
     const payload = await readJsonBounded(response);
+    if (await acceptedResult()) return acceptedResult();
     const classification = classifyCommentReceipt(payload, Boolean(response?.ok()));
     if (response) {
       const code = String(payload?.error_code ?? payload?.code ?? payload?.data?.error_code ?? '无').replace(/[^\w-]/g, '').slice(0, 40);
@@ -1150,7 +1542,18 @@ export class WeiboAdapter {
     if (result.state === 'succeeded' && !result.url.includes('comment_id=') && commentId) {
       result.url = `${candidate.url}${candidate.url.includes('?') ? '&' : '?'}comment_id=${encodeURIComponent(commentId)}`;
     }
-    return result;
+    return await acceptedResult() || result;
+    } catch (error) {
+      const success = await acceptedResult();
+      if (success) return success;
+      if (error instanceof VerificationError && submitted) {
+        handedOff = true;
+        error.submittedUncertain = true;
+      }
+      throw error;
+    } finally {
+      if (!handedOff) await notice.stop();
+    }
   }
 
   static describeError(error) {

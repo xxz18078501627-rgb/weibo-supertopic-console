@@ -250,6 +250,9 @@ const status = {
 function lightFor(value) {
   return { succeeded: "ok", failed: "bad", uncertain: "warn", submitted: "warn", skipped: "idle", verification_wait: "warn", cancelled: "idle" }[value] || "idle";
 }
+function displayState(action) {
+  return action.display_state || action.state;
+}
 function renderLights() {
   const node = $("#status-lights");
   if (!node) return;
@@ -267,8 +270,9 @@ function recentRow(item) {
   const key = String(item.id || (item.started_at || item.created_at || "") + (item.kind || ""));
   const open = key === expandedRecent;
   const link = /^https?:\/\//.test(item.url || "");
+  const shownState = displayState(item);
   const detail = open ? "<div class='recent-detail'><div><span class='lbl'>返链</span>" + (link ? " <a href='" + esc(item.url) + "' target='_blank' rel='noreferrer'>" + esc(item.url) + "</a>" : " 无返链") + "</div>" + (item.receipt_id ? "<div><span class='lbl'>回执</span>" + esc(item.receipt_id) + "</div>" : "") + (item.content ? "<div class='copy'><span class='lbl'>文案</span>" + esc(item.content) + "</div>" : "") + (item.error ? "<div><span class='lbl'>原因</span>" + esc(item.error) + "</div>" : "") + "</div>" : "";
-  return "<article class='recent-row " + (open ? "open" : "") + "' data-recent='" + esc(key) + "' tabindex='0' role='button'><i class='light " + lightFor(item.state) + "'></i><time>" + time(item.started_at || item.created_at) + "</time><b>" + esc(item.account_name || "系统") + "</b><span class='recent-kind'>" + kind(item.kind) + "</span><span class='recent-state " + (item.state || "") + "'>" + (stateName(item.state) || '') + "</span><span class='recent-caret'>" + (open ? "收起 ▴" : "展开 ▾") + "</span></article>" + detail;
+  return "<article class='recent-row " + (open ? "open" : "") + "' data-recent='" + esc(key) + "' tabindex='0' role='button'><i class='light " + lightFor(shownState) + "'></i><time>" + time(item.started_at || item.created_at) + "</time><b>" + esc(item.account_name || "系统") + "</b><span class='recent-kind'>" + kind(item.kind) + "</span><span class='recent-state " + (shownState || "") + "'>" + (stateName(shownState) || '') + "</span><span class='recent-caret'>" + (open ? "收起 ▴" : "展开 ▾") + "</span></article>" + detail;
 }
 function recentRows() {
   const live = (state?.recentActions || []).slice(0, 20);
@@ -354,7 +358,12 @@ function renderOverview({ configFields = true } = {}) {
     const connection = job.cursor?.networkRecovery;
     const active = ["running", "waiting", "paused"].includes(job.status);
     const checked = connection?.lastCheckedAt ? "最近检测 " + time(connection.lastCheckedAt, true) : "等待首次检测";
-    if (active && connection?.state === "offline") {
+    const navigation = job.cursor?.navigationRecovery;
+    if (active && navigation?.state === "waiting") {
+      $("#run-detail").textContent = job.pausedByUser ? "已改为手动暂停，页面恢复后不会自动开始。" :
+        "页面暂不可用，正在自动等待恢复。连续两次页面检查通过后接续，不会重复发送。" +
+        (navigation.nextCheckAt ? "下次检查 " + time(navigation.nextCheckAt, true) : "");
+    } else if (active && connection?.state === "offline") {
       $("#run-detail").textContent = job.pausedByUser ? "已改为手动暂停，联网后不会自动开始。" : "网络中断，任务已自动暂停。每 5 秒检测网络，连续两次连通后自动继续。" + checked;
     } else if (active && connection) {
       if (connection.probeState === "unknown" || connection.probeState === "offline") $("#run-detail").textContent = "检测暂不可用，尚未确认断网。" + checked;
@@ -391,7 +400,7 @@ function renderOverview({ configFields = true } = {}) {
 function controls(job) {
   if (editingJob)
     return `<button data-edit-action="save-resume" type="button">保存并继续运行</button><button data-edit-action="cancel" type="button">取消修改</button><button data-job-action="stop" data-job="${job.id}" type="button">停止任务</button>`;
-  if (job.status === 'paused' && !job.pausedByUser && job.cursor?.networkRecovery?.state === 'offline')
+  if (job.status === 'paused' && !job.pausedByUser && (job.cursor?.networkRecovery?.state === 'offline' || job.cursor?.navigationRecovery?.state === 'waiting'))
     return `<button data-job-action="pause" data-job="${job.id}">改为手动暂停</button><button data-job-action="stop" data-job="${job.id}">停止</button>`;
   if (
     state.verification?.jobId === job.id &&
@@ -849,7 +858,8 @@ document.addEventListener('pointerup', () => {
   request('/api/accounts/order', { method: 'POST', body: { ids } }).catch(() => {});
 });
 function action(x) {
-  return `<article class="activity"><time>${time(x.started_at)}</time><div><strong>${esc(x.account_name || "")} · ${esc(x.topic_name || "")}</strong><div>${kind(x.kind)}${x.content ? ` · ${esc(x.content)}` : ""}</div>${x.url ? `<a href="${esc(x.url)}" target="_blank" rel="noreferrer">打开目标帖</a>` : ""}</div><span class="result ${x.state}">${stateName(x.state)}</span></article>`;
+  const shownState = displayState(x);
+  return `<article class="activity"><time>${time(x.started_at)}</time><div><strong>${esc(x.account_name || "")} · ${esc(x.topic_name || "")}</strong><div>${kind(x.kind)}${x.content ? ` · ${esc(x.content)}` : ""}</div>${x.url ? `<a href="${esc(x.url)}" target="_blank" rel="noreferrer">打开目标帖</a>` : ""}</div><span class="result ${shownState}">${stateName(shownState)}</span></article>`;
 }
 function kind(x) {
   return { checkin: "签到", post: "发帖", comment: "评论" }[x] || x;
@@ -1494,11 +1504,11 @@ function mergedLogEntries(filter) {
     ...recordData.actions.map((item) => ({
       ...item,
       created_at: item.started_at,
-      level: logEntryLevel(item.state),
+      level: logEntryLevel(displayState(item)),
       message:
         kind(item.kind) +
         " · " +
-        stateName(item.state) +
+        stateName(displayState(item)) +
         (item.error ? "：" + item.error : ""),
     })),
   ];
@@ -1541,7 +1551,8 @@ function renderLogSummary() {
   const perKind = { checkin: {}, post: {}, comment: {} };
   for (const a of recordData.actions || []) {
     if (!perKind[a.kind]) continue;
-    perKind[a.kind][a.state] = (perKind[a.kind][a.state] || 0) + 1;
+    const shown = displayState(a);
+    perKind[a.kind][shown] = (perKind[a.kind][shown] || 0) + 1;
   }
   const stat = (k, key) => {
     const fromView = view?.counts?.[k]?.[key];

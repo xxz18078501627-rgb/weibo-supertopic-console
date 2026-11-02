@@ -11,7 +11,7 @@ export function createVerificationUI({ getState, request, refresh, toast }) {
     const state = getState(), verification = state.verification; if (!verification) return;
     let action, body = {};
     if (button.dataset.verifyToggle != null) { const id = button.dataset.verifyToggle; if (openRows.has(id)) openRows.delete(id); else openRows.add(id); render(); return; }
-    if (button.dataset.verifyIdentity) { action = 'open'; body.identity = button.dataset.verifyIdentity; }
+    if (button.dataset.verifyIdentity) { action = 'open'; body.identity = button.dataset.verifyIdentity; if (button.dataset.verifyStep) body.stepKey = button.dataset.verifyStep; }
     if (button.dataset.verificationEnd != null) action = 'end';
     if (button.dataset.verificationContinue != null) action = 'continue';
     if (button.dataset.verificationRecheck != null) action = 'recheck';
@@ -57,7 +57,7 @@ export function createVerificationUI({ getState, request, refresh, toast }) {
     const totalCards = allCards.length;
     const pendingCheckins = cards.reduce((n, card) => n + card.steps.filter(step => step.kind === 'checkin' && ['deferred', 'review', 'running', 'pending'].includes(step.state)).length, 0);
     const session = verification.session;
-    const sessionText = session ? (session.phase === 'requested' ? '等待打开验证窗口…' : session.phase === 'signing_checkin' || session.phase === 'submitting_checkin' ? '正在当前窗口补做签到…' : session.phase === 'challenge' ? '正在当前窗口手动验证…' : session.phase === 'awaiting_post_receipt' ? '正在确认发帖回执…' : '正在打开账号…') : '';
+    const sessionText = session ? (session.phase === 'requested' ? '等待打开验证窗口…' : session.phase === 'signing_checkin' || session.phase === 'submitting_checkin' ? '正在当前窗口补做签到…' : session.phase === 'challenge' ? '正在当前窗口手动验证…' : session.phase === 'awaiting_post_receipt' ? '正在等待本次发帖成功提示…' : session.phase === 'awaiting_comment_receipt' ? '正在等待本次评论成功提示…' : session.phase === 'submitting_post' ? '正在当前窗口发帖…' : session.phase === 'submitting_comment' ? '正在当前窗口评论…' : '正在打开账号…') : '';
     let html = '<header class="verify-head"><h2>待验证账号</h2><span class="verify-count" title="已验证 ' + completed + ' / 本轮共 ' + totalCards + ' 个待验证账号">' + completed + '/' + totalCards + '</span>' + (pendingCheckins ? '<span class="verify-hint" title="待补做 ' + pendingCheckins + ' 项">待补做 ' + pendingCheckins + '</span>' : '');
     if (sessionText) html += '<span class="verify-session" role="status">' + sessionText + '</span>';
     html += '<div class="verify-actions">';
@@ -71,14 +71,18 @@ export function createVerificationUI({ getState, request, refresh, toast }) {
       const pending = card.steps.filter(step => step.kind === 'checkin' && ['deferred', 'review', 'running', 'pending'].includes(step.state)).length;
       const open = openRows.has(card.identity);
       const tone = card.status === 'resolved' ? 'ok' : pending ? 'warn' : card.status === 'validating' ? 'blue' : 'warn';
-      const hint = pending ? '签到待补做（剩 ' + pending + ' 项）' : (card.reason || labels[card.status] || '');
+      const hint = card.currentKind ? '当前：' + kind(card.currentKind) + ' · ' + (card.reason || labels[card.status] || '') : (card.reason || labels[card.status] || '');
       html += '<article class="verify-row' + (open ? ' open' : '') + '" data-identity="' + esc(card.identity) + '">';
       html += '<i class="light ' + tone + '"></i><b>' + esc(card.name) + '</b><span class="uid">UID ' + esc(card.uid || '—') + '</span>';
       html += '<span class="why" title="' + esc(card.reason || '') + '">' + esc(hint) + '</span>';
       html += '<button class="text-button" data-verify-toggle="' + esc(card.identity) + '" type="button">' + (open ? '收起' : '详情') + '</button>';
-      html += '<button class="quiet" data-verify-identity="' + esc(card.identity) + '" type="button"' + (blocked || busy || card.status === 'resolved' || sending ? ' disabled' : '') + '>' + (card.status === 'ready' ? '再验证' : card.status === 'resolved' ? '已处理' : '验证') + '</button>';
+      const handled = card.status === 'resolved' || (card.status === 'ready' && card.verificationResult === 'passed');
+      html += '<button class="quiet" data-verify-identity="' + esc(card.identity) + '" data-verify-step="' + esc(card.currentStepKey || '') + '" type="button"' + (blocked || busy || handled || sending ? ' disabled' : '') + '>' + (handled ? '已验证' : '验证') + '</button>';
       if (open) {
-        html += '<div class="verify-detail"><p>待补做 ' + card.remainingStepCount + ' 项 · 待核对 ' + reviews.length + ' 项</p>';
+        const needsValidation = step => step.verificationPending ?? (card.verificationResult !== 'passed' && card.source !== 'checkin_unconfirmed');
+        const validating = reviews.filter(needsValidation).length;
+        const reviewing = reviews.length - validating;
+        html += '<div class="verify-detail"><p>待补做 ' + card.remainingStepCount + ' 项 · ' + (validating ? '待验证 ' + validating + ' 项' : '待核对 ' + reviewing + ' 项') + (validating && reviewing ? ' · 待核对 ' + reviewing + ' 项' : '') + '</p>';
         if (card.reason) html += '<p class="muted">' + esc(card.reason) + '</p>';
         for (const step of reviews) html += '<div class="verification-review"><span>' + esc(step.topicName) + ' · ' + kind(step.kind) + '</span><button class="text-button" data-confirm-unpublished="' + esc(step.key) + '"' + (blocked || busy ? ' disabled' : '') + ' type="button">确认未发布</button></div>';
         html += '</div>';

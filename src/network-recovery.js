@@ -66,6 +66,7 @@ export class NetworkRecovery {
     return result.stale || !info || (info.state !== 'offline' && (result.state !== 'offline' || (!result.definitive && info.failures < 2)));
   }
   async monitor(job) {
+    if (this.runner.navigation?.waiting(job)) return;
     if (!job || !['running','waiting'].includes(job.status) || this.checking || job.cursor.networkRecovery?.state === 'offline') return;
     this.checking = true;
     try {
@@ -122,6 +123,7 @@ export class NetworkRecovery {
     clearInterval(this.timer); this.timer = null; this.jobId = null;
   }
   async tick(jobId) {
+    if (this.runner.navigation?.waiting(getJob(jobId))) return;
     if (this.checking) return;
     this.checking = true;
     try {
@@ -140,7 +142,7 @@ export class NetworkRecovery {
         lastOutage: { since: info.since, reason: info.reason, restoredAt } } } });
       log('info', `任务网络已恢复，开始只读核验及接续；本次中断始于 ${info.since}`);
       const step = info.step;
-      if (step && !this.runner.workflow.session) {
+      if (step && this.runner.workflow.session?.jobId !== jobId) {
         const action = getStepAction(jobId, keyFor(step));
         if (action && ['submitted','uncertain'].includes(action.state)) {
           const account = getAccount(step.accountId), topic = listTopics().find(t => t.id === step.topicId);
@@ -150,6 +152,7 @@ export class NetworkRecovery {
             if (step.kind === 'checkin') result = await this.runner.adapter.verifyCheckin?.(account, topic) || result;
             if (step.kind === 'comment' && action.target_id && action.url) result = await this.runner.adapter.verifyComment?.(account, { id: action.target_id, url: action.url.split('?')[0] }, action.content, { delays: [0] }) || result;
           } catch (error) {
+            if (await this.runner.navigation?.handle(error, jobId, step)) return;
             if (await this.isNetworkError(error, jobId)) { this.pause(jobId, step, error.message); return; }
             if (error.code === 'verification_required' && this.runner.workflow.enabled(job)) { this.runner.workflow.defer(jobId, step, Object.assign(error, { submittedUncertain: true })); result = null; }
           }
@@ -161,9 +164,13 @@ export class NetworkRecovery {
           }
         }
       }
+      if (step && this.runner.workflow.session?.jobId === jobId && this.runner.workflow.enabled(getJob(jobId)) &&
+          this.runner.workflow.row(jobId, step)?.state === 'network_review' && getStepAction(jobId, keyFor(step))?.state !== 'succeeded') {
+        this.runner.workflow.finishStep(jobId, step, 'uncertain', '网络已恢复，已提交操作等待人工只读核验');
+      }
       job = getJob(jobId);
       if (job.pausedByUser || job.stopRequested || this.runner.isExpired(jobId)) return;
-      const waiting = Boolean(job.cursor.verificationBarrier || this.runner.workflow.session);
+      const waiting = Boolean(job.cursor.verificationBarrier || this.runner.workflow.session?.jobId === jobId);
       const updated = updateJob(jobId, { status: waiting ? 'waiting' : 'running', waitReason: waiting ? '等待人工验证及补做' : null, cursor: { ...job.cursor, notice: '网络已恢复，继续任务' } });
       this.runner.emitUpdate(updated);
       if (!waiting) this.runner.run(jobId);

@@ -1,6 +1,7 @@
 import { db, getJob, getAccount, listTopics } from './db.js';
 import { now, shanghaiDate } from './util.js';
 import { isArchivedRecord } from './retention.js';
+import { displayStateSql } from './result-state.js';
 
 db.exec(`CREATE TABLE IF NOT EXISTS task_rounds (
   job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -36,7 +37,7 @@ export function dailyStats(date = shanghaiDate()) {
     return { date, counts: row ? JSON.parse(row.counts_json || '{}') : emptyCounts(), jobCount: Number(row?.job_count || 0), abnormalAccounts: Number(row?.abnormal_accounts || 0), archived: true };
   }
   const counts = emptyCounts();
-  for (const row of db.prepare("SELECT kind,state,COUNT(*) total FROM action_logs WHERE strftime('%Y-%m-%d',started_at,'+8 hours')=? GROUP BY kind,state").all(date)) {
+  for (const row of db.prepare(`SELECT l.kind,${displayStateSql(db)} state,COUNT(*) total FROM action_logs l WHERE strftime('%Y-%m-%d',l.started_at,'+8 hours')=? GROUP BY l.kind,(${displayStateSql(db)})`).all(date)) {
     if (counts[row.kind]?.[row.state] != null) counts[row.kind][row.state] = Number(row.total);
   }
   const jobCount = db.prepare("SELECT COUNT(*) c FROM jobs WHERE strftime('%Y-%m-%d',created_at,'+8 hours')=?").get(date).c;
@@ -48,7 +49,7 @@ export function startRound(jobId, round, startedAt = now()) {
 }
 
 function summaryFor(job, round, { details = false } = {}) {
-  const actions = db.prepare('SELECT * FROM action_logs WHERE job_id=? AND step_key LIKE ? ORDER BY started_at,id').all(job.id, `${round}:%`);
+  const actions = db.prepare(`SELECT l.*,${displayStateSql(db)} display_state FROM action_logs l WHERE l.job_id=? AND l.step_key LIKE ? ORDER BY l.started_at,l.id`).all(job.id, `${round}:%`);
   const counts = emptyCounts();
   const topics = new Map(listTopics().map(topic => [topic.id, topic.name]));
   const accounts = new Map((job.config.accountIds || []).map(accountId => {
@@ -59,9 +60,9 @@ function summaryFor(job, round, { details = false } = {}) {
   }));
   for (const action of actions) {
     const account = accounts.get(action.account_id);
-    if (counts[action.kind]?.[action.state] != null) counts[action.kind][action.state]++;
+    if (counts[action.kind]?.[action.display_state] != null) counts[action.kind][action.display_state]++;
     if (!account) continue;
-    if (account.counts[action.kind]?.[action.state] != null) account.counts[action.kind][action.state]++;
+    if (account.counts[action.kind]?.[action.display_state] != null) account.counts[action.kind][action.display_state]++;
     const topicName = job.config.topicIdentities?.[action.topic_id]?.name || topics.get(action.topic_id) || action.topic_id;
     if (details) account.actions.push({ ...action, topic_name: topicName });
     if (['failed', 'uncertain', 'submitted'].includes(action.state) || (action.state === 'skipped' && /禁言|频繁|登录失效|UID.*不符|UID.*一致/.test(action.error || ''))) account.anomalies.push({ kind: action.kind, topicId: action.topic_id, topicName, reason: action.error || (action.state === 'failed' ? '操作失败' : '结果待核对'), at: action.completed_at || action.started_at });
@@ -75,13 +76,15 @@ function summaryFor(job, round, { details = false } = {}) {
   let verification = null;
   if (Number(job.config.schedulerVersion || 0) >= 2) {
     const cards = db.prepare('SELECT * FROM verification_cards WHERE job_id=? AND round_index=?').all(job.id, round);
-    const steps = db.prepare('SELECT * FROM task_step_state WHERE job_id=? AND round_index=? AND ever_verification=1').all(job.id, round);
-    verification = { accounts: cards.length, triggers: cards.reduce((total, card) => total + card.attempts, 0), checkinUnconfirmed: cards.filter(card => card.source === 'checkin_unconfirmed').length, pending: steps.filter(step => ['pending','running','deferred'].includes(step.state)).length, succeeded: steps.filter(step => step.outcome === 'succeeded').length, uncertain: steps.filter(step => step.outcome === 'uncertain').length, failed: steps.filter(step => step.outcome === 'failed').length };
+    const steps = db.prepare(`SELECT s.*,${displayStateSql(db)} display_state FROM task_step_state s
+      LEFT JOIN action_logs l ON l.job_id=s.job_id AND l.step_key=s.step_key
+      WHERE s.job_id=? AND s.round_index=? AND s.ever_verification=1`).all(job.id, round);
+    verification = { accounts: cards.length, triggers: cards.reduce((total, card) => total + card.attempts, 0), checkinUnconfirmed: cards.filter(card => card.source === 'checkin_unconfirmed').length, pending: steps.filter(step => ['pending','running','deferred'].includes(step.state) || step.display_state === 'verification_wait').length, succeeded: steps.filter(step => step.outcome === 'succeeded').length, uncertain: steps.filter(step => step.outcome === 'uncertain' && step.display_state !== 'verification_wait').length, failed: steps.filter(step => step.outcome === 'failed').length };
     for (const card of cards) for (const account of accounts.values()) if (String(account.uid || `account:${account.id}`) === card.identity) {
       account.anomalies.push({ reason: `${card.source === 'checkin_unconfirmed' ? '签到结果未确认，' : ''}本轮触发人工验证 ${card.attempts} 次，${card.status === 'resolved' ? '已处理' : card.status === 'ready' ? '已验证，待补做' : '验证队列中'}`, at: card.updated_at });
     }
   }
-  return { counts, verification, accountCount: accounts.size, topicCount: job.config.topicIds?.length || 0, accounts: [...accounts.values()], abnormalAccounts: [...accounts.values()].filter(account => account.anomalies.length).map(({ actions, ...account }) => account) };
+  return { resultStateVersion: 1, counts, verification, accountCount: accounts.size, topicCount: job.config.topicIds?.length || 0, accounts: [...accounts.values()], abnormalAccounts: [...accounts.values()].filter(account => account.anomalies.length).map(({ actions, ...account }) => account) };
 }
 
 export function roundReport(row, { details = false } = {}) {
@@ -89,11 +92,18 @@ export function roundReport(row, { details = false } = {}) {
   const stored = row.summary_json ? JSON.parse(row.summary_json) : {};
   const base = { counts: emptyCounts(), verification: null, accountCount: 0, topicCount: 0, accounts: [], abnormalAccounts: [] };
   let summary;
-  if (row.summary_json && row.status === 'completed') {
+  if (row.summary_json && ['completed', 'stopped'].includes(row.status)) {
     summary = { ...base, ...stored };
+    // Upgrade the view of retained reports without reopening the round or
+    // moving its timestamps. Archived reports keep their original snapshot.
+    const retained = job && db.prepare('SELECT 1 FROM task_step_state WHERE job_id=? AND round_index=? LIMIT 1').get(row.job_id, row.round_index);
+    if (retained && stored.resultStateVersion !== 1) summary = { ...summary, ...summaryFor(job, row.round_index, { details }) };
     if (details && job) {
       const live = summaryFor(job, row.round_index, { details: true });
-      if (live.accounts.some(account => (account.actions || []).length)) summary.accounts = live.accounts;
+      const hasSteps = db.prepare('SELECT 1 FROM task_step_state WHERE job_id=? AND round_index=? LIMIT 1').get(row.job_id, row.round_index);
+      if (hasSteps && live.accounts.some(account => (account.actions || []).length)) summary.accounts = live.accounts;
+      else summary.accounts = summary.accounts.map(account => ({ ...account,
+        actions: live.accounts.find(item => item.id === account.id)?.actions || [] }));
     }
   } else if (job) {
     summary = summaryFor(job, row.round_index, { details });
@@ -113,6 +123,36 @@ export function finishRound(jobId, round, status = 'completed') {
   db.prepare('UPDATE task_rounds SET completed_at=?,status=?,summary_json=? WHERE job_id=? AND round_index=? AND status=?')
     .run(now(), status, JSON.stringify(summary), jobId, round, 'running');
   return roundReport(db.prepare('SELECT * FROM task_rounds WHERE job_id=? AND round_index=?').get(jobId, round));
+}
+
+// Reconciliation changes counts, not the historical lifecycle or notification
+// acknowledgement. Completed reports otherwise keep their original snapshot.
+export function refreshRoundSummary(jobId, round, { action = null, nextState = null } = {}) {
+  const job = getJob(jobId);
+  if (!job) return;
+  const row = db.prepare('SELECT * FROM task_rounds WHERE job_id=? AND round_index=?').get(jobId, round);
+  if (!row) return;
+  const hasSteps = db.prepare('SELECT 1 FROM task_step_state WHERE job_id=? AND round_index=? LIMIT 1').get(jobId, round);
+  if (!hasSteps && row.summary_json && action && nextState) {
+    const summary = JSON.parse(row.summary_json);
+    const adjust = counts => {
+      if (!counts || action.state === nextState) return;
+      counts[action.state] = Math.max(0, Number(counts[action.state] || 0) - 1);
+      counts[nextState] = Number(counts[nextState] || 0) + 1;
+    };
+    adjust(summary.counts?.post);
+    for (const account of summary.accounts || []) {
+      if (account.id !== action.account_id) continue;
+      adjust(account.counts?.post);
+      if (nextState === 'succeeded') account.anomalies = (account.anomalies || []).filter(item =>
+        !(item.kind === 'post' && item.reason === action.error && item.at === (action.completed_at || action.started_at)));
+    }
+    summary.abnormalAccounts = (summary.accounts || []).filter(account => account.anomalies?.length).map(({ actions, ...account }) => account);
+    db.prepare('UPDATE task_rounds SET summary_json=? WHERE job_id=? AND round_index=?').run(JSON.stringify(summary), jobId, round);
+    return;
+  }
+  db.prepare('UPDATE task_rounds SET summary_json=? WHERE job_id=? AND round_index=?')
+    .run(JSON.stringify(summaryFor(job, round)), jobId, round);
 }
 
 export function listRoundReports(jobId, details = false) {

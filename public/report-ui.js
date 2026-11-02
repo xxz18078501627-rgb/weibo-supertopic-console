@@ -1,6 +1,7 @@
 const escapeHtml = (value = '') => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 const kindName = kind => ({ checkin: '签到', post: '发帖', comment: '评论' })[kind] || kind;
 const stateName = state => ({ succeeded: '成功', failed: '失败', uncertain: '待核对', skipped: '跳过', submitted: '已提交', prepared: '准备中', verification_wait: '待验证', cancelled: '已取消' })[state] || state;
+const displayState = action => action.display_state || action.state;
 const statusName = status => ({ running: '运行中', waiting: '等待中', paused: '已暂停', completed: '已完成', stopped: '已中止', failed: '失败' })[status] || status;
 export const localDate = value => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(new Date(value || Date.now()));
 const localTime = value => value ? new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date(value)) : '进行中';
@@ -21,7 +22,7 @@ function anomalies(accounts = []) {
 }
 
 function accountDetails(accounts = []) {
-  return accounts.map(account => `<details class="report-account"><summary>${escapeHtml(account.name)} <small>${escapeHtml(account.groupName || '未分组')}${account.uid ? ` · UID ${escapeHtml(account.uid)}` : ''}</small>${account.anomalies.length ? '<span class="result warning">异常</span>' : ''}</summary>${countTable(account.counts)}<div class="report-actions">${(account.actions || []).map(action => `<article><div><b>${kindName(action.kind)} · ${escapeHtml(action.topic_name || '')}</b><span class="result ${action.state}">${stateName(action.state)}</span></div><time>${localTime(action.started_at)}</time>${action.error ? `<p>${escapeHtml(action.error)}</p>` : ''}${action.content ? `<details><summary>查看文案</summary><p>${escapeHtml(action.content)}</p></details>` : ''}${action.url && /^https?:\/\//.test(action.url) ? `<a href="${escapeHtml(action.url)}" target="_blank" rel="noreferrer">打开目标帖</a>` : ''}</article>`).join('') || '<p>该账号没有操作记录。</p>'}</div></details>`).join('');
+  return accounts.map(account => `<details class="report-account"><summary>${escapeHtml(account.name)} <small>${escapeHtml(account.groupName || '未分组')}${account.uid ? ` · UID ${escapeHtml(account.uid)}` : ''}</small>${account.anomalies.length ? '<span class="result warning">异常</span>' : ''}</summary>${countTable(account.counts)}<div class="report-actions">${(account.actions || []).map(action => `<article><div><b>${kindName(action.kind)} · ${escapeHtml(action.topic_name || '')}</b><span class="result ${displayState(action)}">${stateName(displayState(action))}</span></div><time>${localTime(action.started_at)}</time>${action.error ? `<p>${escapeHtml(action.error)}</p>` : ''}${action.content ? `<details><summary>查看文案</summary><p>${escapeHtml(action.content)}</p></details>` : ''}${action.url && /^https?:\/\//.test(action.url) ? `<a href="${escapeHtml(action.url)}" target="_blank" rel="noreferrer">打开目标帖</a>` : ''}</article>`).join('') || '<p>该账号没有操作记录。</p>'}</div></details>`).join('');
 }
 
 export function roundHtml(report) {
@@ -33,7 +34,8 @@ function jobCounts(records) {
   for (const action of records.actions || []) {
     if (!action.job_id) continue;
     const bucket = map[action.job_id] || (map[action.job_id] = { succeeded: 0, failed: 0, uncertain: 0, skipped: 0 });
-    if (bucket[action.state] != null) bucket[action.state]++;
+    const shown = displayState(action);
+    if (bucket[shown] != null) bucket[shown]++;
   }
   return map;
 }

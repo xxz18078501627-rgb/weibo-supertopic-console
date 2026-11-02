@@ -47,7 +47,7 @@ function accessToken() {
 const sessions = new Set();
 const sseClients = new Set();
 const serviceIdentity = { pid: process.pid, startedAt: new Date().toISOString(), revision: createHash('sha256').update(
-  ['server.js','runner.js','weibo-adapter.js','verification-workflow.js','network-recovery.js','task-progress.js'].map(file => fs.readFileSync(path.join(config.rootDir, 'src', file))).join('\n')
+  ['server.js','runner.js','weibo-adapter.js','post-receipts.js','post-success-notice.js','db.js','task-reports.js','verification-workflow.js','network-recovery.js','task-progress.js'].map(file => fs.readFileSync(path.join(config.rootDir, 'src', file))).join('\n')
 ).digest('hex').slice(0, 16) };
 const runner = createRunner(browserManager);
 // QR login owns a separate visible Chromium manager.  Normal tasks remain
@@ -202,6 +202,9 @@ async function api(req, res, url) {
   }
   if (url.pathname === '/api/session') return send(res, 200, { authenticated: isAuthenticated(req) });
   if (!isAuthenticated(req)) return send(res, 401, { error: '请先输入访问口令' });
+  if (runner.repairing && req.method !== 'GET' && !/^\/api\/jobs\/[^/]+\/(pause|stop)$/.test(url.pathname)) {
+    return send(res, 409, { error: '正在只读核对历史发帖，请等待核对完成' });
+  }
   if (url.pathname === '/api/lan-qr.svg' && req.method === 'GET') {
     const access = currentLanAccess(config.port);
     if (!access.qrUrl) return send(res, 404, { error: '未检测到局域网地址' });
@@ -285,7 +288,7 @@ async function api(req, res, url) {
     if (!job || !runner.workflow.enabled(job)) return send(res, 404, { error: '该任务不支持验证队列' });
     if (loginService.active) return send(res, 409, { error: '请先完成或取消扫码登录' });
     let result;
-    if (action === 'open') result = runner.workflow.requestManual(jobId, String(input.identity || ''));
+    if (action === 'open') result = runner.workflow.requestManual(jobId, String(input.identity || ''), String(input.stepKey || ''));
     if (action === 'end') result = await runner.workflow.endManual(jobId);
     if (action === 'recheck') result = await runner.workflow.recheckManual(jobId);
     if (action === 'continue') result = runner.workflow.continue(jobId);
@@ -300,7 +303,11 @@ async function api(req, res, url) {
     if (loginService.active) return send(res, 409, { error: '请先完成或取消扫码登录' });
     const job = getJob(repairPostsRoute[1]);
     if (!job) return send(res, 404, { error: '任务不存在' });
-    const result = await runner.repairUncertainPosts(job.id, { limit: 4 });
+    const input = await body(req);
+    if (input.includeReceiptFailures !== undefined && typeof input.includeReceiptFailures !== 'boolean') return send(res, 400, { error: 'includeReceiptFailures 必须为布尔值' });
+    if (input.actionIds !== undefined && (!Array.isArray(input.actionIds) || !input.actionIds.every(value => typeof value === 'string'))) return send(res, 400, { error: 'actionIds 必须为操作 ID 数组' });
+    const result = await runner.repairUncertainPosts(job.id, { limit: input.limit ?? 4,
+      includeReceiptFailures: input.includeReceiptFailures === true, actionIds: input.actionIds || null });
     broadcast('state', state()); return send(res, 200, result);
   }
 
@@ -613,6 +620,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, async () => {
     clearInterval(dailyStopTimer);
     runner.network.clear();
+    runner.navigation.clear();
     await loginService.cancel();
     await browserManager.close();
     await loginBrowserManager.close();

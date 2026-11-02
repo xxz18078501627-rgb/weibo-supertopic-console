@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { chromium } from 'playwright';
-import { WeiboAdapter } from '../src/weibo-adapter.js';
+import { WeiboAdapter, VerificationError } from '../src/weibo-adapter.js';
 import { DatabaseSync } from 'node:sqlite';
 
 const root = path.resolve(import.meta.dirname, '..');
@@ -106,8 +106,8 @@ test('发帖拒绝后延迟验证码进入验证，人工完成后原窗口自�
       <div class="woo-modal-wrap"><button>选择超话</button><input placeholder="搜索超话" oninput="fetch('/ajax/stopic/list')">
       <div class="_h3_fixture" onclick="document.querySelector('textarea').value='苏新皓[超话]'">苏新皓</div>
       <textarea placeholder="掐指一算，此贴必火"></textarea><label><input type="checkbox">同步到微博</label>
-      <button onclick="fetch('/ajax/statuses/update',{method:'POST'});setTimeout(()=>document.querySelector('#captcha').style.display='block',300)">发送</button></div>
-      <div id="captcha" class="geetest_panel" style="display:none">请完成安全验证<button onclick="this.parentElement.style.display='none';fetch('/ajax/statuses/update',{method:'POST'})">验证通过</button></div>` });
+      <button onclick="fetch('/ajax/statuses/update',{method:'POST',body:JSON.stringify({status:document.querySelector('textarea').value,page_id:'100808fixture'})});setTimeout(()=>document.querySelector('#captcha').style.display='block',300)">发送</button></div>
+      <div id="captcha" class="geetest_panel" style="display:none">请完成安全验证<button onclick="this.parentElement.style.display='none';fetch('/ajax/statuses/update',{method:'POST',body:JSON.stringify({status:document.querySelector('textarea').value,page_id:'100808fixture'})})">验证通过</button></div>` });
   });
   const manager = { page: async () => page, context: page.context(), foreground: async () => {} };
   const adapter = new WeiboAdapter(manager); adapter.ensureIdentity = async () => ({});
@@ -130,6 +130,135 @@ test('实测易盾组件可见时识别验证，隐藏组件不阻止任务', as
   await page.locator('.yidun_modal__wrap').evaluate(node => node.style.display = 'block');
   assert.equal(await adapter.hasTaskChallenge({}), true);
   await page.close();
+});
+
+test('HTTP400后延迟成功回执仍成功，零任务间隔不会提前关闭监听', async () => {
+  const page = await browser.newPage(); let requests = 0;
+  await installPostFixture(page, async route => {
+    requests++;
+    return route.fulfill({ status: requests === 1 ? 400 : 200, json: requests === 1
+      ? { ok: 0, message: '临时响应异常' } : { ok: 1, data: { idstr: '5359362629435909' } } });
+  }, true);
+  const adapter = new WeiboAdapter({ page: async () => page, context: page.context() });
+  adapter.ensureIdentity = async () => {};
+  try {
+    const result = await adapter.post({ id: 'fixture', uid: '1001' }, { name: '苏新皓', url: 'https://weibo.com/p/100808fixture' }, '本次正文', { intervalSeconds: 0, receiptTimeoutMs: 1000 });
+    assert.equal(result.state, 'succeeded'); assert.equal(result.receiptId, '5359362629435909');
+    assert.equal(await page.evaluate(() => window.sendClicks), 1);
+    assert.equal(requests, 2);
+  } finally { await page.close(); }
+});
+
+test('只有HTTP400且无明确业务拒绝时保持待核对，主动只读复核仍可用', async () => {
+  const page = await browser.newPage(); let requests = 0;
+  const startedAt = new Date().toISOString();
+  await installPostFixture(page, route => {
+    requests++; return route.fulfill({ status: 400, json: {} });
+  });
+  const adapter = new WeiboAdapter({ page: async () => page, context: page.context() });
+  adapter.ensureIdentity = async () => {};
+  try {
+    const topic = { name: '苏新皓', url: 'https://weibo.com/p/100808fixture' };
+    const result = await adapter.post({ id: 'fixture', uid: '1001' }, topic, '本次正文', { receiptTimeoutMs: 100 });
+    assert.equal(result.state, 'uncertain'); assert.equal(result.needsReadback, undefined);
+    const found = await adapter.findPublishedPost({ uid: '1001' }, { content: '本次正文', topic, startedAt, submittedAt: startedAt });
+    assert.equal(found.state, 'succeeded'); assert.equal(found.receiptId, '5359362629435909');
+    assert.equal(requests, 1);
+  } finally { await page.close(); }
+});
+
+async function installPostFixture(page, update, delayedSuccess = false) {
+  await page.route('https://weibo.com/**', route => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/ajax/stopic/list') return route.fulfill({ json: { data: [{ title: '苏新皓', page_id: '100808fixture' }] } });
+    if (url.pathname === '/ajax/statuses/update') return update(route);
+    if (url.pathname === '/ajax_proxy/chaohua/page') return route.fulfill({ json: { items: [{ idstr: '5359362629435909',
+      user: { idstr: '1001' }, text_raw: '苏新皓[超话]本次正文', created_at: new Date().toISOString() }] } });
+    if (url.pathname.startsWith('/p/')) return route.fulfill({ contentType: 'text/html', body: '<div id="list"></div><script>fetch(\'/ajax_proxy/chaohua/page\')</script>' });
+    return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<button>更多</button><button>超话</button>
+      <div class="woo-modal-wrap"><button>选择超话</button><input placeholder="搜索超话" oninput="fetch('/ajax/stopic/list')">
+      <div class="_h3_fixture" onclick="document.querySelector('textarea').value='苏新皓[超话]'">苏新皓</div>
+      <textarea placeholder="掐指一算，此贴必火"></textarea><label><input type="checkbox">同步到微博</label>
+      <button onclick="window.sendClicks=(window.sendClicks||0)+1;const send=()=>fetch('/ajax/statuses/update',{method:'POST',body:JSON.stringify({status:document.querySelector('textarea').value,page_id:'100808fixture'})});send();${delayedSuccess ? 'setTimeout(send,50);' : ''}">发送</button></div>` });
+  });
+}
+
+test('发帖明确成功可无编号，HTTP200本身和旧提示不能算成功', async () => {
+  for (const mode of ['api', 'notice', 'stale', 'plain']) {
+    const page = await browser.newPage(); let sends = 0, navigations = 0;
+    await installPostFixture(page, route => {
+      sends++;
+      return route.fulfill({ json: mode === 'api' ? { ok: 1 } : {} });
+    });
+    const manager = { page: async () => page, context: page.context() };
+    const adapter = new WeiboAdapter(manager); adapter.ensureIdentity = async () => {};
+    const original = adapter.post.bind(adapter);
+    // Add notices through actual DOM mutations triggered by this click, using
+    // the same renderer as the live adapter. No real network is permitted.
+    await page.addInitScript(kind => {
+      window.addEventListener('DOMContentLoaded', () => {
+        if (kind === 'stale') { const notice = document.createElement('div'); notice.setAttribute('role', 'status'); notice.textContent = '发布成功'; document.body.append(notice); }
+        document.addEventListener('click', event => {
+          if (event.target?.textContent !== '发送') return;
+          if (kind === 'notice') {
+            const notice = document.createElement('div'); notice.className = 'woo-message'; notice.textContent = '发送成功'; document.body.append(notice);
+          }
+        });
+      });
+    }, mode);
+    page.on('framenavigated', frame => { if (frame === page.mainFrame()) navigations++; });
+    try {
+      const result = await original({ id: 'fixture', uid: '1001' }, { name: '苏新皓', url: 'https://weibo.com/p/100808fixture' }, '正文含有发布成功这几个字', { receiptTimeoutMs: 500 });
+      assert.equal(result.state, ['api', 'notice'].includes(mode) ? 'succeeded' : 'uncertain', mode);
+      if (result.state === 'succeeded') {
+        assert.equal(result.receiptId, null); assert.equal(result.url, null);
+        assert.equal(result.successSource, mode === 'api' ? 'api_receipt' : 'page_notice');
+      }
+      assert.equal(sends, 1); assert.equal(navigations, 1);
+    } finally { await page.close(); }
+  }
+});
+
+test('超时边缘才读出验证码回执，人工随后出现成功提示仍保存本次成功', async () => {
+  const page = await browser.newPage(); const receipts = [];
+  await installPostFixture(page, route => route.fulfill({ status: 400,
+    json: { ok: 0, error_code: 20067, message: '请完成安全验证' } }));
+  const delayBody = response => {
+    if (new URL(response.url()).pathname !== '/ajax/statuses/update') return;
+    const read = response.json.bind(response);
+    response.json = async () => { await new Promise(resolve => setTimeout(resolve, 180)); return read(); };
+  };
+  page.context().on('response', delayBody);
+  const adapter = new WeiboAdapter({ page: async () => page, context: page.context() });
+  adapter.ensureIdentity = async () => {};
+  try {
+    await assert.rejects(adapter.withChallengeMode('manual', () => adapter.post({ id: 'fixture', uid: '1001' },
+      { name: '苏新皓', url: 'https://weibo.com/p/100808fixture' }, '本次正文',
+      { receiptTimeoutMs: 80, onReceipt: receipt => receipts.push(receipt) })), error => error.code === 'verification_required');
+    await page.evaluate(() => { const notice = document.createElement('div'); notice.setAttribute('role', 'status'); notice.textContent = '发布成功'; document.body.append(notice); });
+    await page.waitForTimeout(300);
+    assert.equal(receipts.length, 1); assert.equal(receipts[0].successSource, 'page_notice');
+    assert.equal(await page.evaluate(() => window.sendClicks), 1);
+  } finally { await adapter.manualPostReceipt?.stop(); page.context().off('response', delayBody); await page.close(); }
+});
+
+test('人工发帖续发的成功提示保存失败会通过read传播，且不再次发送', async () => {
+  const page = await browser.newPage();
+  await installPostFixture(page, route => route.fulfill({ status: 400,
+    json: { ok: 0, error_code: 20067, message: '请完成安全验证' } }));
+  const adapter = new WeiboAdapter({ page: async () => page, context: page.context() });
+  adapter.ensureIdentity = async () => {};
+  try {
+    await assert.rejects(adapter.withChallengeMode('manual', () => adapter.post({ id: 'fixture', uid: '1001' },
+      { name: '苏新皓', url: 'https://weibo.com/p/100808fixture' }, '本次正文',
+      { onReceipt: () => { throw new Error('模拟保存失败'); } })), error => error.code === 'verification_required');
+    await page.evaluate(() => {
+      const notice = document.createElement('div'); notice.setAttribute('role', 'status');
+      notice.textContent = '发布成功'; document.body.append(notice);
+    });
+    await assert.rejects(adapter.manualPostReceipt.read(), error => error.code === 'receipt_persistence_failed');
+    assert.equal(await page.evaluate(() => window.sendClicks), 1);
+  } finally { await adapter.manualPostReceipt?.stop(); await page.close(); }
 });
 
 test('连通性探测使用Chrome网络，断网返回离线且不导航任务页面', async () => {
@@ -337,6 +466,79 @@ test('普通评论接口已精确读到新评论时直接成功，不依赖按�
     assert.equal(result.verificationMethod, 'default_comment_readback');
     assert.equal(reads, 1);
   } finally { await page.close(); }
+});
+
+test('评论成功提示无须编号直接成功，且不调用verifyComment或翻评论列表', async () => {
+  const page = await browser.newPage();
+  let createRequests = 0, readRequests = 0, receipts = 0;
+  await page.route('https://weibo.com/**', route => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/ajax/comments/create') {
+      createRequests += 1;
+      return route.fulfill({ json: { ok: 1, data: {} } });
+    }
+    if (url.pathname === '/ajax/statuses/buildComments') {
+      readRequests += 1;
+      return route.fulfill({ json: { data: [] } });
+    }
+    return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<div><div><div>
+      <textarea placeholder="发布你的评论"></textarea>
+      <button onclick="window.commentClicks=(window.commentClicks||0)+1;fetch('/ajax/comments/create',{method:'POST'}).then(()=>{const notice=document.createElement('div');notice.setAttribute('role','status');notice.textContent='评论成功';document.body.append(notice)})">评论</button>
+    </div></div></div>` });
+  });
+  try {
+    const adapter = new WeiboAdapter({ page: async () => page, context: page.context() });
+    adapter.ensureIdentity = async () => { throw new Error('评论成功提示不应读取身份'); };
+    adapter.verifyComment = async () => { throw new Error('评论成功提示不应回读评论列表'); };
+    const account = { uid: '1001', nickname: '测试账号' };
+    const candidate = { id: '5359362629435909', url: 'https://weibo.com/1001/5359362629435909' };
+    const result = await adapter.comment(account, candidate, '新评论文案', { onReceipt: receipt => { receipts += 1; assert.equal(receipt.successSource, 'page_notice'); } });
+    assert.equal(result.state, 'succeeded');
+    assert.equal(result.successSource, 'page_notice');
+    assert.equal(result.receiptId, null);
+    assert.equal(receipts, 1);
+    assert.equal(createRequests, 1);
+    assert.equal(readRequests, 0);
+    assert.equal(await page.evaluate(() => window.commentClicks), 1);
+  } finally { await page.close(); }
+});
+
+test('评论验证码中断后人工通过原请求自动续发，提示成功且只保存一次回执', async () => {
+  const page = await browser.newPage();
+  let createRequests = 0, receipts = 0;
+  await page.route('https://weibo.com/**', route => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/ajax/comments/create') {
+      createRequests += 1;
+      return route.fulfill(createRequests === 1
+        ? { status: 400, json: { ok: 0, error_code: 20067, message: '请完成安全验证' } }
+        : { json: { ok: 1, data: {} } });
+    }
+    if (url.pathname === '/ajax/statuses/buildComments') return route.fulfill({ json: { data: [] } });
+    return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<div><div><div>
+      <textarea placeholder="发布你的评论"></textarea>
+      <button onclick="window.commentClicks=(window.commentClicks||0)+1;window.sendComment(false);setTimeout(()=>{document.querySelector('#captcha').style.display='block'},300)">评论</button>
+    </div></div></div>
+    <div id="captcha" class="geetest_panel" style="display:none">请完成安全验证<button onclick="this.parentElement.style.display='none';window.sendComment(true)">验证通过</button></div>
+    <script>window.sendComment=(verified)=>fetch('/ajax/comments/create',{method:'POST'}).then(response=>{if(!verified||!response.ok)return;const notice=document.createElement('div');notice.className='toast';notice.textContent='评论成功';document.body.append(notice)});</script>` });
+  });
+  const adapter = new WeiboAdapter({ page: async () => page, context: page.context(), foreground: async () => {} });
+  try {
+    adapter.verifyComment = async () => { throw new Error('评论成功提示不应回读评论列表'); };
+    const account = { uid: '1001', nickname: '测试账号' };
+    const candidate = { id: '5359362629435909', url: 'https://weibo.com/1001/5359362629435909' };
+    await assert.rejects(adapter.withChallengeMode('manual', () => adapter.comment(account, candidate, '验证码评论文案', {
+      onReceipt: () => { receipts += 1; }
+    })), error => error instanceof VerificationError && error.code === 'verification_required');
+    assert.equal(createRequests, 1);
+    assert.equal(await page.evaluate(() => window.commentClicks), 1);
+    await page.getByRole('button', { name: '验证通过', exact: true }).click();
+    await page.waitForTimeout(400);
+    assert.equal(createRequests, 2, '验证通过触发的续发请求，没有再次点击评论');
+    assert.equal(receipts, 1);
+    assert.equal(await page.evaluate(() => window.commentClicks), 1);
+    assert.equal(await page.locator('.toast').innerText(), '评论成功');
+  } finally { await adapter.manualCommentReceipt?.stop(); await page.close(); }
 });
 
 test('默认读取未命中后切到倒序，短编号换成数字 ID 并按 1、3 秒回读', async () => {
@@ -645,7 +847,7 @@ test('待验证账号卡片、互斥、明确确认与继续运行按钮可用',
   db.prepare('INSERT INTO jobs(id,status,config_json,cursor_json,metrics_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)').run(jobId, 'waiting', JSON.stringify(snapshot), JSON.stringify(cursor), JSON.stringify({ success: 0, failed: 0, uncertain: 1, skipped: 0 }), stamp, stamp);
   for (let index = 0; index < 2; index++) {
     db.prepare('INSERT INTO task_step_state(job_id,step_key,ordinal,round_index,account_id,identity,topic_id,kind,action_index,unit_index,state,outcome,ever_verification) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(jobId, keys[index], index, 0, account.id, '10086', topic.id, index ? 'post' : 'comment', index, 0, index ? 'review' : 'deferred', index ? 'uncertain' : null, 1);
-    db.prepare('INSERT INTO action_logs(id,job_id,step_key,kind,account_id,topic_id,state,error,started_at) VALUES(?,?,?,?,?,?,?,?,?)').run(`verification-action-${index}`, jobId, keys[index], index ? 'post' : 'comment', account.id, topic.id, index ? 'uncertain' : 'verification_wait', '需要验证码', stamp);
+    db.prepare('INSERT INTO action_logs(id,job_id,step_key,kind,account_id,topic_id,state,error,started_at,verification_pending) VALUES(?,?,?,?,?,?,?,?,?,1)').run(`verification-action-${index}`, jobId, keys[index], index ? 'post' : 'comment', account.id, topic.id, index ? 'uncertain' : 'verification_wait', '需要验证码', stamp);
   }
   db.prepare('INSERT INTO verification_cards(job_id,round_index,identity,account_id,status,blocked_kinds_json,reason,triggered_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)').run(jobId, 0, '10086', account.id, 'pending', '["comment","post"]', '需要验证码', stamp, stamp);
   const refused = await page.request.post(`http://127.0.0.1:${port}/api/jobs/${jobId}/verification/confirm-unpublished`, { data: { stepKey: keys[1], confirmed: false } });
@@ -654,6 +856,8 @@ test('待验证账号卡片、互斥、明确确认与继续运行按钮可用',
   assert.equal((await page.request.post(`http://127.0.0.1:${port}/api/accounts/${account.id}/login`)).status(), 409);
   db.prepare('UPDATE jobs SET cursor_json=? WHERE id=?').run(JSON.stringify(cursor), jobId);
   let state = await page.request.get(`http://127.0.0.1:${port}/api/state`).then(r => r.json());
+  assert.equal(state.activeJob.metrics.uncertain, 0);
+  assert.ok(state.recentActions.every(action => action.display_state === 'verification_wait'));
   const requests = [];
   await page.route('**/api/state', route => route.fulfill({ contentType: 'application/json', body: JSON.stringify(state) }));
   await page.route('**/api/events', route => route.fulfill({ contentType: 'text/event-stream', body: '' }));
@@ -670,9 +874,12 @@ test('待验证账号卡片、互斥、明确确认与继续运行按钮可用',
     await page.locator('#verification-panel').waitFor();
     assert.match(await page.locator('#verification-panel').innerText(), /待验证昵称/);
     assert.match(await page.locator('#verification-panel').innerText(), /10086/);
+    assert.equal(await page.locator('.recent-state.verification_wait').count(), 2);
+    assert.equal(await page.locator('.recent-state.uncertain').count(), 0);
+    assert.match(await page.locator('#run-metrics').innerText(), /0\s*待核对/);
     assert.equal(await page.locator('[data-verification-continue]').isDisabled(), true);
     await page.locator('[data-verify-toggle]').first().click();
-    assert.match(await page.locator('.verify-detail').innerText(), /待补做 \d+ 项 · 待核对 \d+ 项/);
+    assert.match(await page.locator('.verify-detail').innerText(), /待补做 \d+ 项 · 待验证 \d+ 项/);
     await page.locator('[data-verify-identity]').click();
     await page.locator('[data-verification-end]').waitFor();
     assert.equal(await page.locator('[data-verify-identity]').isDisabled(), true);
@@ -695,7 +902,7 @@ test('待验证账号卡片、互斥、明确确认与继续运行按钮可用',
   } finally { db.prepare("UPDATE jobs SET status='stopped' WHERE id=?").run(jobId); db.close(); await page.close(); }
 });
 
-test('会话状态文案区分手动验证与补做签到', async () => {
+test('会话状态文案区分手动验证、提交与等待回执', async () => {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   await page.request.post(`http://127.0.0.1:${port}/api/login`, { data: { token } });
   const state = await page.request.get(`http://127.0.0.1:${port}/api/state`).then(r => r.json());
@@ -716,10 +923,18 @@ test('会话状态文案区分手动验证与补做签到', async () => {
     assert.equal(await page.locator('.verify-count').innerText(), '2/3');
     assert.equal(await page.locator('.verify-session').innerText(), '正在当前窗口手动验证…');
     assert.equal(await page.locator('[data-verification-recheck]').count(), 1);
-    state.verification.session = { identity: '10086', phase: 'signing_checkin' };
-    await page.reload();
-    await page.locator('.verify-session').waitFor();
-    assert.equal(await page.locator('.verify-session').innerText(), '正在当前窗口补做签到…');
+    for (const [phase, expected] of [
+      ['signing_checkin', '正在当前窗口补做签到…'],
+      ['submitting_post', '正在当前窗口发帖…'],
+      ['submitting_comment', '正在当前窗口评论…'],
+      ['awaiting_comment_receipt', '正在等待本次评论成功提示…'],
+      ['awaiting_post_receipt', '正在等待本次发帖成功提示…']
+    ]) {
+      state.verification.session = { identity: '10086', phase };
+      await page.reload();
+      await page.locator('.verify-session').waitFor();
+      assert.equal(await page.locator('.verify-session').innerText(), expected, phase);
+    }
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
   } finally { await page.close(); }
 });
@@ -1820,5 +2035,29 @@ test('记录页待核对操作取代账号运行卡片并可复核', async () =>
     assert.equal(rechecked, true);
     assert.equal(await page.locator('.record-uncertain-row').count(), 0);
     assert.equal(await page.locator('#record-accounts .panel-head h2').innerText(), '账号运行情况');
+  } finally { await page.close(); }
+});
+
+test('页面故障自动等待与手动暂停提示明确，不显示网络正常或手动继续', async () => {
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  try {
+    await page.goto(`http://127.0.0.1:${port}`); await page.locator('#token').fill(token);
+    const loggedIn = page.waitForResponse(response => response.url().endsWith('/api/login') && response.request().method() === 'POST');
+    await page.getByRole('button', { name: '进入工坊' }).click();
+    assert.equal((await loggedIn).status(), 200);
+    const base = await page.request.get(`http://127.0.0.1:${port}/api/state`).then(r => r.json());
+    const stamp = new Date().toISOString(); let manual = false;
+    await page.route('**/api/state', route => route.fulfill({ json: { ...base, verification: null, pendingRoundReports: [],
+      activeJob: { id: 'navigation-ui-fixture', status: 'paused', pausedByUser: manual, created_at: stamp, metrics: { success: 1, failed: 0 },
+        config: { rounds: 1 }, wait_reason: '微博页面暂不可用，任务已暂停，正在自动检查恢复',
+        cursor: { networkRecovery: { state: 'online', probeState: 'online' }, navigationRecovery: { state: 'waiting', successes: 0, nextCheckAt: stamp } } } } }));
+    await page.addInitScript(() => { window.EventSource = class extends EventTarget { close() {} }; });
+    await page.reload();
+    await page.waitForFunction(() => document.querySelector('#run-detail')?.textContent.includes('页面暂不可用'));
+    assert.match(await page.locator('#run-detail').innerText(), /连续两次页面检查/);
+    assert.equal(await page.locator('#run-controls [data-job-action="resume"]').count(), 0);
+    assert.match(await page.locator('#run-controls').innerText(), /改为手动暂停/);
+    manual = true; await page.reload();
+    await page.waitForFunction(() => document.querySelector('#run-detail')?.textContent.includes('页面恢复后不会自动开始'));
   } finally { await page.close(); }
 });
