@@ -70,7 +70,7 @@ test('只选择当前平台和架构的最新兼容更新', async () => {
     assert.equal(status.latestVersion, '1.2.0');
     assert.equal(status.platformKey, 'mac-arm64');
     assert.equal(status.available, true);
-    assert.match(status.command, /ZhibingStudio\/bootstrap\.mjs/);
+    assert.match(status.command, /ZhibingStudio[\\/]bootstrap\.mjs/);
     assert.match(status.commandNoRestart, /--no-restart$/);
     assert.doesNotMatch(status.commandNoRestart, /--restart$/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }

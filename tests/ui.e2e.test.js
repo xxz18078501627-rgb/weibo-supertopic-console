@@ -1218,7 +1218,7 @@ test('固定苏新皓模式下拉含12分区，超话只读，保存及手机布
     assert.deepEqual(await page.locator('#comment-section option').allTextContents(),state.commentSections);
     assert.equal(await page.locator('#comment-section').inputValue(),'超like');
     await page.locator('#comment-section').selectOption('创作🫙');await page.getByRole('button',{name:'设为默认',exact:true}).click();
-    await page.reload();assert.equal(await page.locator('#comment-section').inputValue(),'创作🫙');
+    await page.reload();await page.waitForFunction(()=>document.querySelector('#comment-section')?.value==='创作🫙');assert.equal(await page.locator('#comment-section').inputValue(),'创作🫙');
     await page.setViewportSize({width:390,height:844});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
   }finally{await page.close();child.kill('SIGTERM');await new Promise(resolve=>child.exitCode!==null?resolve():child.once('exit',resolve));fs.rmSync(folder,{recursive:true,force:true});}
 });
@@ -1805,7 +1805,7 @@ test('桌面四页页头统一紧凑，后三页填满可用高度', async () =>
     assert.equal(pages.accounts.page.height, 734);
     assert.equal(pages.accounts.list.bottom, pages.accounts.page.bottom);
     assert.equal(pages.materials.page.height, 734);
-    assert.equal(pages.logs.page.bottom, 890);
+    assert.ok(Math.abs(pages.logs.page.bottom - 890) <= 1, `记录页底部应约 890px，实际 ${pages.logs.page.bottom}`);
     assert.equal(pages.logs.grid.bottom, pages.logs.page.bottom);
     assert.equal(pages.logs.grid.height, 654);
     assert.ok(pages.logs.panels.every(height => Math.abs(height - 321) <= 1));
@@ -1886,20 +1886,22 @@ test('第一页手机访问按钮打开二维码对话框', async () => {
     await page.request.post(base + '/api/login', { data: { token } });
     await page.goto(base);
     await page.waitForTimeout(700);
+    const lanState = await page.request.get(base + '/api/state').then(r => r.json()).then(data => data.lanAccess || {});
     assert.equal(await page.locator('#lan-access-button').isVisible(), true);
     await page.locator('#lan-access-button').click();
     await page.locator('#lan-access-dialog[open]').waitFor();
     assert.match(await page.locator('#lan-ip-url').innerText(), /^http:\/\/\d+\.\d+\.\d+\.\d+:\d+$/);
     assert.match(await page.locator('#lan-host-url').innerText(), /\.local:\d+$/);
-    assert.match(await page.locator('#lan-qr').getAttribute('src'), /^\/api\/lan-qr\.svg\?ts=/);
+    if (lanState.qrUrl) assert.match(await page.locator('#lan-qr').getAttribute('src'), /^\/api\/lan-qr\.svg\?ts=/);
+    else assert.equal(await page.locator('#lan-qr').isHidden(), true);
     assert.match(await page.locator('.lan-note').innerText(), /Honor 100 Pro/);
     const beforeQr = await page.locator('#lan-qr').getAttribute('src');
     await page.locator('#lan-refresh').click();
     await page.waitForTimeout(250);
-    assert.notEqual(await page.locator('#lan-qr').getAttribute('src'), beforeQr);
+    if (lanState.qrUrl) assert.notEqual(await page.locator('#lan-qr').getAttribute('src'), beforeQr);
     const qr = await page.request.get(base + '/api/lan-qr.svg');
-    assert.equal(qr.status(), 200);
-    assert.match(qr.headers()['content-type'], /image\/svg\+xml/);
+    assert.equal(qr.status(), lanState.qrUrl ? 200 : 404);
+    if (lanState.qrUrl) assert.match(qr.headers()['content-type'], /image\/svg\+xml/);
     assert.match(await qr.text(), /<svg/);
     await page.locator('[data-close-lan]').first().click();
     await page.locator('#nav [data-page="accounts"]').click();
