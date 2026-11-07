@@ -49,6 +49,16 @@ function zip(folder, target) {
   run('powershell.exe', ['-NoProfile', '-Command', `Compress-Archive -LiteralPath ${quote(folder)} -DestinationPath ${quote(target)} -Force`]);
 }
 
+function findShortcuts(parent, output = []) {
+  if (!fs.existsSync(parent)) return output;
+  for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+    const target = path.join(parent, entry.name);
+    if (entry.isDirectory()) findShortcuts(target, output);
+    else if (entry.name.toLowerCase().endsWith('.url')) output.push(target);
+  }
+  return output;
+}
+
 try {
   console.log('Installing native EXE to a Chinese path without admin: ' + installRoot);
   run(installer, ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', `/DIR=${installRoot}`], { timeout: 300000 });
@@ -56,7 +66,13 @@ try {
   assert.ok(fs.existsSync(path.join(installRoot, 'data', 'console.sqlite')));
   assert.ok(fs.existsSync(path.join(installRoot, 'versions', version, 'src', 'server.js')));
   assert.ok(fs.existsSync(path.join(installRoot, 'runtime', 'node', 'node.exe')));
-  assert.ok(fs.existsSync(path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', '制饼工坊.url')));
+  const shortcutRoots = [
+    path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs'),
+    path.join(process.env.ProgramData || 'C:\\ProgramData', 'Microsoft', 'Windows', 'Start Menu', 'Programs')
+  ];
+  const shortcuts = shortcutRoots.flatMap(root => findShortcuts(root));
+  const appShortcut = shortcuts.find(file => /制饼工坊\.url$/i.test(file) && /localhost:4178/.test(fs.readFileSync(file, 'utf8')));
+  assert.ok(appShortcut, 'Start Menu shortcut must open http://localhost:4178: ' + shortcuts.join(', '));
   const task = spawnSync('schtasks.exe', ['/Query', '/TN', serviceName], { encoding: 'utf8', windowsHide: true, env });
   const startup = path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', `${serviceName}.vbs`);
   assert.ok(task.status === 0 || fs.existsSync(startup), 'login autostart must be installed');

@@ -114,7 +114,7 @@ exit 1
   const appId = '{{7BC8F25C-6E39-4EC9-A1B0-0A67AB3A5D8C}';
   const escapedRoot = path.join(work, 'payload', `weibo-console-${version}`).replaceAll('"', '""');
   const runtimeRoot = runtime.replaceAll('"', '""');
-  fs.writeFileSync(inno, `#define AppVersion "${version}"
+  fs.writeFileSync(inno, '\uFEFF' + `#define AppVersion "${version}"
 [Setup]
 AppId=${appId}
 AppName=制饼工坊
@@ -141,7 +141,7 @@ Name: "{autoprograms}\\制饼工坊"; Filename: "{app}\\制饼工坊.url"; Worki
 Filename: "{app}\\runtime\\node\\node.exe"; Parameters: "scripts\\managed-install.mjs --install-root ""{app}"""; WorkingDir: "{app}\\versions\\{#AppVersion}"; StatusMsg: "正在安装本地服务…"; Flags: runhidden waituntilterminated
 Filename: "http://localhost:4178"; Description: "打开制饼工坊"; Flags: postinstall shellexec nowait
 [UninstallRun]
-Filename: "{app}\\runtime\\node\\node.exe"; Parameters: "service.mjs uninstall"; WorkingDir: "{app}"; Flags: runhidden waituntilterminated
+Filename: "{app}\\runtime\\node\\node.exe"; Parameters: "service.mjs uninstall"; WorkingDir: "{app}"; RunOnceId: "StopConsoleService"; Flags: runhidden waituntilterminated
 `);
   const isccCandidates = [
     process.env.INNO_SETUP_COMPILER,
