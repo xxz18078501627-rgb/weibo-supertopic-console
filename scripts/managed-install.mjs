@@ -32,7 +32,7 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const state = JSON.parse(fs.readFileSync(path.join(root, 'current.json'), 'utf8'));
 const app = path.join(root, 'versions', state.version);
 const node = process.execPath;
-const child = spawn(node, [path.join(app, 'src', 'server.js')], {
+const child = spawn(node, [path.join(app, 'scripts', 'service-runner.mjs'), process.env.WEIBO_CONSOLE_PORT || '4178', path.join(root, 'data')], {
   cwd: app,
   stdio: 'inherit',
   env: { ...process.env, WEIBO_CONSOLE_INSTALL_ROOT: root, WEIBO_CONSOLE_DATA_DIR: path.join(root, 'data'),

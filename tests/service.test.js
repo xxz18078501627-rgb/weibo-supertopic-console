@@ -128,7 +128,7 @@ test('Windows 原生脚本宿主能启动中文与空格目录中的 runner 并�
   } finally { fs.rmSync(item.base, { recursive: true, force: true }); }
 });
 
-test('真实服务通过私有控制通道安全退出，激活保持启用且拒绝伪造凭据', async () => {
+test('真实服务通过私有控制通道安全退出，兼容管理版跨版本目录且拒绝伪造凭据', async () => {
   const data = fs.mkdtempSync(path.join(os.tmpdir(), 'weibo-service-control-'));
   const root = fileURLToPath(new URL('../', import.meta.url)).replace(/[\\/]$/, '');
   const probe = net.createServer();
@@ -152,9 +152,9 @@ test('真实服务通过私有控制通道安全退出，激活保持启用且�
     assert.equal(await controlService(data, root, runtime.childPid + 1), null);
     const refused = await fetch(`http://127.0.0.1:${runtime.controlPort}/stop`, { method: 'POST', headers: { Authorization: 'Bearer wrong' } });
     assert.equal(refused.status, 403);
-    const alias = path.join(data, 'project-link');
-    fs.symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
-    assert.equal((await controlService(data, alias, runtime.childPid)).ok, true);
+    const nextVersionRoot = path.join(root, 'versions', 'next-version');
+    assert.equal(await controlService(data, nextVersionRoot, runtime.childPid + 1), null);
+    assert.equal((await controlService(data, nextVersionRoot, runtime.childPid)).ok, true);
     assert.equal(await exited, 0);
     assert.equal(fs.existsSync(path.join(data, 'service-runtime.json')), false);
   } finally {

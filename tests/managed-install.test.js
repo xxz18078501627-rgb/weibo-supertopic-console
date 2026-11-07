@@ -28,5 +28,6 @@ test('管理版安装生成固定启动、维护和服务入口，并初始化�
       assert.ok(fs.existsSync(target), file);
       execFileSync(process.execPath, ['--check', target], { stdio: 'pipe' });
     }
+    assert.match(fs.readFileSync(path.join(installRoot, 'launcher.mjs'), 'utf8'), /service-runner\.mjs/);
   } finally { fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
