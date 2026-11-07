@@ -156,6 +156,12 @@ jobs:
           name: docs-and-transition
           path: release-assets
           merge-multiple: true
+      - name: Normalize guide filenames
+        shell: bash
+        run: |
+          mv "release-assets/docs/手动安装与更新-Mac.md" "release-assets/Manual-Install-Update-Mac.md"
+          mv "release-assets/docs/手动安装与更新-Windows.md" "release-assets/Manual-Install-Update-Windows.md"
+          rmdir release-assets/docs
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
