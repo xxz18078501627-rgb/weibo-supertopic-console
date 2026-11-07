@@ -14,6 +14,7 @@ const dataDir = process.env.WEIBO_CONSOLE_DATA_DIR || path.join(root, 'data');
 const action = process.argv[2] || 'install';
 const nodeBin = process.execPath;
 const serverEntry = path.join(root, 'src', 'server.js');
+const managedLauncher = process.env.WEIBO_CONSOLE_MANAGED_LAUNCHER || '';
 
 export function listenerPid({ platform = process.platform, run = execFileSync, listenPort = port } = {}) {
   try {
@@ -42,7 +43,7 @@ async function assertIdle() {
     const cookie = auth?.headers.get('set-cookie')?.split(';')[0];
     const response = cookie ? await fetch(`http://localhost:${port}/api/state`, { headers: { cookie } }) : null;
     const state = response?.ok ? await response.json() : null;
-    if (state && (state.loginSession?.active || state.verification?.session || state.browser?.busy || state.activeJob?.status === 'running')) {
+    if (state && (state.loginSession?.active || state.verification?.session || state.engageVerification?.session || state.browser?.busy || state.engageBrowser?.busy || state.activeJob?.status === 'running' || state.engageJob?.status === 'running')) {
       throw new Error('浏览器或任务仍在执行，请在空闲时再重启');
     }
   } catch (error) {
@@ -51,12 +52,19 @@ async function assertIdle() {
   return pid;
 }
 
-export async function waitHealthy(previousPid, { findPid = listenerPid, request = fetch, attempts = 100, interval = 150 } = {}) {
+export async function waitHealthy(previousPid, {
+  findPid = listenerPid, request = fetch, attempts = 100, interval = 150,
+  expectedVersion = process.env.WEIBO_CONSOLE_EXPECTED_VERSION || ''
+} = {}) {
   for (let attempt = 0; attempt < attempts; attempt++) {
     const pid = findPid();
     if (pid && pid !== previousPid) {
-      const response = await request(`http://127.0.0.1:${port}/api/license/status`, { signal: AbortSignal.timeout(1000) }).catch(() => null);
-      if (response?.ok) return pid;
+      const response = await request(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(1000) }).catch(() => null);
+      if (response?.ok) {
+        if (!expectedVersion) return pid;
+        const health = await response.json().catch(() => null);
+        if (health?.version === expectedVersion) return pid;
+      }
     }
     await new Promise(resolve => setTimeout(resolve, interval));
   }
@@ -72,7 +80,8 @@ function startupPath() {
 }
 
 function startWindowsRunner() {
-  const child = spawn(nodeBin, [path.join(root, 'scripts', 'service-runner.mjs'), String(port), dataDir], { detached: true, stdio: 'ignore', windowsHide: true });
+  const args = managedLauncher ? [managedLauncher] : [path.join(root, 'scripts', 'service-runner.mjs'), String(port), dataDir];
+  const child = spawn(nodeBin, args, { detached: true, stdio: 'ignore', windowsHide: true });
   child.on('error', error => { console.error('后台启动失败：' + error.message); process.exitCode = 1; });
   child.unref();
 }
@@ -107,7 +116,7 @@ function macPlist() {
 <plist version="1.0"><dict>
   <key>Label</key><string>${label}</string>
   <key>ProgramArguments</key><array>
-    ${process.platform === 'darwin' ? '<string>/usr/bin/caffeinate</string><string>-dimsu</string>' : ''}<string>${esc(nodeBin)}</string><string>${esc(serverEntry)}</string>
+    ${process.platform === 'darwin' ? '<string>/usr/bin/caffeinate</string><string>-dimsu</string>' : ''}<string>${esc(nodeBin)}</string><string>${esc(managedLauncher || serverEntry)}</string>
   </array>
   <key>WorkingDirectory</key><string>${esc(root)}</string>
   <key>RunAtLoad</key><true/>
@@ -121,7 +130,7 @@ function macPlist() {
 export function windowsLauncher({ directory = dataDir, projectRoot = root, executable = nodeBin, listenPort = port } = {}) {
   const launcher = path.join(directory, 'start-console.vbs');
   const vbString = value => `"${String(value).replaceAll('"', '""')}"`;
-  const command = [executable, path.join(projectRoot, 'scripts', 'service-runner.mjs'), String(listenPort), directory].map(value => `"${value}"`).join(' ');
+  const command = [executable, ...(managedLauncher ? [managedLauncher] : [path.join(projectRoot, 'scripts', 'service-runner.mjs'), String(listenPort), directory])].map(value => `"${value}"`).join(' ');
   fs.mkdirSync(directory, { recursive: true });
   const source = [
     'Set sh = CreateObject("WScript.Shell")',
@@ -183,6 +192,15 @@ async function install() {
   console.log(`控制台地址：http://localhost:${port}`);
 }
 
+async function stopService() {
+  if (process.platform === 'win32') { await stopWindows(); return; }
+  if (process.platform !== 'darwin') throw new Error('当前系统暂不支持停止服务');
+  await assertIdle();
+  const plistPath = macPlistPath();
+  const domain = `gui/${process.getuid()}`;
+  try { execFileSync('/bin/launchctl', ['bootout', domain, plistPath], { stdio: 'ignore' }); } catch {}
+}
+
 async function uninstall() {
   if (process.platform === 'win32') {
     await stopWindows();
@@ -216,7 +234,8 @@ export async function main() {
   if (action === 'install') await install();
   else if (action === 'uninstall') await uninstall();
   else if (action === 'status') status();
-  else if (action === 'stop' && process.platform === 'win32') await stopWindows();
+  else if (action === 'preflight') { await assertIdle(); console.log('当前服务空闲，可以安装或更新。'); }
+  else if (action === 'stop') await stopService();
   else if (action === 'restart') {
     const previous = process.platform === 'win32' ? await stopWindows() : await assertIdle();
     if (process.platform === 'darwin') {
@@ -229,7 +248,7 @@ export async function main() {
     const pid = await waitHealthy(previous);
     console.log('服务已重启，PID ' + pid);
   }
-  else { console.error('用法：node scripts/service.mjs install|uninstall|status|restart'); process.exit(1); }
+  else { console.error('用法：node scripts/service.mjs install|uninstall|status|preflight|stop|restart'); process.exit(1); }
 }
 
 const isMain = import.meta.main ?? (process.argv[1] && fs.realpathSync.native(process.argv[1]).toLowerCase() === fs.realpathSync.native(fileURLToPath(import.meta.url)).toLowerCase());

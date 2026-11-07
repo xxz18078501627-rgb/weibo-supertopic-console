@@ -10,8 +10,12 @@ export function definiteNetworkError(error) {
 const keyFor = step => `${step.round}:${step.topicId}:${step.accountId}:${step.segmentId || step.actionIndex}:${step.unitIndex}`;
 
 export class NetworkRecovery {
-  constructor(runner) { this.runner = runner; this.timer = null; this.checking = false; this.probeSerial = 0; this.probeRun = `${process.pid}-${Date.now()}-${Math.random()}`; this.epoch = 0; }
-  status(job) { return job?.cursor?.networkRecovery || { state: 'online', pauseSource: null }; }
+  constructor(runner) { this.runner = runner; this.timer = null; this.checking = false; this.probeSerial = 0; this.probeRun = `${process.pid}-${Date.now()}-${Math.random()}`; this.epoch = 0; this.lastOnline = null; }
+  status(job) {
+    const info = job?.cursor?.networkRecovery;
+    if (this.runner.scope === 'engage') return { ...info, state: info?.state === 'offline' ? 'offline' : info?.lastProbe?.state || 'unknown', pauseSource: info?.pauseSource || null };
+    return info || { state: 'online', pauseSource: null };
+  }
   async check(job) {
     const manager = this.runner.adapter.browserManager;
     const generation = manager?.generation || 0;
@@ -23,8 +27,12 @@ export class NetworkRecovery {
     const flight = { jobId: job.id, generation, episode, controller };
     this.flight?.controller.abort(); this.flight = flight;
     flight.promise = (async () => {
-      let timer;
+      let timer, release;
+      const groupOwnsAccount = this.runner.engageSession?.jobId === job.id
+        && this.runner.engageSession.accountId === account?.id;
+      const needsLease = this.runner.leases && !this.runner.currentExecution && !this.runner.workflow.session && !groupOwnsAccount;
       try {
+        if (needsLease && account) release = this.runner.leases.acquire(account, this.runner.scope || job.id);
         const raw = !account || !this.runner.adapter.probeConnectivity ? { state: 'unknown', code: 'PROBE_NOT_READY' } : await Promise.race([
           this.runner.adapter.probeConnectivity(account, { force: job.cursor.networkRecovery?.state === 'offline', signal: controller.signal }),
           new Promise(resolve => { timer = setTimeout(() => { controller.abort(); resolve({ state: 'unknown', code: 'PROBE_TIMEOUT' }); }, 3000); })
@@ -39,7 +47,7 @@ export class NetworkRecovery {
         return { ...value, state: stale ? 'unknown' : ['online','offline','unknown'].includes(value?.state) ? value.state : 'unknown',
           code: stale ? 'PROBE_STALE' : value?.code || null, stale, serial, checkedAt: new Date(this.runner.now()).toISOString(), latencyMs: value?.latencyMs ?? Date.now() - started };
       } catch { return { state: 'unknown', code: 'PROBE_EXCEPTION', stale: true, serial, checkedAt: new Date(this.runner.now()).toISOString(), latencyMs: Date.now() - started }; }
-      finally { clearTimeout(timer); if (this.flight === flight) this.flight = null; }
+      finally { clearTimeout(timer); try { if (release) await manager?.closeRunner?.(); } finally { release?.(); if (this.flight === flight) this.flight = null; } }
     })();
     return flight.promise;
   }
@@ -55,22 +63,33 @@ export class NetworkRecovery {
       lastProbe: { state: result.state, code: result.code, httpStatus: result.httpStatus || null, latencyMs: result.latencyMs, checkedAt: result.checkedAt } };
     if (result.state === 'online' && info.state !== 'offline') { info.reason = null; info.step = null; info.since = null; }
     if (result.state !== 'online' && (old.lastProbe?.state !== result.state || old.lastProbe?.code !== result.code)) {
-      log('warning', `网络探测${result.state === 'unknown' ? '暂不可用' : '不可达'}：${result.code || '无错误码'}，耗时 ${result.latencyMs}ms，HTTP ${result.httpStatus || '无响应'}`);
+      log('warning', `网络探测${result.state === 'unknown' ? '暂不可用' : '不可达'}：${result.code || '无错误码'}，耗时 ${result.latencyMs}ms，HTTP ${result.httpStatus || '无响应'}`, { jobId });
     }
     this.runner.emitUpdate(updateJob(jobId, { cursor: { ...job.cursor, networkRecovery: info } }));
     return info;
   }
-  async probe(job) {
+  async probe(job, { force = false } = {}) {
+    const manager = this.runner.adapter.browserManager;
+    const cached = this.lastOnline;
+    if (!force && cached && cached.jobId === job?.id
+      && Date.now() - cached.at < 15000
+      && (manager?.generation || 0) === cached.generation
+      && job?.cursor?.networkRecovery?.state !== 'offline') return true;
     const result = await this.check(job);
     const info = this.recordProbe(job.id, result);
+    if (!result.stale && result.state === 'online' && manager?.context) {
+      this.lastOnline = { jobId: job.id, at: Date.now(), generation: manager?.generation || 0 };
+    } else if (result.state === 'offline') this.lastOnline = null;
+    if (this.runner.scope === 'engage' && !result.stale && result.state === 'offline' && result.code === 'ERR_INTERNET_DISCONNECTED') return false;
     return result.stale || !info || (info.state !== 'offline' && (result.state !== 'offline' || (!result.definitive && info.failures < 2)));
   }
   async monitor(job) {
+    if (this.runner.leases && (this.runner.currentExecution || this.runner.workflow.busy())) return;
     if (this.runner.navigation?.waiting(job)) return;
     if (!job || !['running','waiting'].includes(job.status) || this.checking || job.cursor.networkRecovery?.state === 'offline') return;
     this.checking = true;
     try {
-      if (!await this.probe(job)) {
+      if (!await this.probe(job, { force: true })) {
         const fresh = getJob(job.id);
         if (fresh && !fresh.pausedByUser && ['running','waiting'].includes(fresh.status)) this.pause(job.id, this.runner.currentExecution?.step || null);
       }
@@ -79,11 +98,12 @@ export class NetworkRecovery {
   async isNetworkError(error, jobId) {
     if (definiteNetworkError(error) || error?.networkHandled) return true;
     if (!/timeout|timed out|network_error|fetch failed|Failed to fetch/i.test(`${error?.code || ''} ${error?.message || ''}`)) return false;
-    const job = getJob(jobId); return Boolean(job && !await this.probe(job));
+    const job = getJob(jobId); return Boolean(job && !await this.probe(job, { force: true }));
   }
   pause(jobId, step = null, reason = '检测到网络断开') {
     const job = getJob(jobId); if (!job || job.stopRequested || ['stopped','completed'].includes(job.status)) return;
     if (job.pausedByUser) return job;
+    this.lastOnline = null;
     const previous = job.cursor.networkRecovery;
     if (previous?.state === 'offline') {
       this.arm(jobId);
@@ -93,7 +113,7 @@ export class NetworkRecovery {
     const since = new Date(this.runner.now()).toISOString();
     const networkRecovery = { ...previous, state: 'offline', pauseSource: 'network', since,
       reason, successes: 0, step, returnStatus: job.status };
-    log('warning', `任务网络暂停：${reason.replace(/https?:\/\/\S+/g, '[链接]').slice(0, 200)}；探测码 ${previous?.lastProbe?.code || '操作返回网络错误'}`);
+      log('warning', `任务网络暂停：${reason.replace(/https?:\/\/\S+/g, '[链接]').slice(0, 200)}；探测码 ${previous?.lastProbe?.code || '操作返回网络错误'}`, { jobId });
     const updated = updateJob(jobId, { status: 'paused', waitReason: '网络中断，任务已自动暂停，正在检测恢复', cursor: { ...job.cursor, networkRecovery, verificationBarrier: job.cursor.verificationBarrier || Boolean(job.cursor.manualVerification) } });
     this.runner.emitUpdate(updated); this.arm(jobId); return updated;
   }
@@ -114,12 +134,13 @@ export class NetworkRecovery {
   arm(jobId) {
     if (this.timer && this.jobId === jobId) return;
     this.clear(); this.jobId = jobId;
-    this.timer = setInterval(() => { void this.tick(jobId).catch(error => log('warning', `网络恢复检测异常：${error.message}`)); }, 5000);
+    this.timer = setInterval(() => { void this.tick(jobId).catch(error => log('warning', `网络恢复检测异常：${error.message}`, { jobId })); }, 5000);
     this.timer.unref?.();
   }
   clear(jobId = null) {
     if (jobId && this.jobId !== jobId && this.flight?.jobId !== jobId) return;
     this.epoch++; this.flight?.controller.abort();
+    if (!jobId || this.lastOnline?.jobId === jobId) this.lastOnline = null;
     clearInterval(this.timer); this.timer = null; this.jobId = null;
   }
   async tick(jobId) {
@@ -140,7 +161,7 @@ export class NetworkRecovery {
       const restoredAt = new Date(this.runner.now()).toISOString();
       job = updateJob(jobId, { cursor: { ...job.cursor, networkRecovery: { ...info, state: 'online', pauseSource: null, since: null, reason: null, step: null, failures: 0, restoredAt,
         lastOutage: { since: info.since, reason: info.reason, restoredAt } } } });
-      log('info', `任务网络已恢复，开始只读核验及接续；本次中断始于 ${info.since}`);
+      log('info', `任务网络已恢复，开始只读核验及接续；本次中断始于 ${info.since}`, { jobId });
       const step = info.step;
       if (step && this.runner.workflow.session?.jobId !== jobId) {
         const action = getStepAction(jobId, keyFor(step));
@@ -148,9 +169,14 @@ export class NetworkRecovery {
           const account = getAccount(step.accountId), topic = listTopics().find(t => t.id === step.topicId);
           let result = { state: 'uncertain' };
           try {
+            await this.runner.withAccountLease(job, account, async () => {
+            if (step.kind === 'repost') result = await this.runner.adapter.verifyRepost?.(account, action) || result;
+            if (step.kind === 'like') result = await this.runner.adapter.verifyLike?.(account, action.link || action.url) || result;
+            if (step.kind === 'comment_like') result = await this.runner.adapter.verifyCommentLike?.(account, action.link || action.url, action.target_id) || result;
             if (step.kind === 'post') result = await this.runner.adapter.verifyPost?.(account, action, { topicName: topic?.name }) || result;
             if (step.kind === 'checkin') result = await this.runner.adapter.verifyCheckin?.(account, topic) || result;
             if (step.kind === 'comment' && action.target_id && action.url) result = await this.runner.adapter.verifyComment?.(account, { id: action.target_id, url: action.url.split('?')[0] }, action.content, { delays: [0] }) || result;
+            });
           } catch (error) {
             if (await this.runner.navigation?.handle(error, jobId, step)) return;
             if (await this.isNetworkError(error, jobId)) { this.pause(jobId, step, error.message); return; }

@@ -16,8 +16,8 @@ const dbModule = await import('../src/db.js');
 const runnerModule = await import('../src/runner.js');
 
 const {
-  addCommentMaterials, addPostMaterials, clearAllDataForTests, createAccount, createActionLog, createJob, createMaterialGroup, migrateRefreshDefaults,
-  createTopic, getActionLog, getJob, hasCommented, listActionLogs, pickCommentMaterial, recordAccountRestriction, listActiveAccountRestrictions, updateAccountAuth, updateActionLog
+  addCommentMaterials, addPostMaterials, clearAccountRestrictions, clearAccountRestrictionsFromOpenJobs, clearAllDataForTests, createAccount, createActionLog, createJob, createMaterialGroup, migrateRefreshDefaults,
+  createTopic, getActionLog, getJob, hasCommented, listActionLogs, pickCommentMaterial, recordAccountRestriction, listActiveAccountRestrictions, seedAccountRestrictionsFromJobs, updateAccountAuth, updateActionLog
 } = dbModule;
 const { buildSteps, createSnapshot, TaskRunner, validateSnapshot } = runnerModule;
 const { decorateText } = runnerModule;
@@ -706,21 +706,22 @@ test('创建任务快照按文案组过滤，空组选择表示全部', () => {
   clearAllDataForTests();
   const account = createAccount('分组测试');
   const topic = createTopic({ name: '分组超话', url: 'https://example.test/group-topic' });
-  const groupA = createMaterialGroup('组A');
-  const groupB = createMaterialGroup('组B');
+  const groupA = createMaterialGroup('组A', 'post');
+  const groupB = createMaterialGroup('组B', 'post');
   addPostMaterials(['甲组发帖', '甲组发帖二'], undefined, groupA.id);
   addPostMaterials(['乙组发帖'], undefined, groupB.id);
   addPostMaterials(['未分组发帖']);
-  const groupC = createMaterialGroup('组C');
+  const groupC = createMaterialGroup('组C', 'post');
   addPostMaterials(['单条发帖'], undefined, groupC.id);
-  addCommentMaterials(['甲组评论', '甲组评论二'], groupA.id);
+  const groupAComment = createMaterialGroup('组A', 'comment');
+  addCommentMaterials(['甲组评论', '甲组评论二'], groupAComment.id);
   addCommentMaterials(['未分组评论']);
   const base = { rounds: 1, accountIds: [account.id], topicIds: [topic.id], actionPlan: [{ type: 'post', count: 1 }, { type: 'comment', count: 1 }] };
-  const filtered = createSnapshot({ ...base, postGroupIds: [groupA.id], commentGroupIds: [groupA.id] }, listAccounts(), listTopics());
+  const filtered = createSnapshot({ ...base, postGroupIds: [groupA.id], commentGroupIds: [groupAComment.id] }, listAccounts(), listTopics());
   assert.deepEqual(new Set(filtered.materials.posts.map(item => item.text)), new Set(['甲组发帖', '甲组发帖二']));
   assert.deepEqual(new Set(filtered.materials.comments.map(item => item.text)), new Set(['甲组评论', '甲组评论二']));
   assert.deepEqual(validateSnapshot(filtered), []);
-  const onePost = createSnapshot({ ...base, postGroupIds: [groupC.id], commentGroupIds: [groupA.id] }, listAccounts(), listTopics());
+  const onePost = createSnapshot({ ...base, postGroupIds: [groupC.id], commentGroupIds: [groupAComment.id] }, listAccounts(), listTopics());
   assert.ok(validateSnapshot(onePost).some(item => item.includes('至少两条共享发帖文案')));
   const all = createSnapshot({ ...base, postGroupIds: [], commentGroupIds: [] }, listAccounts(), listTopics());
   assert.deepEqual(new Set(all.materials.posts.map(item => item.text)), new Set(['甲组发帖', '甲组发帖二', '乙组发帖', '未分组发帖', '单条发帖']));
@@ -1214,6 +1215,47 @@ test('频繁限制持久 1 小时且只匹配对应操作类型', () => {
   db.prepare('UPDATE account_restrictions SET expires_at=? WHERE account_id=?').run(new Date(Date.now() - 1000).toISOString(), account.id);
   runner.accountRestrictionsAt = 0;
   assert.equal(runner.restrictionFor(account.id, 'comment', identity), null);
+});
+
+test('手动解除账号限制会清除限制表和进行中任务游标', () => {
+  clearAllDataForTests();
+  const account = createAccount('解除限制测试');
+  updateAccountAuth(account.id, { status: 'valid', uid: '7000000002', nickname: '解除限制测试' });
+  const identity = '7000000002';
+  const detectedAt = new Date().toISOString();
+  recordAccountRestriction({ accountId: account.id, identity, type: 'mute', reason: '测试禁言', detectedAt, expiresAt: new Date(Date.now() + 3600000).toISOString() });
+  recordAccountRestriction({ accountId: account.id, identity, type: 'frequent', kind: 'comment', reason: '测试频繁', detectedAt, expiresAt: new Date(Date.now() + 600000).toISOString() });
+  const running = createJob({ accountIds: [account.id], topicIds: [], rounds: 1, actionPlan: [] });
+  dbModule.updateJob(running.id, { cursor: { stepIndex: 0, muteLimits: [{ round: 0, identity, accountId: account.id, at: detectedAt }], rateLimits: [{ round: 0, identity, accountId: account.id, kind: 'comment', at: detectedAt }] } });
+  const finished = createJob({ accountIds: [account.id], topicIds: [], rounds: 1, actionPlan: [] });
+  dbModule.updateJob(finished.id, { status: 'completed', cursor: { stepIndex: 0, muteLimits: [{ round: 0, identity, accountId: account.id, at: detectedAt }] } });
+  assert.equal(listActiveAccountRestrictions().length, 2);
+  assert.equal(clearAccountRestrictions(account.id), 2);
+  assert.equal(clearAccountRestrictionsFromOpenJobs({ accountId: account.id, identity }), 1);
+  assert.equal(listActiveAccountRestrictions().length, 0);
+  assert.deepEqual(getJob(running.id).cursor.muteLimits, []);
+  assert.deepEqual(getJob(running.id).cursor.rateLimits, []);
+  assert.equal(getJob(finished.id).cursor.muteLimits.length, 1);
+  const runner = new TaskRunner({});
+  runner.accountRestrictionsAt = 0;
+  assert.equal(runner.restrictionFor(account.id, 'comment', identity), null);
+});
+
+test('启动回填只恢复未过期的游标限制', () => {
+  clearAllDataForTests();
+  const account = createAccount('回填测试');
+  const identity = '7000000003';
+  const at = Date.now();
+  const job = createJob({ accountIds: [account.id], topicIds: [], rounds: 1, actionPlan: [] });
+  dbModule.updateJob(job.id, { status: 'completed', cursor: { stepIndex: 0,
+    muteLimits: [
+      { round: 0, identity, accountId: account.id, at: new Date(at - 2 * 3600000).toISOString(), reason: '两小时前禁言' },
+      { round: 0, identity: identity + '9', accountId: account.id, at: new Date(at - 25 * 3600000).toISOString(), reason: '过期禁言' }
+    ],
+    rateLimits: [{ round: 0, identity: identity + '8', accountId: account.id, kind: 'comment', at: new Date(at - 30 * 60000).toISOString(), reason: '半小时前频繁' }]
+  } });
+  assert.equal(seedAccountRestrictionsFromJobs(), 2);
+  assert.deepEqual(listActiveAccountRestrictions().map(item => item.type + ':' + item.kind).sort(), ['frequent:comment', 'mute:']);
 });
 
 test('登录验证状态会显示，关闭窗口后停止检测，不清理登录目录', async () => {

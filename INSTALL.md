@@ -1,5 +1,15 @@
 # 安装说明（人和 agent 都看这一份）
 
+## v1.1.0 新安装包
+
+- Mac：按 `uname -m` 选择 `weibo-console-1.1.0-mac-arm64.dmg` 或 `weibo-console-1.1.0-mac-x64.dmg`，详细步骤见 [手动安装与更新-Mac](docs/手动安装与更新-Mac.md)。
+- Windows x64：下载 `weibo-console-1.1.0-windows-x64.exe`，详细步骤见 [手动安装与更新-Windows](docs/手动安装与更新-Windows.md)。
+- 安装包未签名时，按对应教程在 Gatekeeper / SmartScreen 手动放行。先核对官方 Release 清单中的 SHA256。
+- 管理版程序、便携 Node、Chromium 和用户数据分开保存；以后更新只切换版本指针，保留 `data/`。
+- `weibo-console-1.1.0.zip` 仍提供，用于旧版更新器过渡；新用户不需要解压 ZIP 或手动运行 `install.sh` / `install.ps1`。
+
+以下旧版安装说明保留用于故障排查和历史版本。
+
 ## 你需要什么
 
 - 一台 Mac 或 Windows 电脑

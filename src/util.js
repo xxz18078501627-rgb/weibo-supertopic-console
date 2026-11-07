@@ -47,3 +47,7 @@ export function pickRandom(items) {
 export function serializeError(error) {
   return error instanceof Error ? error.message : String(error);
 }
+
+export function kindLabel(kind) {
+  return { checkin: '签到', post: '发帖', comment: '评论', repost: '转发', like: '外赞', comment_like: '内赞' }[kind] || String(kind || '');
+}

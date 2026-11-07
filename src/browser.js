@@ -85,9 +85,11 @@ export class BrowserManager {
       locale: 'zh-CN',
       timezoneId: config.timezone
     };
+    profileOwners.set(account.profile_dir, { accountId: account.id, launching: this });
     try {
       this.context = await this.launch({ profile: account.profile_dir, options });
     } catch (error) {
+      if (profileOwners.get(account.profile_dir)?.launching === this) profileOwners.delete(account.profile_dir);
       throw new BrowserBusyError(`Chrome 无法打开：${error.message}`);
     }
     this.accountId = account.id;

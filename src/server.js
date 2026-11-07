@@ -7,23 +7,26 @@ import { taskProgress } from './task-progress.js';
 import { recordView } from './record-view.js';
 import { URL } from 'node:url';
 import { config } from './config.js';
+import { resolveBlacklist, resolveEngageSettings } from './engage-profile-resolver.js';
 import {
-  addCommentMaterials, addPostMaterials, createAccount, createTopic, deleteCommentMaterial, deleteCommentMaterials, deletePostMaterial, deletePostMaterials,
-  deleteTopic, deleteTopics, deleteAccount, getAccount, getActiveJob, getJob, getSetting, listAccounts, listActionLogs, listCommentMaterials, listMaterialGroups, createMaterialGroup, deleteMaterialGroup, setMaterialsGroup,
+  addCommentMaterials, addPostMaterials, addRepostMaterials, clearAccountRestrictions, clearAccountRestrictionsFromOpenJobs, createAccount, createTopic, deleteCommentMaterial, deleteCommentMaterials, deletePostMaterial, deletePostMaterials, deleteRepostMaterial, deleteRepostMaterials,
+  deleteTopic, deleteTopics, deleteAccount, getAccount, getActiveJob, getJob, getSetting, listAccounts, listActionLogs, listCommentMaterials, listRepostMaterials, listMaterialGroups, createMaterialGroup, deleteMaterialGroup, renameMaterialGroup, setMaterialsGroup,
   listActiveAccountRestrictions, listJobs, listPostMaterials, listRecordsByShanghaiDate, listSystemLogs, listTopics, log, reorderAccounts, seedAccountRestrictionsFromJobs, setSetting, updateAccount, updateAccountAuth, updateTopic
 } from './db.js';
 import { BrowserManager, browserManager } from './browser.js';
 import { createRunner } from './runner.js';
+import { AccountLeases } from './account-leases.js';
 import { WeiboAdapter } from './weibo-adapter.js';
 import { parseCookies, randomToken, safeEqual, shanghaiDate } from './util.js';
 import { LoginService } from './login-service.js';
-import { DEFAULT_EMOJIS, normalizeTaskSettings } from '../public/defaults.js';
+import { DEFAULT_EMOJIS, normalizeTaskSettings, normalizeEngageSettings, engageTemplateConfig } from '../public/defaults.js';
 import { listAccountGroups, saveAccountGroup, deleteAccountGroup, moveAccountsToGroup } from './account-groups.js';
-import { dailySuccess, dailyStats, roundsForDate, listRoundReports, pendingRoundReports, acknowledgeRound, unnotifiedRounds } from './task-reports.js';
+import { dailySuccess, dailyStats, operationCounts, roundsForDate, listRoundReports, pendingRoundReports, acknowledgeRound, unnotifiedRounds } from './task-reports.js';
 import { pruneDetailedRecords, isArchivedRecord, RETENTION_DAYS } from './retention.js';
 import { FIXED_TOPIC, COMMENT_SECTIONS, isFixedTopic } from '../public/topic-policy.js';
 import { currentLanAccess } from './lan-access.js';
 import { activate as activateLicense, licenseEnabled, licenseStatus } from './license.js';
+import { UpdateManager } from './update-manager.js';
 
 if (config.topicMode === 'fixed') {
   const topic = listTopics().find(isFixedTopic);
@@ -47,9 +50,29 @@ function accessToken() {
 const sessions = new Set();
 const sseClients = new Set();
 const serviceIdentity = { pid: process.pid, startedAt: new Date().toISOString(), revision: createHash('sha256').update(
-  ['server.js','runner.js','weibo-adapter.js','post-receipts.js','post-success-notice.js','db.js','task-reports.js','verification-workflow.js','network-recovery.js','task-progress.js'].map(file => fs.readFileSync(path.join(config.rootDir, 'src', file))).join('\n')
+  ['server.js','runner.js','weibo-adapter.js','post-receipts.js','post-success-notice.js','db.js','task-reports.js','verification-workflow.js','network-recovery.js','task-progress.js','engage.js','account-leases.js','engage-profile-resolver.js'].map(file => fs.readFileSync(path.join(config.rootDir, 'src', file))).join('\n')
 ).digest('hex').slice(0, 16) };
-const runner = createRunner(browserManager);
+const leases = new AccountLeases();
+const runner = createRunner(browserManager, { scope: 'workbench', leases });
+const engageBrowserManager = new BrowserManager(undefined, { headless: true, name: 'engage', visibleRunner: false });
+const engageRunner = createRunner(engageBrowserManager, { scope: 'engage', leases });
+const runners = [runner, engageRunner];
+const packageVersion = JSON.parse(fs.readFileSync(path.join(config.rootDir, 'package.json'), 'utf8')).version;
+const updateManager = new UpdateManager({
+  rootDir: config.rootDir,
+  dataDir: config.dataDir,
+  currentVersion: packageVersion,
+  idleCheck: async () => {
+    if (loginService.active) return '请先完成或取消扫码登录';
+    if (runner.promise || engageRunner.promise || runner.currentExecution || engageRunner.currentExecution) return '当前仍有浏览器操作，请在任务安全暂停后再更新';
+    if (runner.workflow.session || engageRunner.workflow.session) return '请先结束当前人工验证会话';
+    if (browserManager.status().busy || engageBrowserManager.status().busy) return '任务浏览器仍在使用，请稍后再更新';
+    const work = getActiveJob('workbench'), engage = getActiveJob('engage');
+    if (work?.status === 'running' || engage?.status === 'running') return '请先暂停工作台和转赞评任务';
+    return null;
+  }
+});
+const runnerFor = job => job?.scope === 'engage' || job?.config?.kind === 'engage' || job?.kind === 'engage' ? engageRunner : runner;
 // QR login owns a separate visible Chromium manager.  Normal tasks remain
 // headless and can keep running while a different account is being added.
 const loginBrowserManager = new BrowserManager(undefined, { headless: false, name: 'login' });
@@ -60,10 +83,13 @@ let stateVersion = 0;
 let nextNetworkProbe = 0;
 const dailyStopTimer = setInterval(() => {
   try {
-    runner.enforceDailyStop();
+    for (const worker of runners) worker.enforceDailyStop();
     if (Date.now() >= nextNetworkProbe) {
       nextNetworkProbe = Date.now() + 5000;
-      void runner.network.monitor(getActiveJob()).catch(error => log('warning', `连通性检查失败：${error.message}`));
+      for (const worker of runners) {
+        const current = worker.current();
+        void worker.network.monitor(current).catch(error => log('warning', `连通性检查失败：${error.message}`, { jobId: current?.id }));
+      }
     }
     const policy = runner.dailyStopStatus();
     const key = `${policy.deadlineAt}:${policy.blocked}`;
@@ -72,15 +98,17 @@ const dailyStopTimer = setInterval(() => {
 }, 1000);
 dailyStopTimer.unref();
 
-runner.on('update', job => {
+for (const worker of runners) {
+worker.on('update', job => {
   broadcast('job', job);
   // A dedicated post-commit event lets the verification queue appear as soon
   // as an action records a challenge, without waiting for the next poll.
-  broadcast('verification', { version: ++verificationVersion, verification: runner.workflow.status(getJob(job.id) || job) });
+  broadcast('verification', { version: ++verificationVersion, scope: job.scope || 'workbench', verification: worker.workflow.status(getJob(job.id) || job) });
 });
-runner.on('round-completed', report => {
+worker.on('round-completed', report => {
   broadcast('round-completed', report);
 });
+}
 loginService.on('update', () => broadcast('state', state()));
 
 function send(res, status, data, headers = {}) {
@@ -127,7 +155,8 @@ function state() {
     profile_dir: undefined,
     postMaterialCount: undefined
   }));
-  const activeJob = getActiveJob();
+  const activeJob = getActiveJob('workbench');
+  const engageJob = getActiveJob('engage');
   return {
     stateVersion: ++stateVersion,
     allowCustomTopics: config.topicMode === 'general',
@@ -137,37 +166,47 @@ function state() {
     schedulerVersion: 3,
     dailyStop: runner.dailyStopStatus(),
     accountGroups: listAccountGroups(),
-    dailySuccess: dailySuccess(),
-    pendingRoundReports: pendingRoundReports(),
+    dailySuccess: dailySuccess(undefined, 'workbench'),
+    engageDailySuccess: dailySuccess(undefined, 'engage'),
+    pendingRoundReports: pendingRoundReports().filter(report => (report.scope || getJob(report.jobId)?.scope || 'workbench') === 'workbench'),
     topics: config.topicMode === 'fixed' ? listTopics().filter(isFixedTopic).slice(0, 1) : listTopics(),
     comments: listCommentMaterials(),
     posts: listPostMaterials(),
+    reposts: listRepostMaterials(),
     defaultEmojis: DEFAULT_EMOJIS,
     taskDefaults: normalizeTaskSettings(getSetting('task_defaults', {})),
+    engageDefaults: normalizeEngageSettings(getSetting('engage_defaults', {})),
+    engageTemplates: getSetting('engage_templates', []),
+    engageNetwork: engageRunner.network.status(engageJob),
     materialGroups: listMaterialGroups(),
     lanAccess: currentLanAccess(config.port),
-    restrictedAccounts: (() => {
-      const cursor = listJobs(1)[0]?.cursor || {};
-      const merged = new Map();
-      for (const item of cursor.muteLimits || []) merged.set('禁言|' + item.identity + '|', { identity: item.identity, type: '禁言', kind: item.kind || '', reason: item.reason || '', at: item.at || '' });
-      for (const item of cursor.rateLimits || []) merged.set('频繁|' + item.identity + '|' + (item.kind || ''), { identity: item.identity, type: '频繁', kind: item.kind || '', reason: item.reason || '', at: item.at || '' });
-      for (const item of listActiveAccountRestrictions()) {
-        const type = item.type === 'mute' ? '禁言' : item.type === 'frequent' ? '频繁' : item.type;
-        merged.set(type + '|' + item.identity + '|' + item.kind, { identity: item.identity, type, kind: item.kind || '', reason: item.reason || '', at: item.detectedAt || '', expiresAt: item.expiresAt || '' });
-      }
-      return [...merged.values()];
-    })(),
+    restrictedAccounts: listActiveAccountRestrictions().map(item => ({
+      accountId: item.accountId,
+      identity: item.identity,
+      type: item.type === 'mute' ? '禁言' : item.type === 'frequent' ? '频繁' : item.type,
+      kind: item.kind || '',
+      reason: item.reason || '',
+      at: item.detectedAt || '',
+      expiresAt: item.expiresAt || ''
+    })),
     taskTemplates: getSetting('task_templates', []).map(item => ({ ...item, config: templateConfig(item.config || {}) })),
     loginSession: loginService.status(),
     activeJob: activeJob ? { ...activeJob, progress: taskProgress(activeJob) } : null,
     network: runner.network.status(activeJob),
-    verification: runner.workflow.status(activeJob || listJobs(1)[0]),
-    recentJobs: listJobs(15).map(job => ({ ...job, progress: taskProgress(job) })),
-    recentActions: activeJob ? listActionLogs(activeJob.id, 120) : [],
-    logs: listSystemLogs(150),
+    verification: runner.workflow.status(activeJob || listJobs(1, 'workbench')[0]),
+    recentJobs: listJobs(15, 'workbench').map(job => ({ ...job, progress: taskProgress(job) })),
+    recentActions: (activeJob || listJobs(1, 'workbench')[0]) ? listActionLogs((activeJob || listJobs(1, 'workbench')[0]).id, 120) : [],
+    engageJob: (() => { const job = engageJob || listJobs(1, 'engage')[0]; return job ? { ...job, progress: taskProgress(job), operationCounts: operationCounts(job.id) } : null; })(),
+    engageEdit: engageJob ? engageRunner.editableTask(engageJob.id) : null,
+    engageVerification: engageRunner.workflow.status(engageJob || listJobs(1, 'engage')[0]),
+    engageRecentActions: (engageJob || listJobs(1, 'engage')[0]) ? listActionLogs((engageJob || listJobs(1, 'engage')[0]).id, 120) : [],
+    engageBrowser: engageBrowserManager.status(),
+    update: updateManager.snapshot(),
+    logs: listSystemLogs(150, 'workbench'),
     browser: browserManager.status(),
     loginBrowser: loginBrowserManager.status(),
     verificationVersion,
+    features: { engageV2: true, typedMaterialGroups: true, concurrentTasks: true },
     service: serviceIdentity
   };
 }
@@ -178,7 +217,10 @@ function broadcast(event, payload) {
 }
 
 async function api(req, res, url) {
+  const routedJobId = url.pathname.match(/^\/api\/jobs\/([^/]+)/)?.[1];
+  const runner = routedJobId ? runnerFor(getJob(routedJobId)) : runners[0];
   if (url.pathname === '/api/license/status' && req.method === 'GET') return send(res, 200, licenseStatus());
+  if (url.pathname === '/api/health' && req.method === 'GET') return send(res, 200, { ok: true, version: packageVersion, service: serviceIdentity });
   if (url.pathname === '/api/license/activate' && req.method === 'POST') {
     const input = await body(req);
     try {
@@ -202,7 +244,7 @@ async function api(req, res, url) {
   }
   if (url.pathname === '/api/session') return send(res, 200, { authenticated: isAuthenticated(req) });
   if (!isAuthenticated(req)) return send(res, 401, { error: '请先输入访问口令' });
-  if (runner.repairing && req.method !== 'GET' && !/^\/api\/jobs\/[^/]+\/(pause|stop)$/.test(url.pathname)) {
+  if (runners.some(worker => worker.repairing) && req.method !== 'GET' && !/^\/api\/jobs\/[^/]+\/(pause|stop)$/.test(url.pathname)) {
     return send(res, 409, { error: '正在只读核对历史发帖，请等待核对完成' });
   }
   if (url.pathname === '/api/lan-qr.svg' && req.method === 'GET') {
@@ -220,11 +262,26 @@ async function api(req, res, url) {
     return send(res, 200, { ok: true }, { 'Set-Cookie': 'wb_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' });
   }
   if (url.pathname === '/api/state' && req.method === 'GET') return send(res, 200, state());
+  if (url.pathname === '/api/update/status' && req.method === 'GET') {
+    const result = await updateManager.check({ force: url.searchParams.get('refresh') === '1' });
+    result.blockedReason = await updateManager.idleCheck();
+    return send(res, 200, result);
+  }
+  if (url.pathname === '/api/update/download' && req.method === 'POST') {
+    const result = updateManager.startDownload();
+    return send(res, 202, result);
+  }
+  if (url.pathname === '/api/update/apply' && req.method === 'POST') {
+    const input = await body(req);
+    const result = await updateManager.apply({ restart: input.restart !== false });
+    return send(res, 202, result);
+  }
   if (url.pathname === '/api/records' && req.method === 'GET') {
     const date = url.searchParams.get('date') || shanghaiDate();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return send(res, 400, { error: '日期格式应为 YYYY-MM-DD' });
-    const records = listRecordsByShanghaiDate(date);
-    const rounds = roundsForDate(date);
+    const scope = ['workbench', 'engage'].includes(url.searchParams.get('scope')) ? url.searchParams.get('scope') : 'workbench';
+    const records = listRecordsByShanghaiDate(date, 500, scope);
+    const rounds = roundsForDate(date, scope);
     for (const report of rounds) if (!records.jobs.some(job => job.id === report.jobId)) {
       const job = getJob(report.jobId); if (job) records.jobs.push(job);
     }
@@ -243,9 +300,10 @@ async function api(req, res, url) {
         offset, limit,
         cursor: (url.searchParams.get('cursor') || '').slice(0, 200),
         snapshot: (url.searchParams.get('snapshot') || '').slice(0, 60),
-        level
+        level,
+        scope
       });
-    return send(res, 200, { date, ...records, rounds, dailySuccess: dailySuccess(date), dailyStats: dailyStats(date), recordView: view });
+    return send(res, 200, { date, scope, ...records, rounds, dailySuccess: dailySuccess(date, scope), dailyStats: dailyStats(date, scope), workbenchDailySuccess: dailySuccess(date, 'workbench'), engageDailySuccess: dailySuccess(date, 'engage'), recordView: view });
   }
   if (url.pathname === '/api/account-groups' && req.method === 'POST') {
     const group = saveAccountGroup(null, (await body(req)).name);
@@ -257,7 +315,8 @@ async function api(req, res, url) {
     const group = saveAccountGroup(groupMatch[1], (await body(req)).name);
     broadcast('state', state()); return send(res, 200, group);
   }
-  if (groupMatch && req.method === 'DELETE') {
+  if (groupMatch && req.method === 'PATCH') { const input = await body(req); const group = renameMaterialGroup(groupMatch[1], input.name); broadcast('state', state()); return send(res, 200, group); }
+    if (groupMatch && req.method === 'DELETE') {
     deleteAccountGroup(groupMatch[1]); broadcast('state', state()); return send(res, 200, { ok: true });
   }
   if (url.pathname === '/api/accounts/group' && req.method === 'POST') {
@@ -321,10 +380,10 @@ async function api(req, res, url) {
     const account = getAccount(id);
     if (!account || account.deleted_at) throw new Error('账号不存在');
     if (action === 'delete') {
-      const job = getActiveJob();
-      if (job?.config?.accountIds?.includes(id)) throw new Error('账号被未结束的任务使用，请先停止任务');
+      const jobs = ['workbench','engage'].map(scope => getActiveJob(scope));
+      if (jobs.some(job => job?.config?.accountIds?.includes(id))) throw new Error('账号被未结束的任务使用，请先停止任务');
       if (loginService.active?.accountId === id) throw new Error('账号正在登录，请先取消登录');
-      if (browserManager.isAccountInUse(id) || loginBrowserManager.isAccountInUse(id)) throw new Error('账号浏览器窗口仍在使用，请先关闭浏览器窗口');
+      if (browserManager.isAccountInUse(id) || engageBrowserManager.isAccountInUse(id) || loginBrowserManager.isAccountInUse(id)) throw new Error('账号浏览器窗口仍在使用，请先关闭浏览器窗口');
       deleteAccount(id);
     } else {
       if (!['enable', 'disable'].includes(action)) throw new Error('不支持的操作');
@@ -357,16 +416,16 @@ async function api(req, res, url) {
   match = url.pathname.match(/^\/api\/accounts\/([^/]+)\/login$/);
   if (match && req.method === 'POST') {
     const account = getAccount(match[1]);
-    if (runner.workflow.busy()) return send(res, 409, { error: '请先结束账号验证会话' });
+    if (runners.some(worker => worker.workflow.busy())) return send(res, 409, { error: '请先结束账号验证会话' });
     if (!account || account.deleted_at || account.cleanup_state) return send(res, 404, { error: '账号不存在或等待清理' });
-    if (browserManager.isAccountInUse(account.id)) return send(res, 409, { error: '该账号正在被任务使用，不能同时重新扫码登录' });
+    if (browserManager.isAccountInUse(account.id) || engageBrowserManager.isAccountInUse(account.id)) return send(res, 409, { error: '该账号正在被任务使用，不能同时重新扫码登录' });
     const login = loginService.start(account);
     broadcast('state', state());
     return send(res, 202, { ...login, message: '请在 Mac 上扫码，登录后将自动确认身份' });
   }
   match = url.pathname.match(/^\/api\/accounts\/([^/]+)\/verify$/);
   if (match && req.method === 'POST') {
-    if (runner.workflow.busy()) return send(res, 409, { error: '请先结束账号验证会话' });
+    if (runners.some(worker => worker.workflow.busy())) return send(res, 409, { error: '请先结束账号验证会话' });
     const account = getAccount(match[1]);
     if (!account || account.deleted_at || account.cleanup_state) return send(res, 404, { error: '账号不存在或等待清理' });
     const identity = await loginService.adapter.getIdentity(account, 'login');
@@ -374,11 +433,24 @@ async function api(req, res, url) {
     broadcast('state', state());
     return send(res, identity.status === 'valid' ? 200 : 409, { account: { ...updated, profile_dir: undefined }, identity });
   }
+  match = url.pathname.match(/^\/api\/accounts\/([^/]+)\/restrictions$/);
+  if (match && req.method === 'DELETE') {
+    const account = getAccount(match[1]);
+    if (!account || account.deleted_at || account.cleanup_state) return send(res, 404, { error: '账号不存在' });
+    const identity = String(account.uid || `account:${account.id}`);
+    const cleared = clearAccountRestrictions(account.id);
+    const jobs = clearAccountRestrictionsFromOpenJobs({ accountId: account.id, identity });
+    for (const worker of runners) worker.accountRestrictionsAt = 0;
+    log('info', `手动解除账号限制：${account.nickname || account.name || account.id}`, { accountId: account.id });
+    broadcast('state', state());
+    return send(res, 200, { ok: true, cleared, jobs });
+  }
   if (url.pathname === '/api/browser/close' && req.method === 'POST') {
-    if (runner.workflow.busy()) return send(res, 409, { error: '请先在待验证账号区结束验证会话' });
-    if (runner.promise) return send(res, 409, { error: '请先暂停任务，待当前操作完成' });
+    if (runners.some(worker => worker.workflow.busy())) return send(res, 409, { error: '请先在待验证账号区结束验证会话' });
+    if (runners.some(worker => worker.promise)) return send(res, 409, { error: '请先暂停任务，待当前操作完成' });
     await loginService.cancel();
     await browserManager.close();
+    await engageBrowserManager.close();
     await loginBrowserManager.close();
     broadcast('state', state());
     return send(res, 200, { ok: true });
@@ -449,6 +521,7 @@ async function api(req, res, url) {
     broadcast('state', state());
     return send(res, 200, { ok: true });
   }
+  if (url.pathname === '/api/comment-materials' && req.method === 'GET') return send(res, 200, listCommentMaterials());
   if (url.pathname === '/api/comment-materials' && req.method === 'POST') {
     const input = await body(req);
     const texts = cleanTexts(input.texts);
@@ -471,17 +544,42 @@ async function api(req, res, url) {
     return send(res, 200, { ok: true });
   }
 
+  if (url.pathname === '/api/repost-materials' && req.method === 'GET') return send(res, 200, listRepostMaterials());
+  if (url.pathname === '/api/repost-materials' && req.method === 'POST') {
+    const input = await body(req);
+    const texts = cleanTexts(input.texts);
+    if (!texts.length) return send(res, 400, { error: '请输入至少一条转发文案' });
+    const materials = addRepostMaterials(texts, String(input.groupId || ''));
+    broadcast('state', state());
+    return send(res, 201, materials);
+  }
+  if (url.pathname === '/api/repost-materials/bulk-delete' && req.method === 'POST') {
+    const input = await body(req);
+    if (!Array.isArray(input.ids) || !input.ids.length) return send(res, 400, { error: '请选择要删除的文案' });
+    const results = deleteRepostMaterials(input.ids);
+    broadcast('state', state());
+    return send(res, 200, { results });
+  }
+  match = url.pathname.match(/^\/api\/repost-materials\/([^/]+)$/);
+  if (match && req.method === 'DELETE') {
+    deleteRepostMaterial(match[1]);
+    broadcast('state', state());
+    return send(res, 200, { ok: true });
+  }
+
   if (url.pathname === '/api/material-groups' && req.method === 'GET') return send(res, 200, listMaterialGroups());
   if (url.pathname === '/api/material-groups' && req.method === 'POST') {
     const input = await body(req);
-    try { const group = createMaterialGroup(input.name); broadcast('state', state()); return send(res, 201, group); }
+    if (!['post','comment','repost'].includes(input.type)) return send(res, 400, { error: '请选择文案类型' });
+    try { const group = createMaterialGroup(input.name, input.type); broadcast('state', state()); return send(res, 201, group); }
     catch (error) { return send(res, 400, { error: error.message }); }
   }
   { const groupMatch = url.pathname.match(/^\/api\/material-groups\/([^/]+)$/);
+    if (groupMatch && req.method === 'PATCH') { const input = await body(req); const group = renameMaterialGroup(groupMatch[1], input.name); broadcast('state', state()); return send(res, 200, group); }
     if (groupMatch && req.method === 'DELETE') { deleteMaterialGroup(groupMatch[1]); broadcast('state', state()); return send(res, 200, { ok: true }); } }
   if (url.pathname === '/api/materials/group' && req.method === 'POST') {
     const input = await body(req);
-    if (!['post','comment'].includes(input.type) || !Array.isArray(input.ids)) return send(res, 400, { error: '参数不正确' });
+    if (!['post','comment','repost'].includes(input.type) || !Array.isArray(input.ids)) return send(res, 400, { error: '参数不正确' });
     const materials = setMaterialsGroup(input.type, input.ids, String(input.groupId || ''));
     broadcast('state', state()); return send(res, 200, { materials });
   }
@@ -496,6 +594,43 @@ async function api(req, res, url) {
     setSetting('task_defaults', input);
     broadcast('state', state());
     return send(res, 200, input);
+  }
+  if (url.pathname === '/api/settings/engage' && req.method === 'PUT') {
+    const input = normalizeEngageSettings(await resolveEngageSettings(await body(req)));
+    setSetting('engage_defaults', input);
+    broadcast('state', state());
+    return send(res, 200, input);
+  }
+  if (url.pathname === '/api/engage/blacklist/resolve' && req.method === 'POST') {
+    const input = await body(req);
+    if (!input || typeof input !== 'object' || !Array.isArray(input.profiles)) return send(res, 400, { error: '作者主页黑名单必须是链接数组' });
+    return send(res, 200, await resolveBlacklist(input.profiles));
+  }
+  if (url.pathname === '/api/engage-templates' && req.method === 'POST') {
+    const input = await body(req);
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return send(res, 400, { error: '模板必须是对象' });
+    const name = String(input.name || '').trim().slice(0, 40);
+    if (!name) return send(res, 400, { error: '请输入模板名称' });
+    const config = engageTemplateConfig(await resolveEngageSettings(input.config || {}));
+    const templates = getSetting('engage_templates', []);
+    const template = { id: `engtpl_${randomToken().slice(0, 12)}`, name, config, updatedAt: new Date().toISOString() };
+    templates.push(template); setSetting('engage_templates', templates); broadcast('state', state());
+    return send(res, 201, template);
+  }
+  match = url.pathname.match(/^\/api\/engage-templates\/([^/]+)$/);
+  if (match && ['PUT','DELETE'].includes(req.method)) {
+    const templates = getSetting('engage_templates', []), index = templates.findIndex(item => item.id === match[1]);
+    if (index < 0) return send(res, 404, { error: '模板不存在' });
+    let result = { ok: true };
+    if (req.method === 'DELETE') templates.splice(index, 1);
+    else {
+      const input = await body(req);
+      if (!input || typeof input !== 'object' || Array.isArray(input)) return send(res, 400, { error: '模板必须是对象' });
+      const name = String(input.name ?? templates[index].name).trim().slice(0, 40);
+      if (!name) return send(res, 400, { error: '请输入模板名称' });
+      result = templates[index] = { ...templates[index], name, config: engageTemplateConfig(await resolveEngageSettings(input.config || templates[index].config)), updatedAt: new Date().toISOString() };
+    }
+    setSetting('engage_templates', templates); broadcast('state', state()); return send(res, 200, result);
   }
   if (url.pathname === '/api/task-templates' && req.method === 'POST') {
     const input = await body(req);
@@ -519,9 +654,11 @@ async function api(req, res, url) {
     setSetting('task_templates', next); broadcast('state', state()); return send(res, 200, { ok: true });
   }
   if (url.pathname === '/api/jobs' && req.method === 'POST') {
-    if (runner.workflow.busy()) return send(res, 409, { error: '请先结束账号验证会话' });
-    const input = await body(req);
-    const result = runner.start(input, listAccounts(), listTopics());
+    let input = await body(req);
+    if (input.kind === 'engage') input = await resolveEngageSettings(input);
+    const selectedRunner = runnerFor(input);
+    if (selectedRunner.workflow.busy()) return send(res, 409, { error: '请先结束本页账号验证会话' });
+    const result = selectedRunner.start(input, listAccounts(), listTopics());
     broadcast('state', state());
     return send(res, result.created ? 201 : 409, result.created ? result : { ...result, error: '已有未结束任务，请先在总览查看、继续或停止该任务' });
   }
@@ -533,6 +670,7 @@ async function api(req, res, url) {
   }
   if (match && req.method === 'POST') {
     const input = await body(req);
+    if (runner.scope === 'engage') input.config = await resolveEngageSettings(input.config || {});
     let result;
     try { result = runner.applyTaskEdit(match[1], input.config || {}, input.version, { resume: input.resume === true }); }
     catch (err) { err.taskId = match[1]; throw err; }
@@ -542,6 +680,7 @@ async function api(req, res, url) {
   match = url.pathname.match(/^\/api\/jobs\/([^/]+)\/edit-preview$/);
   if (match && req.method === 'POST') {
     const input = await body(req);
+    if (runner.scope === 'engage') input.config = await resolveEngageSettings(input.config || {});
     const result = runner.taskEditPreview(match[1], input.config || {}, input.version);
     if (!result) return send(res, 404, { error: '任务不存在' });
     return send(res, 200, result);
@@ -600,7 +739,7 @@ server.listen(config.port, config.host, async () => {
   if ((process.stdout.isTTY || process.env.WEIBO_CONSOLE_SHOW_TOKEN === '1') && accessToken()) console.log(`访问口令：${accessToken()}`);
   const seededRestrictions = seedAccountRestrictionsFromJobs();
   if (seededRestrictions) log('info', '已回填账号限制 ' + seededRestrictions + ' 条');
-  await runner.recover();
+  for (const worker of runners) await worker.recover();
   try {
     const pruned = pruneDetailedRecords({ days: RETENTION_DAYS });
     if (pruned.deleted.actions || pruned.deleted.logs || pruned.deleted.cards || pruned.deleted.steps) {
@@ -612,8 +751,9 @@ server.listen(config.port, config.host, async () => {
   // Upgrade the just-finished run that exposed the sign-in classification
   // issue.  The workflow method is idempotent and only reopens uncertain
   // check-ins from a completed, verification-capable task.
-  const latest = listJobs(1)[0];
+  const latest = listJobs(1, 'workbench')[0];
   if (latest) runner.workflow.reopenUnconfirmedCheckins(latest.id);
+  engageRunner.scheduleAutoReadbacks();
 });
 
 let stopping = false;
@@ -621,10 +761,10 @@ async function shutdown() {
     if (stopping) return;
     stopping = true;
     clearInterval(dailyStopTimer);
-    runner.network.clear();
-    runner.navigation.clear();
+    for (const worker of runners) { worker.network.clear(); worker.navigation.clear(); }
     await loginService.cancel();
     await browserManager.close();
+    await engageBrowserManager.close();
     await loginBrowserManager.close();
     for (const client of sseClients) client.end();
     server.close(() => process.exit(0));
@@ -633,8 +773,6 @@ for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, shutdown);
 // Only the private parent/child IPC channel can request service shutdown.
 process.on('message', message => {
   if (message?.type !== 'weibo-service-stop' || !process.send) return;
-  const job = getActiveJob();
-  const verification = runner.workflow.status(job || listJobs(1)[0]);
-  const busy = loginService.active || browserManager.status().busy || loginBrowserManager.status().busy || verification?.session || job?.status === 'running' || runner.repairing;
+  const busy = loginService.active || loginBrowserManager.status().busy || runners.some(worker => worker.adapter.browserManager.status().busy || worker.workflow.busy() || worker.current()?.status === 'running' || worker.repairing);
   process.send({ type: 'weibo-service-stop-result', id: message.id, ok: !busy, error: busy ? '浏览器或任务仍在执行，请先安全暂停任务并结束会话' : undefined }, () => { if (!busy) void shutdown(); });
 });

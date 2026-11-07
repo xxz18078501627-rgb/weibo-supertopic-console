@@ -1,10 +1,14 @@
 import { db } from './db.js';
+import { engageExpectedCounts } from './engage.js';
 
 function inPlan(row, config) {
-  if (row.round_index >= Number(config.rounds || 1) || !config.accountIds?.includes(row.account_id) || !config.topicIds?.includes(row.topic_id)) return false;
-  const index = row.segment_id ? (config.actionPlan || []).findIndex((item, i) => (item.segmentId || config.segmentIds?.[i]) === row.segment_id) : row.action_index;
+  const scope = config.kind === 'engage' ? config.links : config.topicIds;
+  if (row.round_index >= Number(config.rounds || 1) || !config.accountIds?.includes(row.account_id) || !scope?.includes(row.topic_id)) return false;
+  if (config.kind === 'engage' && row.kind === 'like') return config.likePost && row.round_index === 0;
+  const baseSegment = (row.segment_id || '').replace(/_couple_(comment|repost)$/, '');
+  const index = row.segment_id ? (config.actionPlan || []).findIndex((item, i) => (item.segmentId || config.segmentIds?.[i]) === baseSegment) : row.action_index;
   const segment = config.actionPlan?.[index];
-  return Boolean(segment && segment.type === row.kind && row.unit_index < (row.kind === 'checkin' ? Math.min(1, segment.count) : segment.count));
+  return Boolean(segment && (segment.type === row.kind || (row.kind === 'comment' && segment.type === 'repost' && segment.alsoComment)) && row.unit_index < (row.kind === 'checkin' ? Math.min(1, segment.count) : segment.count));
 }
 
 export function taskProgress(job) {
@@ -22,7 +26,8 @@ export function taskProgress(job) {
     processed = included.filter(row => row.state === 'done' || (row.state === 'review' && !(row.ever_verification && ['pending','requested','validating'].includes(row.verification_status)))).length;
   } else {
     const perAccount = (config.actionPlan || []).reduce((sum, item) => sum + (item.type === 'checkin' ? Math.min(1, Number(item.count) || 0) : Math.max(0, Number(item.count) || 0)), 0);
-    total = rounds * (config.accountIds?.length || 0) * (config.topicIds?.length || 0) * perAccount;
+    const scopeLength = (config.kind === 'engage' ? config.links : config.topicIds)?.length || 0;
+    total = config.kind === 'engage' ? Object.values(engageExpectedCounts(config)).reduce((a,b) => a+b,0) : rounds * (config.accountIds?.length || 0) * scopeLength * perAccount;
     processed = Math.max(0, Math.min(total, Number(job.cursor?.stepIndex || 0)));
   }
   if (job.status === 'completed') processed = total;

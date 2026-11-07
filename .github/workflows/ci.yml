@@ -23,9 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 只跑 macOS。Windows runner 历史上容易抖（临时目录清理、等待时间），
-        # 见 8a662c9 / 42d84b6。需要临时验证 Windows 时，把 windows-latest 加回列表即可。
-        os: [macos-latest]
+        os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +31,14 @@ jobs:
         with:
           node-version: 24
       - run: npm ci
+      - run: npx playwright install chromium
       - run: npm test
+        env:
+          WEIBO_CONSOLE_LICENSE: 'off'
+      - name: UI E2E
+        if: runner.os == 'macOS'
+        run: npm run test:e2e
+      - name: 工作台验证契约与转赞评验证隔离
+        run: node --test --test-name-pattern='工作台浏览器验证契约|engage 抛出 VerificationError|点赞验证码' tests/verification.test.js tests/engage-session.test.js tests/engage.test.js
         env:
           WEIBO_CONSOLE_LICENSE: 'off'

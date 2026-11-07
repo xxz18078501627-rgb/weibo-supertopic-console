@@ -6,12 +6,15 @@ import {
 } from "./defaults.js";
 import { createGroupUI } from "./group-ui.js";
 import { createVerificationUI } from "./verification-ui.js";
+import { createEngageUI } from "./engage-ui.js";
 import { renderDailyStop } from "./daily-stop-ui.js";
 import { createReportUI, renderRecordJobs, localDate } from "./report-ui.js";
 import { createRecordUI } from "./record-ui.js";
 let verificationUI,
+  engageVerificationUI,
   groupUI,
   reportUI,
+  engageUI,
   events,
   eventsConnected = false,
   lastEventAt = 0,
@@ -23,6 +26,7 @@ const $ = (s) => document.querySelector(s),
 const meta = {
   overview: ["超话工作台", "配置下一次任务，或查看正在运行的任务。"],
   accounts: ["账号", "管理登录、启停与执行顺序。"],
+  engage: ["转赞评", "转发、评论、点赞指定微博。"],
   materials: ["文案", "准备发帖和评论内容。"],
   logs: ["记录", "查看任务、结果和待核对项目。"],
 };
@@ -47,10 +51,11 @@ let state,
   page = "overview",
   toastTimer,
   selectedAccounts = new Set(),
-  selectedMaterials = { post: new Set(), comment: new Set() },
+  selectedMaterials = { post: new Set(), comment: new Set(), repost: new Set() },
   selectedTemplate = "",
   editingJob = null,
-  editingBaseline = null;
+  editingBaseline = null,
+  engageAccountPicker = false;
 const esc = (v = "") =>
   String(v).replace(
     /[&<>"']/g,
@@ -67,6 +72,7 @@ function toast(message) {
   toastTimer = setTimeout(() => el.classList.remove("show"), 2800);
 }
 async function request(path, options = {}) {
+  if (state && !state.features?.typedMaterialGroups && options.method && options.method !== "GET" && /^\/api\/(material-groups|materials\/group)/.test(path)) throw new Error("当前后台仍为旧版本，请在任务安全结束后更新服务，再管理独立文案组");
   const response = await fetch(path, {
     ...options,
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -119,15 +125,16 @@ async function load({ keep = false } = {}) {
   const next = await request("/api/state");
   if (version !== stateRequestVersion) return;
   if (!acceptState(next)) return;
+  engageUI?.hydrate(next.engageDefaults);
   if (!keep) config = merge(state.taskDefaults);
   seedSelections();
   if (!keep) render();
   else {
     renderLive();
+    renderMaterials();
     if (!isEditing()) {
       renderAccounts();
       renderSelection();
-          renderMaterials();
       renderTemplate();
     }
   }
@@ -139,6 +146,7 @@ function acceptState(next) {
   if (sameService && Number(next.stateVersion || 0) < Number(state?.stateVersion || 0)) return false;
   if (sameService && Number(next.verificationVersion || 0) < Number(state?.verificationVersion || 0)) {
     next.verification = state.verification;
+    next.engageVerification = state.engageVerification;
     next.verificationVersion = state.verificationVersion;
   }
   state = next; return true;
@@ -194,12 +202,14 @@ function render() {
   reportUI?.render();
   renderDailyStop(state);
   verificationUI?.render();
+  engageVerificationUI?.render();
+  engageUI?.renderLive();
 }
 function renderBrowser() {
   const task = state.browser?.busy ? "任务后台运行" : "";
   const login = state.loginBrowser?.busy ? "扫码登录中" : "";
   $("#browser-badge").textContent =
-    [task, login].filter(Boolean).join(" · ") || "浏览器空闲";
+    [state.engageBrowser?.busy ? "转赞评运行中" : "", task, login].filter(Boolean).join(" · ") || "浏览器空闲";
   renderLanAccess();
 }
 function renderLanAccess() {
@@ -283,7 +293,7 @@ async function loadRecentFallback() {
   recentLoading = true;
   try {
     const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai" }).format(new Date());
-    const data = await request("/api/records?date=" + today + "&panel=flow&limit=20");
+    const data = await request("/api/records?date=" + today + "&scope=workbench&panel=flow&limit=20");
     recentFallback = (data.recordView?.details || []).filter(row => row.source === 'action').map(row => ({ ...row, started_at: row.at || row.created_at }));
     recentFallbackAt = Date.now();
   } catch { recentFallback = recentFallback || []; }
@@ -308,8 +318,6 @@ function selectConfigPane(name) {
   for (const pane of document.querySelectorAll('#config-card .config-body .pane')) pane.classList.toggle('hidden', pane.dataset.pane !== name);
 }
 document.querySelectorAll('.config-tabs [data-pane]').forEach(button => button.addEventListener('click', () => selectConfigPane(button.dataset.pane)));
-document.querySelector('#config-prev')?.addEventListener('click', () => selectConfigPane({ range: 'advanced', plan: 'range', advanced: 'plan' }[configPane]));
-document.querySelector('#config-next')?.addEventListener('click', () => selectConfigPane({ range: 'plan', plan: 'advanced', advanced: 'range' }[configPane]));
 document.querySelector('#toggle-decorations')?.addEventListener('click', () => document.querySelector('#text-decorations')?.classList.toggle('hidden'));
 document.addEventListener('click', event => {
   const row = event.target.closest('[data-recent]');
@@ -446,7 +454,7 @@ function renderPickerList() {
   if (count) count.textContent = '已选 ' + pickerDraft.size + ' / ' + state.accounts.filter((a) => a.enabled).length;
 }
 function openPicker() {
-  pickerDraft = new Set(config.accountIds || []);
+  pickerDraft = new Set(engageAccountPicker ? engageUI?.getConfig().accountIds || [] : config.accountIds || []);
   const select = document.querySelector('#picker-group');
   if (select) select.innerHTML = '<option value="">全部分组</option>' + (state.accountGroups || []).map((g) => '<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>').join('');
   const search = document.querySelector('#picker-search');
@@ -455,11 +463,11 @@ function openPicker() {
   document.querySelector('#account-picker')?.showModal();
 }
 document.addEventListener('click', (event) => {
-  if (event.target.closest('#pick-accounts')) { openPicker(); return; }
+  if (event.target.closest('#pick-accounts')) { engageAccountPicker = false; openPicker(); return; }
   if (event.target.closest('#picker-all')) { const next = new Set(pickerDraft || []); for (const account of pickerAccounts()) next.add(account.id); pickerDraft = next; renderPickerList(); return; }
   if (event.target.closest('#picker-none')) { pickerDraft = new Set(); renderPickerList(); return; }
-  if (event.target.closest('#picker-confirm')) { config.accountIds = [...(pickerDraft || [])]; updatePickerButton(); renderSummary(); document.querySelector('#account-picker')?.close(); return; }
-  if (event.target.closest('#picker-cancel') || event.target.closest('[data-close-picker]')) { document.querySelector('#account-picker')?.close(); }
+  if (event.target.closest('#picker-confirm')) { if (engageAccountPicker) { engageUI?.setAccounts([...(pickerDraft || [])]); engageAccountPicker = false; } else { config.accountIds = [...(pickerDraft || [])]; updatePickerButton(); renderSummary(); } document.querySelector('#account-picker')?.close(); return; }
+  if (event.target.closest('#picker-cancel') || event.target.closest('[data-close-picker]')) { document.querySelector('#account-picker')?.close(); engageAccountPicker = false; }
 });
 document.addEventListener('input', (event) => { if (event.target.id === 'picker-search') renderPickerList(); });
 document.addEventListener('change', (event) => {
@@ -550,7 +558,7 @@ function renderSettings() {
       const selected = (config[key] || []).filter(id => ids.includes(id));
       config[key] = selected.length === ids.length && ids.length && ids.every(id => selected.includes(id)) ? [] : selected;
     }
-    const row = (key, label) => '<span class="hint">' + label + '</span>' + (groups.length ? groups.map(group => '<label class="check-inline"><input type="checkbox" data-material-group-pick="' + key + '" value="' + esc(group.id) + '" ' + (config[key].includes(group.id) ? 'checked' : '') + '>' + esc(group.name) + '</label>').join('') : '<span class="hint">没有分组，默认全部</span>');
+    const row = (key, label) => '<span class="hint">' + label + '</span>' + (groups.filter(group => group.type === (key === 'postGroupIds' ? 'post' : 'comment')).length ? groups.filter(group => group.type === (key === 'postGroupIds' ? 'post' : 'comment')).map(group => '<label class="check-inline"><input type="checkbox" data-material-group-pick="' + key + '" value="' + esc(group.id) + '" ' + (config[key].includes(group.id) ? 'checked' : '') + '>' + esc(group.name) + '</label>').join('') : '<span class="hint">没有分组，默认全部</span>');
     picks.innerHTML = '<div class="pick-row">' + row('postGroupIds', '发帖') + '</div><div class="pick-row">' + row('commentGroupIds', '评论') + '</div>';
   }
   renderSummary();
@@ -599,7 +607,7 @@ function sync() {
   const allGroupIds = (state.materialGroups || []).map(group => group.id);
   for (const key of ['postGroupIds', 'commentGroupIds']) {
     const picked = [...document.querySelectorAll('[data-material-group-pick="' + key + '"]:checked')].map(node => node.value);
-    config[key] = picked.length && picked.length < allGroupIds.length ? picked : [];
+    config[key] = picked;
   }
   for (const k of ["post", "comment"])
     config[`${k}Decoration`] = {
@@ -647,22 +655,6 @@ function renderSummary() {
   $("#task-errors").innerHTML = errors.join("<br>");
   return errors;
 }
-function restrictionBadges(a) {
-  const c = state.activeJob?.cursor || {},
-    id = String(a.uid || "account:" + a.id),
-    labels = [];
-  const round = Number(c.workflowRound ?? c.current?.round ?? 0);
-  if ((c.muteLimits || []).some((x) => x.identity === id && x.round === round)) labels.push("禁言");
-  if ((c.rateLimits || []).some((x) => x.identity === id && x.round === round && x.kind === "post"))
-    labels.push("发帖频繁");
-  if (
-    (c.rateLimits || []).some((x) => x.identity === id && x.round === round && x.kind === "comment")
-  )
-    labels.push("评论频繁");
-  return labels
-    .map((x) => '<span class="status-pill warning">' + x + "<\/span>")
-    .join("");
-}
 let accountFilter = { q: '', group: '', status: 'all' };
 function renderAccountFilters() {
   const groups = (state.accountGroups || []).filter(group => group.id), accounts = state.accounts || [];
@@ -678,10 +670,9 @@ function renderAccountFilters() {
 }
 function applyAccountFilter() {
   const q = accountFilter.q.trim().toLocaleLowerCase();
-  const restrictions = new Map((state.restrictedAccounts || []).map(item => [String(item.identity), item]));
+  const restrictions = new Map((state.restrictedAccounts || []).map(item => [String(item.accountId || item.identity || ''), item]));
   for (const row of document.querySelectorAll('#account-list .account-row')) {
-    const uid = row.dataset.uid || '';
-    const restriction = restrictions.get(uid);
+    const restriction = restrictions.get(row.dataset.accountId || '');
     const text = row.textContent.toLocaleLowerCase();
     const matchQ = !q || text.includes(q);
     const group = accountFilter.group === '__ungrouped__' ? '' : accountFilter.group;
@@ -701,11 +692,12 @@ function renderAccounts() {
   for (const id of selectedAccounts) if (!state.accounts.some(x => x.id === id)) selectedAccounts.delete(id);
   $('#selected-account-count').textContent = '已选 ' + selectedAccounts.size + ' 个';
   const groups = new Map((state.accountGroups || []).map(group => [group.id, group.name]));
-  const restrictions = new Map((state.restrictedAccounts || []).map(item => [String(item.identity), item]));
+  const restrictions = new Map((state.restrictedAccounts || []).map(item => [String(item.accountId || item.identity || ''), item]));
   $('#account-list').innerHTML = state.accounts.length ? state.accounts.map((a, i) => {
-    const restriction = restrictions.get(String(a.uid || ''));
+    const restriction = restrictions.get(String(a.id));
     const groupName = groups.get(a.group_id || '') || '未分组';
-    return '<article class="list-row account-row" data-account-id="' + a.id + '" data-enabled="' + (a.enabled ? '1' : '0') + '" data-group-id="' + esc(a.group_id || '') + '" data-uid="' + esc(a.uid || '') + '" data-invalid="' + (a.auth_status === 'invalid' ? '1' : '0') + '"><span class="drag-handle" data-drag-account="' + a.id + '" title="按住拖动排序">⠿</span><label class="check-inline"><input data-select-account="' + a.id + '" type="checkbox" ' + (selectedAccounts.has(a.id) ? 'checked' : '') + ' aria-label="选择 ' + esc(a.nickname || a.name) + '"></label><span class="ord">' + String(i + 1).padStart(2, '0') + '</span><div class="row-main"><strong>' + esc(a.nickname || a.name || a.uid || '等待扫码') + '</strong><span>' + (a.uid ? 'UID ' + esc(a.uid) : '未识别 UID') + '</span></div><span class="group-cell">' + esc(groupName) + '</span><span class="status-pill ' + a.auth_status + '">' + (a.auth_status === 'valid' ? '已登录' : a.auth_status === 'invalid' ? '需重登' : '未检查') + '</span><span class="row-tags">' + (restriction ? '<span class="result warning">' + esc(restriction.type) + '</span>' : '') + (!a.enabled ? '<span class="status-pill account-disabled-pill">已停用</span>' : '') + '</span><div class="row-actions"><button class="quiet" data-account-action="login" data-id="' + a.id + '">扫码登录</button><button class="' + (a.enabled ? 'danger' : 'quiet') + '" data-account-action="toggle" data-id="' + a.id + '">' + (a.enabled ? '停用' : '启用') + '</button><button class="danger" data-account-action="delete" data-id="' + a.id + '">删除</button></div></article>';
+    const restrictionTip = restriction ? [restriction.type, restriction.expiresAt ? '至 ' + time(restriction.expiresAt, true) : '', restriction.reason].filter(Boolean).join(' · ') : '';
+    return '<article class="list-row account-row" data-account-id="' + a.id + '" data-enabled="' + (a.enabled ? '1' : '0') + '" data-group-id="' + esc(a.group_id || '') + '" data-uid="' + esc(a.uid || '') + '" data-invalid="' + (a.auth_status === 'invalid' ? '1' : '0') + '"><span class="drag-handle" data-drag-account="' + a.id + '" title="按住拖动排序">⠿</span><label class="check-inline"><input data-select-account="' + a.id + '" type="checkbox" ' + (selectedAccounts.has(a.id) ? 'checked' : '') + ' aria-label="选择 ' + esc(a.nickname || a.name) + '"></label><span class="ord">' + String(i + 1).padStart(2, '0') + '</span><div class="row-main"><strong>' + esc(a.nickname || a.name || a.uid || '等待扫码') + '</strong><span>' + (a.uid ? 'UID ' + esc(a.uid) : '未识别 UID') + '</span></div><span class="group-cell">' + esc(groupName) + '</span><span class="status-pill ' + a.auth_status + '">' + (a.auth_status === 'valid' ? '已登录' : a.auth_status === 'invalid' ? '需重登' : '未检查') + '</span><span class="row-tags">' + (restriction ? '<span class="result warning" title="' + esc(restrictionTip) + '">' + esc(restriction.type) + '</span>' : '') + (!a.enabled ? '<span class="status-pill account-disabled-pill">已停用</span>' : '') + '</span><div class="row-actions">' + (restriction ? '<button class="quiet" data-account-action="clear-restriction" data-id="' + a.id + '">解除限制</button>' : '') + '<button class="quiet" data-account-action="login" data-id="' + a.id + '">扫码登录</button><button class="' + (a.enabled ? 'danger' : 'quiet') + '" data-account-action="toggle" data-id="' + a.id + '">' + (a.enabled ? '停用' : '启用') + '</button><button class="danger" data-account-action="delete" data-id="' + a.id + '">删除</button></div></article>';
   }).join('') : '<div class="empty">添加一个账号后，在本机 Chrome 窗口扫码登录。</div>';
   groupUI?.renderAccounts();
   renderAccountFilters();
@@ -714,13 +706,16 @@ function renderAccounts() {
 let materialTab = 'post';
 let materialGroupFilter = '';
 let materialGroupsOpen = false;
-function materialItems() { return materialTab === 'post' ? state.posts : state.comments; }
+const materialDrafts = { post:{}, comment:{}, repost:{} };
+function materialsFor(type) { return ({ post: state?.posts, comment: state?.comments, repost: state?.reposts })[type] || []; }
+function materialItems() { return materialsFor(materialTab); }
+function materialGroupsFor(type) { return (state?.materialGroups || []).filter(group => group.type === type); }
 function renderMaterialGroupOptions() {
-  const groups = state.materialGroups || [];
+  const groups = (state.materialGroups || []).filter(group => group.type === materialTab);
   for (const [id, withAll] of [['#material-group-filter', true], ['#material-add-group', false]]) {
     const select = $(id);
     if (!select) continue;
-    const current = select.value;
+    const current = withAll ? materialGroupFilter : select.value;
     select.innerHTML = (withAll ? '<option value="">全部分组</option>' : '<option value="">未分组</option>') + groups.map(group => '<option value="' + esc(group.id) + '">' + esc(group.name) + '</option>').join('');
     select.value = groups.some(group => group.id === current) ? current : '';
   }
@@ -735,8 +730,8 @@ function renderMaterialGroupsPanel() {
   const foot = $('#material-foot');
   if (!foot) return;
   if (!materialGroupsOpen) { foot.textContent = '共 ' + materialItems().filter(item => !materialGroupFilter || (item.group_id || '') === materialGroupFilter).length + ' 条 · 列表内滚动'; return; }
-  const groups = state.materialGroups || [];
-  foot.innerHTML = '<span class="hint">分组：</span>' + (groups.map(group => '<span class="group-chip">' + esc(group.name) + '<button type="button" data-delete-material-group="' + esc(group.id) + '">×</button></span>').join('') || '<span class="hint">还没有分组</span>');
+  const groups = materialGroupsFor(materialTab);
+  foot.innerHTML = '<span class="hint">分组：</span>' + (groups.map(group => '<span class="group-chip">' + esc(group.name) + '<button type="button" data-rename-material-group="' + esc(group.id) + '">改名</button><button type="button" data-delete-material-group="' + esc(group.id) + '">×</button></span>').join('') || '<span class="hint">还没有分组</span>');
 }
 function updateMaterialSelectionUi() {
   const selected = selectedMaterials[materialTab].size;
@@ -760,7 +755,11 @@ function renderMaterials() {
   if (subtitle) subtitle.hidden = page !== 'overview';
   $('#post-count').textContent = state.posts.length;
   $('#comment-count').textContent = state.comments.length;
+  $('#repost-count').textContent = (state.reposts || []).length;
   for (const tab of document.querySelectorAll('#material-tabs [data-material-tab]')) tab.classList.toggle('on', tab.dataset.materialTab === materialTab);
+  if (materialGroupFilter && !materialGroupsFor(materialTab).some(g => g.id === materialGroupFilter)) materialGroupFilter = '';
+  const liveIds = new Set(materialItems().map(m => m.id));
+  selectedMaterials[materialTab] = new Set([...selectedMaterials[materialTab]].filter(id => liveIds.has(id)));
   renderMaterialGroupOptions();
   const groups = new Map((state.materialGroups || []).map(group => [group.id, group.name]));
   const items = materialItems().filter(item => !materialGroupFilter || (item.group_id || '') === materialGroupFilter);
@@ -769,25 +768,27 @@ function renderMaterials() {
   renderMaterialGroupsPanel();
 }
 function addMaterialTexts() {
+  const type = materialTab;
   const raw = document.querySelector('#material-texts')?.value || '';
   const single = document.querySelector('#material-single')?.checked;
   const texts = single ? [raw.trim()] : raw.split(/\r?\n/).map(text => text.trim()).filter(Boolean);
   if (!texts.length) { toast('请输入文案'); return; }
   const groupId = document.querySelector('#material-add-group')?.value || '';
-  request('/api/' + (materialTab === 'post' ? 'post-materials' : 'comment-materials'), { method: 'POST', body: { texts, groupId } })
-    .then(() => { document.querySelector('#material-texts').value = ''; return load({ keep: true }); })
+  request('/api/' + (type === 'post' ? 'post-materials' : type === 'repost' ? 'repost-materials' : 'comment-materials'), { method: 'POST', body: { texts, groupId } })
+    .then(() => { if (materialTab === type && document.querySelector('#material-texts').value === raw) document.querySelector('#material-texts').value = ''; if (materialDrafts[type].text === raw) materialDrafts[type].text = ''; return load({ keep: true }); })
     .catch(error => toast(error.message));
 }
 function moveSelectedMaterials(groupId) {
-  const ids = [...selectedMaterials[materialTab]];
+  const type = materialTab;
+  const ids = [...selectedMaterials[type]];
   if (!ids.length) { toast('请先选择文案'); return; }
   const targetId = groupId || '';
   const targetName = targetId ? ((state.materialGroups || []).find(group => group.id === targetId)?.name || '目标分组') : '未分组';
-  request('/api/materials/group', { method: 'POST', body: { type: materialTab, ids, groupId } })
+  request('/api/materials/group', { method: 'POST', body: { type, ids, groupId } })
     .then(() => {
-      selectedMaterials[materialTab].clear();
+      selectedMaterials[type].clear();
       const moveTarget = $('#material-move-target');
-      if (moveTarget) moveTarget.value = '';
+      if (moveTarget && materialTab === type) moveTarget.value = '';
       toast('已移动 ' + ids.length + ' 条到' + targetName);
       return load({ keep: true });
     }).catch(error => toast(error.message));
@@ -806,9 +807,19 @@ document.addEventListener('click', event => {
   if (groupChip) { accountFilter.group = groupChip.dataset.accountGroupFilter; renderAccountFilters(); applyAccountFilter(); return; }
   if (event.target.closest('[data-toggle-groups]')) { groupUI?.open?.(); return; }
   const tab = event.target.closest('[data-material-tab]');
-  if (tab) { materialTab = tab.dataset.materialTab; materialGroupFilter = ''; renderMaterials(); return; }
-  if (event.target.closest('#new-material-group')) { const name = prompt('新分组名称'); if (name?.trim()) request('/api/material-groups', { method: 'POST', body: { name } }).then(() => load({ keep: true })).catch(error => toast(error.message)); return; }
+  if (tab) {
+    const next = tab.dataset.materialTab; if (next === materialTab) return;
+    materialDrafts[materialTab] = { text: $('#material-texts').value, single: $('#material-single').checked, filter: materialGroupFilter, group: $('#material-add-group').value, move: $('#material-move-target').value };
+    materialTab = next; const draft = materialDrafts[next]; materialGroupFilter = draft.filter || ''; renderMaterials();
+    $('#material-texts').value = draft.text || ''; $('#material-single').checked = Boolean(draft.single);
+    $('#material-add-group').value = materialGroupsFor(next).some(g => g.id === draft.group) ? draft.group : '';
+    $('#material-move-target').value = draft.move === '__ungrouped__' || materialGroupsFor(next).some(g => g.id === draft.move) ? draft.move : '';
+    updateMaterialSelectionUi(); return;
+  }
+  if (event.target.closest('#new-material-group')) { const name = prompt('新分组名称'); if (name?.trim()) request('/api/material-groups', { method: 'POST', body: { name, type: materialTab } }).then(() => load({ keep: true })).catch(error => toast(error.message)); return; }
   if (event.target.closest('[data-manage-groups]')) { materialGroupsOpen = !materialGroupsOpen; renderMaterialGroupsPanel(); return; }
+  const rename = event.target.closest('[data-rename-material-group]');
+  if (rename) { const group = materialGroupsFor(materialTab).find(g => g.id === rename.dataset.renameMaterialGroup); const name = prompt('新的分组名称', group?.name || ''); if (name?.trim()) request('/api/material-groups/' + group.id, { method: 'PATCH', body: { name } }).then(() => load({ keep: true })).catch(error => toast(error.message)); return; }
   const delGroup = event.target.closest('[data-delete-material-group]');
   if (delGroup) { if (confirm('删除该分组？其中文案会回到未分组')) request('/api/material-groups/' + delGroup.dataset.deleteMaterialGroup, { method: 'DELETE' }).then(() => load({ keep: true })).catch(error => toast(error.message)); return; }
   if (event.target.closest('[data-select-all-material-btn]')) { selectedMaterials[materialTab] = new Set(materialItems().filter(item => !materialGroupFilter || (item.group_id || '') === materialGroupFilter).map(item => item.id)); renderMaterials(); return; }
@@ -823,7 +834,8 @@ document.addEventListener('click', event => {
     const ids = [...selectedMaterials[materialTab]];
     if (!ids.length) { toast('请先选择文案'); return; }
     if (!confirm('删除所选 ' + ids.length + ' 条文案？')) return;
-    request('/api/' + (materialTab === 'post' ? 'post-materials' : 'comment-materials') + '/bulk-delete', { method: 'POST', body: { ids } }).then(() => { selectedMaterials[materialTab].clear(); return load({ keep: true }); }).catch(error => toast(error.message));
+    const type = materialTab;
+    request('/api/' + (type === 'post' ? 'post-materials' : type === 'repost' ? 'repost-materials' : 'comment-materials') + '/bulk-delete', { method: 'POST', body: { ids } }).then(() => { selectedMaterials[type].clear(); return load({ keep: true }); }).catch(error => toast(error.message));
     return;
   }
   if (event.target.closest('#material-add')) { addMaterialTexts(); return; }
@@ -862,7 +874,7 @@ function action(x) {
   return `<article class="activity"><time>${time(x.started_at)}</time><div><strong>${esc(x.account_name || "")} · ${esc(x.topic_name || "")}</strong><div>${kind(x.kind)}${x.content ? ` · ${esc(x.content)}` : ""}</div>${x.url ? `<a href="${esc(x.url)}" target="_blank" rel="noreferrer">打开目标帖</a>` : ""}</div><span class="result ${shownState}">${stateName(shownState)}</span></article>`;
 }
 function kind(x) {
-  return { checkin: "签到", post: "发帖", comment: "评论" }[x] || x;
+  return { checkin: "签到", post: "发帖", comment: "评论", repost: "转发", like: "外赞", comment_like: "内赞" }[x] || x;
 }
 function stateName(x) {
   return (
@@ -935,7 +947,7 @@ document.addEventListener("change", (e) => {
     const type = t.dataset.selectAllMaterial;
     selectedMaterials[type] = t.checked
       ? new Set(
-          (type === "post" ? state.posts : state.comments).map((x) => x.id),
+          materialsFor(type).map((x) => x.id),
         )
       : new Set();
     renderMaterials();
@@ -952,7 +964,7 @@ document.addEventListener("change", (e) => {
       "comment-max-count-enabled",
     ].includes(t.id) ||
     t.id.includes("-decoration-") ||
-    t.id.includes("-emoji-")
+    (t.id.includes("-emoji-") && !t.closest('#page-engage'))
   )
     sync();
 });
@@ -983,7 +995,8 @@ async function submitTaskEdit({ resume }) {
     body: { config, version: editingJob.version, resume },
   });
   editingJob = null;
-  editingBaseline = null;
+  editingBaseline = null,
+  engageAccountPicker = false;
   toast(
     resume
       ? `已按新参数继续运行（新增 ${result.change.added} 项）`
@@ -999,7 +1012,8 @@ async function cancelTaskEdit() {
   if (taskEditDirty() && !confirm("当前修改尚未保存，确定取消吗？")) return;
   if (editingBaseline) config = structuredClone(editingBaseline);
   editingJob = null;
-  editingBaseline = null;
+  editingBaseline = null,
+  engageAccountPicker = false;
   renderOverview();
   toast("已取消修改，恢复为当前已保存参数");
 }
@@ -1008,14 +1022,14 @@ document.addEventListener('click', event => {
   const target = event.target.closest('[data-material-id]');
   if (!target) return;
   const type = target.dataset.materialType;
-  const item = (type === 'post' ? state.posts : state.comments).find(entry => entry.id === target.dataset.materialId);
+  const item = materialsFor(type).find(entry => entry.id === target.dataset.materialId);
   if (!item) return;
   const dialog = document.querySelector('#material-dialog');
   if (!dialog) return;
   document.querySelector('#material-dialog-body').textContent = item.text;
   const groups = state.materialGroups || [];
   const group = groups.find(entry => entry.id === item.group_id);
-  document.querySelector('#material-dialog-meta').textContent = (group ? group.name : '未分组') + ' · ' + item.text.length + ' 字 · ' + (type === 'post' ? '发帖文案' : '评论文案');
+  document.querySelector('#material-dialog-meta').textContent = (group ? group.name : '未分组') + ' · ' + item.text.length + ' 字 · ' + ({ post: '发帖文案', comment: '评论文案', repost: '转发文案' }[type]);
   dialog.dataset.materialId = item.id;
   dialog.dataset.materialType = type;
   dialog.showModal();
@@ -1025,7 +1039,7 @@ document.addEventListener('click', async event => {
   if (event.target.closest('[data-copy-material]')) {
     const dialog = document.querySelector('#material-dialog');
     const type = dialog?.dataset.materialType;
-    const item = (type === 'post' ? state.posts : state.comments || []).find(entry => entry.id === dialog?.dataset.materialId);
+    const item = materialsFor(type).find(entry => entry.id === dialog?.dataset.materialId);
     if (item) { try { await navigator.clipboard.writeText(item.text); toast('已复制'); } catch { toast('复制失败'); } }
     return;
   }
@@ -1061,13 +1075,15 @@ document.addEventListener("click", async (e) => {
   const b = e.target.closest("button");
   if (!b) return;
   try {
+    if (b.dataset.recordScope) setRecordScope(b.dataset.recordScope);
     if (b.dataset.page) navigate(b.dataset.page);
     if (b.dataset.go) {
       if (b.dataset.go === "overview") {
         if (editingJob && taskEditDirty() && !confirm("当前修改尚未保存，确定进入新建任务配置吗？")) return;
         if (editingJob) {
           editingJob = null;
-          editingBaseline = null;
+          editingBaseline = null,
+  engageAccountPicker = false;
         }
         navigate("overview", { scrollTop: false });
         render();
@@ -1266,6 +1282,10 @@ async function accountAction(b) {
   if (action === "delete") {
     if (!confirm(`删除账号“${a.nickname || a.name}”及本机登录资料？`)) return;
     await request(`/api/accounts/${a.id}`, { method: "DELETE" });
+  } else if (action === "clear-restriction") {
+    if (!confirm(`解除账号“${a.nickname || a.name}”的禁言/频繁标记？\n只解除标记，当前轮已跳过的操作不会自动补做；若微博仍限制该账号，下次运行会重新标记。`)) return;
+    const result = await request(`/api/accounts/${a.id}/restrictions`, { method: "DELETE" });
+    toast(result.cleared ? '已解除账号限制' : '该账号没有可解除的限制');
   } else if (action === "login")
     await request(`/api/accounts/${a.id}/login`, { method: "POST" });
   else if (action === "toggle") {
@@ -1326,15 +1346,26 @@ const today = () =>
     new Date(),
   );
 let recordData = { logs: [], actions: [], jobs: [], rounds: [] },
-  recordDate = today();
+  recordDate = today(),
+  recordCalendarDay = today(),
+  recordScope = new URLSearchParams(location.search).get('recordScope') === 'engage' ? 'engage' : 'workbench';
 let recordsLoading = false,
   recordsError = "",
   recordRefreshTimer = null;
-const recordUI = createRecordUI({ request, reload: () => loadRecords(recordDate), date: () => recordDate, filter: () => $("#log-filter").value, changed: () => { ++recordsVersion; }, toast });
+const recordUI = createRecordUI({ request, reload: () => loadRecords(recordDate), date: () => recordDate, scope: () => recordScope, filter: () => $("#log-filter").value, changed: () => { ++recordsVersion; }, toast });
+function rollRecordDate() {
+  const currentDay = today();
+  if (currentDay === recordCalendarDay) return false;
+  recordCalendarDay = currentDay;
+  recordUI.reset();
+  loadRecords(currentDay).catch(() => {});
+  return true;
+}
 function syncRecordUrl() {
   const params = new URLSearchParams(location.search);
   params.set("recordDate", recordDate);
   params.set("recordFilter", $("#log-filter")?.value || "all");
+  params.set("recordScope", recordScope);
   history.replaceState(null, "", `?${params}`);
 }
 $("#login-form").addEventListener("submit", async (e) => {
@@ -1394,6 +1425,8 @@ function renderLive() {
   reportUI?.render();
   renderDailyStop(state);
   verificationUI?.render();
+  engageVerificationUI?.render();
+  engageUI?.renderLive();
 }
 function connect() {
   events?.close();
@@ -1419,6 +1452,7 @@ function connect() {
       renderAccounts();
       renderSelection();
       renderTemplate();
+      renderMaterials();
     }
   });
   es.addEventListener("job", () => {
@@ -1435,8 +1469,10 @@ function connect() {
     )
       return;
     state.verificationVersion = update.version;
-    state.verification = update.verification;
+    if (update.scope === 'engage') state.engageVerification = update.verification;
+    else state.verification = update.verification;
     verificationUI?.render();
+    engageVerificationUI?.render();
   });
   es.addEventListener("round-completed", () => {
     lastEventAt = Date.now();
@@ -1444,9 +1480,10 @@ function connect() {
     scheduleRecordsRefresh();
   });
 }
-document.addEventListener('visibilitychange', () => { if (!document.hidden) void syncLiveState(); });
-window.addEventListener('focus', () => { void syncLiveState(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { rollRecordDate(); void syncLiveState(); } });
+window.addEventListener('focus', () => { rollRecordDate(); void syncLiveState(); });
 setInterval(() => { if (!eventsConnected || Date.now() - lastEventAt >= 15000) void syncLiveState(); }, 10000);
+setInterval(rollRecordDate, 60000);
 async function loadRecords(date = recordDate, { silent = false } = {}) {
   const version = ++recordsVersion;
   recordDate = date;
@@ -1454,7 +1491,7 @@ async function loadRecords(date = recordDate, { silent = false } = {}) {
   recordsError = "";
   if (!silent) renderLogs();
   try {
-    const next = await request("/api/records?" + new URLSearchParams({date, ...recordUI.params()}));
+    const next = await request("/api/records?" + new URLSearchParams({date, scope: recordScope, ...recordUI.params()}));
     if (version !== recordsVersion) return;
     recordData = next;
     syncRecordUrl();
@@ -1547,8 +1584,9 @@ function renderLogSummary() {
   if (!node) return;
   const view = recordData.recordView;
   const stats = recordData.dailyStats;
-  const daily = recordData.dailySuccess || {};
-  const perKind = { checkin: {}, post: {}, comment: {} };
+  const daily = recordData.dailySuccess || (recordScope === 'engage' ? recordData.engageDailySuccess : recordData.workbenchDailySuccess) || {};
+  const kinds = recordScope === 'engage' ? ['repost', 'comment', 'comment_like', 'like'] : ['checkin', 'post', 'comment'];
+  const perKind = Object.fromEntries(kinds.map(k => [k, {}]));
   for (const a of recordData.actions || []) {
     if (!perKind[a.kind]) continue;
     const shown = displayState(a);
@@ -1567,7 +1605,7 @@ function renderLogSummary() {
       const key = acc.uid || acc.name || acc.id;
       if (key && !abnormal.has(key)) abnormal.set(key, acc);
     }
-  const columns = ["checkin", "post", "comment"]
+  const columns = kinds
     .map(
       (k) =>
         '<div class="log-summary-kind"><span>' + kind(k) +
@@ -1578,8 +1616,9 @@ function renderLogSummary() {
         "</small></div>",
     )
     .join("");
+  const columnCount = kinds.length + 1;
   node.innerHTML =
-    '<header><h2>当日汇总</h2><span>' + (view?.archived ? "归档记录" : "北京时间") + '</span></header><div class="log-summary-grid">' +
+    '<header><h2>当日汇总</h2><span>' + (view?.archived ? "归档记录" : "北京时间") + '</span></header><div class="log-summary-grid" data-columns="' + columnCount + '" style="grid-template-columns:repeat(' + columnCount + ',minmax(0,1fr))">' +
     columns +
     '<div class="log-summary-meta"><span>任务</span><strong>' +
     Number(stats?.jobCount ?? recordData.jobs.length ?? 0) +
@@ -1631,6 +1670,11 @@ function renderLogs() {
   const date = $("#record-date");
   if (!date) return;
   date.value = recordDate;
+  document.querySelectorAll('[data-record-scope]').forEach(button => {
+    const active = button.dataset.recordScope === recordScope;
+    button.classList.toggle('on', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
   const filter = $("#log-filter").value;
   const statusNode = $("#record-status");
   if (statusNode)
@@ -1654,6 +1698,13 @@ function renderLogs() {
     $("#job-list").innerHTML = '<div class="empty">当天没有任务记录。</div>';
   renderFlow(entries);
 }
+function setRecordScope(scope) {
+  if (!['workbench', 'engage'].includes(scope) || scope === recordScope) return;
+  recordScope = scope;
+  recordUI.reset();
+  syncRecordUrl();
+  loadRecords(recordDate).catch(() => {});
+}
 $("#record-date").addEventListener("change", (e) => {
   recordUI.reset();
   loadRecords(e.target.value).catch(() => {});
@@ -1663,6 +1714,8 @@ $("#log-filter").addEventListener("change", () => {
   loadRecords(recordDate).catch(() => {});
 });
 document.addEventListener("click", (e) => {
+  const scopeButton = e.target.closest('[data-record-scope]');
+  if (scopeButton) { setRecordScope(scopeButton.dataset.recordScope); return; }
   if (e.target.closest("[data-retry-records]")) {
     loadRecords(recordDate).catch(() => {});
     return;
@@ -1692,11 +1745,28 @@ document.addEventListener("click", (e) => {
     return;
   }
 });
+async function startEngage(input) {
+  try {
+    const result = await request('/api/jobs', { method: 'POST', body: { kind: 'engage', ...input } });
+    if (result.created) { toast('转赞评任务已开始'); await load({ keep: true }); }
+    else toast(result.error || '已有未结束任务');
+  } catch (error) { toast(error.message); }
+}
+
 verificationUI = createVerificationUI({
   getState: () => state,
   request,
   refresh: () => load({ keep: true }),
   toast,
+});
+engageVerificationUI = createVerificationUI({ getState: () => state, request, refresh: () => load({ keep: true }), toast, panelId: 'engage-verification', anchor: '#engage-run-card', verificationKey: 'engageVerification' });
+engageUI = createEngageUI({
+  getState: () => state,
+  request,
+  refresh: () => load({ keep: true }),
+  toast,
+  openAccounts: () => { engageAccountPicker = true; openPicker(); },
+  start: startEngage,
 });
 groupUI = createGroupUI({
   getState: () => state,
@@ -1719,9 +1789,10 @@ reportUI = createReportUI({
     const records = await request(
       "/api/records?date=" + encodeURIComponent(date),
     );
-    return records.dailySuccess;
+    return records.workbenchDailySuccess || records.dailySuccess;
   },
   viewReport: async (report) => {
+    recordScope = 'workbench';
     navigate("logs");
     await loadRecords(localDate(report.completedAt));
     for (let attempt = 0; attempt < 15; attempt++) {
@@ -1734,7 +1805,127 @@ setInterval(() => {
   if (state && state.dailySuccess?.date !== localDate())
     load({ keep: true }).catch(() => {});
 }, 30000);
-async function boot() {
+let updateState = null;
+let updatePolling = null;
+let updateCheckedOnce = false;
+function renderUpdateEntry() {
+  const entry = $("#update-entry"), label = $("#update-entry-version"), dot = $("#update-entry-dot"), dialog = $("#update-dialog");
+  if (!entry) return;
+  const current = updateState?.currentVersion ? "v" + updateState.currentVersion : "检查中…";
+  const tone = updateState?.lastError || updateState?.download?.state === "error" ? "error"
+    : updateState?.applying || updateState?.download?.state === "downloading" ? "busy"
+      : updateState?.available ? "available" : updateState?.checkedAt ? "current" : "idle";
+  const text = updateState?.switched ? "v" + updateState.activatedVersion + " · 待重启"
+    : updateState?.available ? "v" + updateState.currentVersion + " · 有新版本"
+    : updateState?.checkedAt ? current + " · 已是最新" : current;
+  label.textContent = text; dot.className = "update-dot " + tone;
+  if (!dialog) return;
+  $("#update-installed").textContent = updateState?.currentVersion ? "v" + updateState.currentVersion : "—";
+  $("#update-latest").textContent = updateState?.latestVersion ? "v" + updateState.latestVersion : "—";
+  $("#update-platform").textContent = updateState?.platformKey || "不支持";
+  $("#update-state").textContent = updateState?.switched ? "已切换，重启后生效" : updateState?.applying ? "正在更新" : updateState?.download?.state === "downloading"
+    ? "下载 " + Number(updateState.download.percent || 0) + "%"
+    : updateState?.downloaded ? "已下载，可更新" : updateState?.available ? "有可用更新" : updateState?.checkedAt ? "已是最新" : "尚未检查";
+  $("#update-notes").textContent = updateState?.release?.notes || "暂无更新说明";
+  const restart = $("#update-restart-toggle").checked;
+  $("#update-command").value = restart ? (updateState?.command || "") : (updateState?.commandNoRestart || "");
+  $("#update-error").textContent = updateState?.lastError || updateState?.download?.error || "";
+  $("#update-blocked").textContent = updateState?.blockedReason
+    ? "当前暂不能应用更新：" + updateState.blockedReason + "。可以先下载更新包，空闲后再更新。"
+    : "";
+  const progress = updateState?.download;
+  $("#update-progress").classList.toggle("hidden", !progress || !["downloading","downloaded"].includes(progress.state));
+  if (progress) {
+    $("#update-progress-text").textContent = progress.state === "downloaded" ? "更新包已下载并通过校验" : "正在下载更新：" + Number(progress.percent || 0) + "%";
+    $("#update-progress-bar").style.width = Number(progress.percent || 0) + "%";
+  }
+  const downloaded = Boolean(updateState?.downloaded), available = Boolean(updateState?.available);
+  $("#update-download").classList.toggle("hidden", !available || downloaded || progress?.state === "downloading");
+  $("#update-apply").classList.toggle("hidden", !downloaded);
+  $("#update-apply").textContent = restart ? "更新并重启" : "更新";
+  $("#update-apply").disabled = Boolean(updateState?.blockedReason || updateState?.applying);
+}
+async function checkUpdate(force = false) {
+  try {
+    updateState = await request('/api/update/status' + (force ? '?refresh=1' : ''));
+    updateCheckedOnce = true;
+    renderUpdateEntry();
+  } catch (error) {
+    updateState = { ...(updateState || {}), lastError: error.message, checkedAt: new Date().toISOString() };
+    renderUpdateEntry();
+  }
+}
+function stopUpdatePolling() { if (updatePolling) { clearInterval(updatePolling); updatePolling = null; } }
+function pollUpdateAfterApply(targetVersion, previousStartedAt) {
+  stopUpdatePolling();
+  const started = Date.now();
+  updatePolling = setInterval(async () => {
+    try {
+      const response = await fetch('/api/health?update=' + Date.now(), { cache: 'no-store' });
+      if (response.ok) {
+        const health = await response.json();
+        if (health.version === targetVersion && health.service?.startedAt !== previousStartedAt) {
+          stopUpdatePolling();
+          location.reload();
+        }
+      }
+    } catch {}
+    if (Date.now() - started > 60000) {
+      stopUpdatePolling();
+      $("#update-error").textContent = "更新助手已启动，但 60 秒内未检测到新版服务。请查看更新日志或重新打开页面。";
+    }
+  }, 800);
+}
+function pollUpdateSwitch(targetVersion) {
+  stopUpdatePolling();
+  const started = Date.now();
+  updatePolling = setInterval(async () => {
+    await checkUpdate(false);
+    if (updateState?.activatedVersion === targetVersion) {
+      stopUpdatePolling();
+      toast("版本文件已切换到 v" + targetVersion + "，下次启动服务时生效");
+    } else if (Date.now() - started > 60000) {
+      stopUpdatePolling();
+      $("#update-error").textContent = "版本切换超过 60 秒仍未完成，请查看更新日志。";
+    }
+  }, 800);
+}
+for (const selector of ["#update-entry", "#update-entry-mobile"]) $(selector)?.addEventListener("click", () => { $("#update-dialog")?.showModal(); renderUpdateEntry(); void checkUpdate(false); });
+$("[data-close-update]")?.addEventListener("click", () => $("#update-dialog")?.close());
+$("#update-check")?.addEventListener("click", () => void checkUpdate(true));
+$("#update-copy")?.addEventListener("click", async () => { try { await navigator.clipboard.writeText($("#update-command").value); toast("命令已复制"); } catch { toast("复制失败，请手动选择命令"); } });
+$("#update-restart-toggle")?.addEventListener("change", renderUpdateEntry);
+$("#update-download")?.addEventListener("click", async () => {
+  try {
+    updateState = await request('/api/update/download', { method:'POST' });
+    renderUpdateEntry();
+    stopUpdatePolling();
+    updatePolling = setInterval(async () => {
+      await checkUpdate(false);
+      if (updateState?.downloaded || updateState?.download?.state === "error") stopUpdatePolling();
+    }, 700);
+  } catch (error) { $("#update-error").textContent = error.message; }
+});
+$("#update-apply")?.addEventListener("click", async () => {
+  const restart = $("#update-restart-toggle").checked;
+  if (!confirm(restart ? "更新后将自动重启服务，当前页面会短暂中断。继续？" : "只切换版本文件，当前服务继续运行旧版本，下次启动时使用新版。继续？")) return;
+  try {
+    $("#update-apply").disabled = true;
+    const targetVersion = updateState?.latestVersion;
+    const previousStartedAt = state?.service?.startedAt || "";
+    await request('/api/update/apply', { method:'POST', body:{ restart } });
+    $("#update-state").textContent = "正在更新";
+    $("#update-error").textContent = "更新助手已启动…";
+    if (restart) pollUpdateAfterApply(targetVersion, previousStartedAt);
+    else {
+      $("#update-state").textContent = "正在切换版本文件";
+      pollUpdateSwitch(targetVersion);
+    }
+  } catch (error) { $("#update-error").textContent = error.message; $("#update-apply").disabled = false; }
+});
+setInterval(() => { if (!document.hidden) void checkUpdate(false); }, 60 * 60 * 1000);
+
+ async function boot() {
   // 旧版后端没有 /api/license/status（会返回 401/404）；此时不能把“接口不存在”
   // 当成“未激活”，否则手机等新打开的页面会被错误地拦在激活页。
   const licenseResponse = await fetch("/api/license/status");
@@ -1745,7 +1936,11 @@ async function boot() {
   const r = await fetch("/api/session"),
     s = await r.json();
   const params = new URLSearchParams(location.search);
-  recordDate = params.get("recordDate") || today();
+  // Records always open on the current Beijing date. A stale recordDate query
+  // from a previous day must not keep the page pinned to yesterday's grid.
+  recordCalendarDay = today();
+  recordDate = recordCalendarDay;
+  recordScope = params.get('recordScope') === 'engage' ? 'engage' : 'workbench';
   const savedFilter = params.get("recordFilter");
   if (
     savedFilter &&
@@ -1756,6 +1951,7 @@ async function boot() {
   showApp();
   await load();
   await loadRecords(recordDate);
+  void checkUpdate(false);
   connect();
 }
 boot().catch((e) => {

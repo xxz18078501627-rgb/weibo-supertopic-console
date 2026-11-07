@@ -4,7 +4,8 @@ import { gotoChecked, isNavigationError, safeNavigationUrl, NavigationUnavailabl
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { createPostReceiptCollector } from './post-receipts.js';
-import { createPostSuccessNoticeObserver, createCommentSuccessNoticeObserver } from './post-success-notice.js';
+import { createPostSuccessNoticeObserver, createCommentSuccessNoticeObserver, createRepostSuccessNoticeObserver } from './post-success-notice.js';
+import { markEngagePost, engageControl, visibleLikeState, markEngageComments, readStreamingComments, scrollStreamingComments, waitForStreamingCommentSettle } from './engage-dom.js';
 const challengeMode = new AsyncLocalStorage();
 
 async function submitBeforeDeadline(button, onSubmit, deadlineAt) {
@@ -37,7 +38,7 @@ async function submitBeforeDeadline(button, onSubmit, deadlineAt) {
       if (guard) for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) document.removeEventListener(type, guard.listener, true);
       delete element.__workbenchSubmitGuard;
     }).catch(() => {});
-    await handle.dispose().catch(() => {});
+    if (!button.keepHandle) await handle.dispose().catch(() => {});
   }
 }
 
@@ -73,6 +74,17 @@ export class MutedError extends AdapterError {
 export class UnsupportedPageError extends AdapterError {
   constructor(message) { super(message, 'page_not_recognized'); }
 }
+export class EngagePageClosedError extends AdapterError {
+  constructor(message = '内赞页面已关闭，正在重新打开当前微博') { super(message, 'engage_page_closed'); this.unsubmitted = true; }
+}
+
+function isDetachedDomError(error) {
+  return /(?:element is not attached|not attached to the DOM|detached from the DOM|element is no longer attached)/i.test(String(error?.message || error || ''));
+}
+
+function isClosedPageError(error) {
+  return /(?:target page, context or browser has been closed|page has been closed|browser has been closed|context has been closed)/i.test(String(error?.message || error || ''));
+}
 
 const visible = locator => locator.filter({ visible: true });
 
@@ -85,6 +97,27 @@ async function firstVisible(locators) {
     }
   }
   return null;
+}
+
+async function setVisibleCheckboxState(checkbox, desired, page) {
+  const target = Boolean(desired);
+  if (await checkbox.isChecked().catch(() => false) === target) return;
+  // Weibo renders the native input beneath a visible text/icon layer. Clicking
+  // the input directly is blocked by that layer, so operate through its label.
+  const label = checkbox.locator('xpath=ancestor::label[1]');
+  if (await label.count().catch(() => 0) && await label.first().isVisible().catch(() => false)) {
+    await label.first().click({ timeout: 1000 }).catch(() => {});
+  }
+  if (await checkbox.isChecked().catch(() => false) !== target) {
+    await checkbox.evaluate(element => element.click()).catch(() => {});
+  }
+  await page.waitForTimeout(50).catch(() => {});
+  if (await checkbox.isChecked().catch(() => false) !== target) {
+    await checkbox.check({ force: true, timeout: 800 }).catch(() => {});
+    if (await checkbox.isChecked().catch(() => false) !== target) {
+      await checkbox.uncheck({ force: true }).catch(() => {});
+    }
+  }
 }
 
 // Response bodies need a separate CDP round-trip (Network.getResponseBody).
@@ -162,7 +195,9 @@ async function detectChallenge(page, browserManager) {
     // Background work records the challenge and yields to the verification
     // queue.  It must never flash a native Chrome window in front of the user.
     if (challengeMode.getStore() === 'manual') await browserManager?.foreground?.(challengePage);
-    throw new VerificationError('微博要求进行安全验证，请在打开的 Chrome 窗口中完成验证');
+    const error = new VerificationError('微博要求进行安全验证，请在打开的 Chrome 窗口中完成验证');
+    error.challengePage = challengePage;
+    throw error;
   }
 }
 
@@ -249,6 +284,33 @@ export function weiboShortIdToNumeric(shortId) {
     }
     return index === 0 ? value.toString() : value.toString().padStart(7, '0');
   }).join('');
+}
+
+export function weiboLinkStatusId(link) {
+  try {
+    const url = new URL(String(link || ''));
+    let m = url.pathname.match(/^\/(\d+)\/([A-Za-z0-9]+)$/);
+    if (m) return m[2];
+    m = url.pathname.match(/^\/(?:detail|status)\/([A-Za-z0-9]+)$/);
+    if (m) return m[1];
+    return url.pathname.split('/').filter(Boolean).pop() || '';
+  } catch { return ''; }
+}
+
+export function weiboLinkAuthorUid(link) {
+  try {
+    const url = new URL(String(link || ''));
+    const m = url.pathname.match(/^\/(\d+)\/([A-Za-z0-9]+)$/);
+    return m ? m[1] : '';
+  } catch { return ''; }
+}
+
+function commentLikeState(rows, commentId) {
+  const row = (rows || []).find(item => String(item.idstr || item.id) === String(commentId));
+  if (!row) return null;
+  if (row.like_status != null) return row.like_status === 1 || row.like_status === '1' || row.like_status === true;
+  if (typeof row.liked === 'boolean') return row.liked;
+  return null;
 }
 
 export function normalizeWeiboText(value) {
@@ -351,6 +413,58 @@ function postContentTopicMatches(post, { uid, content, topicName }) {
     if (prefix && raw.startsWith(prefix)) bodies.push(raw.slice(prefix.length));
   }
   return Boolean(expectedContent && hasTopic && bodies.includes(expectedContent));
+}
+
+function superTopicTitle(topic) {
+  return String(topic?.name || '').replace(/超话$/, '').trim();
+}
+
+function topicPageId(value) {
+  return String(value ?? '').trim();
+}
+
+function matchingTopicItems(data, title, target) {
+  const items = Array.isArray(data?.data) ? data.data : Array.isArray(data?.list) ? data.list : [];
+  return items.filter(item => String(item?.title || '').trim() === title
+    && topicPageId(item?.page_id) === target);
+}
+
+async function waitForTopicSearchResult(page, search, topic, target) {
+  const title = superTopicTitle(topic);
+  if (!title || !target) throw new UnsupportedPageError('超话名称或目标标识缺失，未发送');
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const pending = new Set(), responses = [];
+    let lastResponseAt = 0;
+    const listener = response => {
+      try {
+        const url = new URL(response.url());
+        if (url.hostname !== 'weibo.com' || url.pathname !== '/ajax/stopic/list'
+          || response.request().method() !== 'GET') return;
+      } catch { return; }
+      lastResponseAt = Date.now();
+      const work = response.json().then(data => { responses.push(data); }, () => {});
+      pending.add(work);
+      void work.finally(() => pending.delete(work));
+    };
+    page.on('response', listener);
+    try {
+      // Clear first so a repeated value still triggers the platform search.
+      await search.fill('');
+      await search.fill(title);
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        for (const data of responses) {
+          if (matchingTopicItems(data, title, target).length === 1) return data;
+        }
+        if (responses.length && Date.now() - lastResponseAt >= 700) break;
+        await page.waitForTimeout(100).catch(() => {});
+      }
+    } finally {
+      page.off('response', listener);
+      await Promise.allSettled([...pending]);
+    }
+  }
+  throw new UnsupportedPageError('不能唯一核对所选超话的标识，未发送');
 }
 
 const receiptUrl = id => `https://weibo.com/detail/${id}`;
@@ -519,6 +633,16 @@ export function classifyPostReceipt(payload, httpOk = true) {
   return httpOk && !denied && explicitSuccess ? { kind: 'succeeded', id: null, explicitSuccess: true } : result;
 }
 
+// A matched business rejection is safe to replay only from the background
+// workbench. In a manual composer Weibo may still auto-submit after solving.
+function workbenchRejectedByVerification(observation) {
+  if (observation?.result?.kind !== 'verification') return false;
+  const { payload, response, result } = observation;
+  if (result.explicitlyUnpublished) return true;
+  const code = String(payload?.error_code ?? payload?.code ?? payload?.data?.error_code ?? '');
+  return response?.status() === 400 && code === '20067';
+}
+
 export function classifyCommentReceipt(payload, httpOk = true) {
   // Comment and post endpoints use the same security envelope. In particular,
   // ok=0 / HTTP 400 can mean captcha or an account-wide restriction, not that
@@ -558,6 +682,7 @@ export class WeiboAdapter {
   constructor(browserManager) {
     this.browserManager = browserManager;
     this.log = () => {};
+    this.engageCatalogs = new Map();
   }
 
   async cancelTask() { await this.browserManager.closeRunner?.(); }
@@ -788,6 +913,31 @@ export class WeiboAdapter {
   }
   withChallengeMode(mode, callback) { return challengeMode.run(mode, callback); }
   taskOwner() { return challengeMode.getStore() === 'manual' ? 'manual' : 'runner'; }
+  async dismissBackgroundChallenge(challengePage) {
+    if (challengeMode.getStore() === 'manual' || !challengePage || challengePage.isClosed?.()) return false;
+    const context = this.browserManager?.context;
+    if (!context) return false;
+    const pages = context.pages().filter(page => page && !page.isClosed?.());
+    // A challenge that opened its own tab can be closed without touching the
+    // account's task page or its persistent browser context.
+    if (pages.length > 1 && pages.includes(challengePage)) {
+      await challengePage.close().catch(() => {});
+      return true;
+    }
+    for (const frame of challengePage.frames?.() || [challengePage]) {
+      const close = await firstVisible([
+        frame.getByRole('button', { name: /^(关闭|关闭验证|close)$/i }),
+        frame.locator('[aria-label*="关闭"], [title*="关闭"], [class*="geetest_close"], .yidun_popup__close').first()
+      ]);
+      if (close) { await close.click().catch(() => {}); break; }
+    }
+    await challengePage.keyboard?.press?.('Escape').catch(() => {});
+    if (!await hasVerificationChallenge(challengePage).catch(() => false)) return true;
+    // Some layouts have no explicit close control. Keep the same tab and
+    // context; the next engage operation will deliberately reload its target.
+    this.forceNextEngageNavigation = true;
+    return false;
+  }
   async minimizeTask() {
     const manager = this.browserManager;
     if (manager.owner === 'runner') for (const page of manager.context?.pages() || []) await manager.minimize?.(page);
@@ -1110,7 +1260,7 @@ export class WeiboAdapter {
 
   async closeManual(context) {
     try {
-      for (const handle of [this.manualPostReceipt, this.manualCommentReceipt]) {
+      for (const handle of [this.manualPostReceipt, this.manualCommentReceipt, this.manualRepostReceipt]) {
         if (!context || handle?.page?.context?.() === context) await handle?.stop?.();
       }
     } finally {
@@ -1119,7 +1269,7 @@ export class WeiboAdapter {
   }
 
   currentSubmission(action) {
-    const handle = action?.kind === 'comment' ? this.manualCommentReceipt : this.manualPostReceipt;
+    const handle = action?.kind === 'comment' ? this.manualCommentReceipt : action?.kind === 'repost' ? this.manualRepostReceipt : action?.kind === 'post' ? this.manualPostReceipt : null;
     return handle && handle.actionId === action?.id && handle.attemptId === action?.attempt_id
       && !handle.page?.isClosed?.() ? handle : null;
   }
@@ -1164,12 +1314,14 @@ export class WeiboAdapter {
     return { state: 'uncertain', url: page.url(), reason: '点击签到后未验收到“已签到”状态' };
   }
 
-  async post(account, topic, text, { onSubmit = () => {}, onReceipt = () => {}, syncToHome = false, deadlineAt,
-    attemptId = randomUUID(), actionId = null, receiptTimeoutMs = 15000, signal } = {}) {
-    await this.manualPostReceipt?.stop();
+  async preparePostComposer(account, topic, text, syncToHome) {
+    const startedAt = Date.now();
+    const mark = stage => this.log('info', `发帖准备阶段：${stage}（${Date.now() - startedAt}ms）`, {
+      accountId: account.id, topicId: topic.id });
     await this.ensureIdentity(account);
     const page = await this.browserManager.page(account, this.taskOwner());
     await gotoChecked(page, 'https://weibo.com/', { stage: 'post-home' });
+    mark('首页已加载');
     await detectChallenge(page, this.browserManager);
     const target = topic.url.match(/\/p\/(100808\w+)/)?.[1];
     if (!target) throw new UnsupportedPageError('超话链接缺少可核对的目标标识');
@@ -1183,30 +1335,61 @@ export class WeiboAdapter {
     const dialog = page.locator('.woo-modal-wrap').filter({ has: page.locator('textarea[placeholder="掐指一算，此贴必火"]') }).first();
     await dialog.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
     if (!await dialog.isVisible().catch(() => false)) throw new UnsupportedPageError('没有识别到超话发博窗口');
+    mark('发博窗口已打开');
     await dialog.getByText('选择超话', { exact: true }).click();
     const search = dialog.getByPlaceholder('搜索超话');
-    const responsePromise = page.waitForResponse(response => response.url().includes('/ajax/stopic/list') && response.request().method() === 'GET', { timeout: 10000 });
-    await search.fill(topic.name.replace(/超话$/, ''));
-    const response = await responsePromise.catch(() => null);
-    const searchData = await response?.json().catch(() => null);
-    const matches = (searchData?.data || []).filter(item => item.title === topic.name.replace(/超话$/, '') && item.page_id === target);
-    const sameNames = (searchData?.data || []).filter(item => item.title === topic.name.replace(/超话$/, ''));
-    if (matches.length !== 1 || sameNames.length !== 1) throw new UnsupportedPageError('不能唯一核对所选超话的标识，未发送');
-    const result = dialog.locator('[class*="_h3_"]').filter({ hasText: new RegExp(`^${topic.name.replace(/超话$/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`) });
-    await result.first().waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
-    if (await result.count() !== 1) throw new UnsupportedPageError('不能唯一识别超话搜索结果，未发送');
-    await result.click();
+    await waitForTopicSearchResult(page, search, topic, target);
+    mark('超话搜索已确认');
+    const title = superTopicTitle(topic);
+    const results = dialog.locator('[class*="_h3_"]').filter({ hasText: new RegExp(`^${title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`) });
+    const count = await results.count().catch(() => 0);
+    let selected = count === 1 ? results.first() : null;
+    if (count > 1) {
+      const matchingIndexes = await results.evaluateAll((nodes, pageId) => nodes.map((node, index) => {
+        const card = node.closest('[data-pageid], [data-page-id], [data-id]') || node.parentElement || node;
+        return String(card?.outerHTML || '').includes(String(pageId)) ? index : -1;
+      }).filter(index => index >= 0), target);
+      if (matchingIndexes.length === 1) selected = results.nth(matchingIndexes[0]);
+    }
+    if (!selected) throw new UnsupportedPageError('不能唯一识别超话搜索结果，未发送');
+    await selected.click();
     const editor = dialog.locator('textarea[placeholder="掐指一算，此贴必火"]');
-    await page.waitForFunction(name => document.querySelector('textarea[placeholder="掐指一算，此贴必火"]')?.value.includes(`${name}[超话]`), topic.name.replace(/超话$/, ''), { timeout: 5000 }).catch(() => {});
+    await page.waitForFunction(name => document.querySelector('textarea[placeholder="掐指一算，此贴必火"]')?.value.includes(`${name}[超话]`), title, { timeout: 5000 }).catch(() => {});
     const prefix = await editor.inputValue();
-    if (!prefix.includes(`${topic.name.replace(/超话$/, '')}[超话]`)) throw new UnsupportedPageError('无法确认已关联目标超话，未发送');
+    if (!prefix.includes(`${title}[超话]`)) throw new UnsupportedPageError('无法确认已关联目标超话，未发送');
     await editor.fill(`${prefix}${text}`);
+    mark('正文已填充');
     const sync = dialog.getByRole('checkbox', { name: /同步到微博/ });
     if (await sync.count() !== 1) throw new UnsupportedPageError('没有识别到主页同步选项，未发送');
-    if ((await sync.isChecked()) !== syncToHome) await dialog.locator('label').filter({ hasText: '同步到微博' }).click({ timeout: 5000 });
+    await setVisibleCheckboxState(sync.first(), syncToHome, page);
+    for (let attempt = 0; attempt < 10 && (await sync.isChecked()) !== syncToHome; attempt += 1) {
+      await page.waitForTimeout(50);
+    }
     if ((await sync.isChecked()) !== syncToHome) throw new UnsupportedPageError('无法确认主页同步设置，未发送');
+    mark('同步选项已确认');
     const publish = dialog.getByRole('button', { name: /^(发送|发布)$/ });
     if (await publish.count() !== 1 || !await publish.isEnabled()) throw new UnsupportedPageError('发博窗口的发送按钮不可用，未发送');
+    return { page, dialog, editor, publish, target };
+  }
+
+  async post(account, topic, text, { onSubmit = () => {}, onReceipt = () => {}, syncToHome = false, deadlineAt,
+    attemptId = randomUUID(), actionId = null, receiptTimeoutMs = 30000, signal, workbenchVerification = false } = {}) {
+    await this.manualPostReceipt?.stop();
+    let prepared = null, lastSetupError = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        prepared = await this.preparePostComposer(account, topic, text, syncToHome);
+        this.log('info', `发帖准备完成（第 ${attempt}/3 次）`, { accountId: account.id, topicId: topic.id });
+        break;
+      } catch (error) {
+        if (!(error instanceof UnsupportedPageError) || signal?.aborted) throw error;
+        lastSetupError = error;
+        this.log('warning', `发帖准备失败（第 ${attempt}/3 次）：${error.message}`, { accountId: account.id, topicId: topic.id });
+        if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 800 * attempt));
+      }
+    }
+    if (!prepared) throw lastSetupError || new UnsupportedPageError('发帖准备失败，未发送');
+    const { page, editor, publish, target } = prepared;
     let savedSuccess = null, savingSuccess = null;
     const saveSuccess = receipt => {
       if (savingSuccess) return savingSuccess;
@@ -1236,7 +1419,10 @@ export class WeiboAdapter {
         successSource: savedSuccess?.successSource || 'api_receipt' };
     };
     try {
-      await submitBeforeDeadline(publish, async () => { await notice.begin(); await onSubmit(); collector.begin(); }, deadlineAt);
+      await submitBeforeDeadline(publish, async () => {
+        await notice.begin(); await onSubmit(); collector.begin();
+        this.log('info', '发帖已点击提交', { accountId: account.id, topicId: topic.id });
+      }, deadlineAt);
       while (!collector.expired && !signal?.aborted) {
         if (await acceptedResult()) break;
         try { await detectChallenge(page, this.browserManager); }
@@ -1269,10 +1455,12 @@ export class WeiboAdapter {
       const success = await acceptedResult();
       if (success) return success;
       if (error instanceof VerificationError) {
-        // This composer may auto-submit when the user solves its widget. Do
-        // not mark it unpublished or create a new attempt in the meantime.
-        collector.handoff(); handedOff = true;
-        error.submittedUncertain = true;
+        // Only an owned, definitive background rejection can be replayed.
+        // Keep the manual composer alive for Weibo's own automatic submit.
+        const rejected = workbenchVerification && this.taskOwner() !== 'manual'
+          && workbenchRejectedByVerification(collector.soleResponse);
+        if (rejected) error.explicitlyUnpublished = true;
+        else { collector.handoff(); handedOff = true; error.submittedUncertain = true; }
       }
       throw error;
     } finally {
@@ -1422,7 +1610,8 @@ export class WeiboAdapter {
     }
     await detectChallenge(page, this.browserManager);
     const authorUid = candidate.authorUid || new URL(candidate.url).pathname.match(/^\/(\d+)\//)?.[1] || '';
-    const statusId = weiboShortIdToNumeric(candidate.id || new URL(candidate.url).pathname.split('/').pop());
+    const rawStatusId = String(candidate.id || new URL(candidate.url).pathname.split('/').pop());
+    const statusId = /^\d+$/.test(rawStatusId) ? rawStatusId : weiboShortIdToNumeric(rawStatusId);
     const findMatch = async (delay, verificationMethod) => {
       if (delay > 0) await page.waitForTimeout(delay);
       const readback = await page.evaluate(async ({ id, authorUid: postAuthorUid }) => {
@@ -1462,31 +1651,39 @@ export class WeiboAdapter {
     return { state: 'uncertain', url: candidate.url, reason: '按倒序查看最新 50 条评论，仍未找到昵称和完整文案均匹配的评论' };
   }
 
-  async comment(account, candidate, content, { onSubmit = () => {}, onReceipt = () => {}, attemptId = randomUUID(), actionId = null, deadlineAt } = {}) {
+  async comment(account, candidate, content, { beforeSubmit, onSubmit = () => {}, onReceipt = () => {}, attemptId = randomUUID(), actionId = null, deadlineAt, engage = false, workbenchVerification = false } = {}) {
     await this.manualCommentReceipt?.stop?.();
     const page = await this.browserManager.page(account, this.taskOwner());
+    let editor, submit;
+    if (engage) {
+      await this.openWeibo(account, candidate.url);
+      ({editor,submit} = await this.engageComposer(page,candidate.url,'comment'));
+      await editor.fill(content);
+    } else {
     await gotoChecked(page, candidate.url, { stage: 'comment-page' });
     await detectChallenge(page, this.browserManager);
     await page.locator('textarea[placeholder*="评论"]').first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
-    const editor = await firstVisible([
+    editor = await firstVisible([
       page.locator('textarea[placeholder*="评论"]'), page.locator('textarea'),
       page.locator('[contenteditable="true"][role="textbox"]'), page.locator('[contenteditable="true"]')
     ]);
     if (!editor) throw new UnsupportedPageError('没有识别到评论输入框');
     await editor.fill(content);
     const region = editor.locator('xpath=../../..');
-    const submit = await firstVisible([region.getByRole('button', { name: /^(评论|发送)$/ }), region.getByText(/^(评论|发送)$/, { exact: true })]);
+    submit = await firstVisible([region.getByRole('button', { name: /^(评论|发送)$/ }), region.getByText(/^(评论|发送)$/, { exact: true })]);
     if (!submit) throw new UnsupportedPageError('已经填写评论，但没有识别到评论按钮');
     if (!await submit.isEnabled()) throw new UnsupportedPageError('评论按钮不可点击，未发送');
+    }
     let saved = null, saving = null, submitted = false, handedOff = false, signalNotice;
     const noticeSignal = new Promise(resolve => { signalNotice = resolve; });
-    const notice = await createCommentSuccessNoticeObserver(page, { attemptId, onSuccess: receipt => {
+    const saveComment = receipt => {
       if (saving) return saving;
-      saved = { ...receipt, url: candidate.url };
+      saved = { ...receipt, url: receipt.url || candidate.url };
       saving = Promise.resolve().then(() => onReceipt(saved));
       void saving.then(() => signalNotice({}), () => signalNotice({}));
       return saving;
-    } });
+    };
+    const notice = await createCommentSuccessNoticeObserver(page, { attemptId, onSuccess: saveComment });
     const acceptedResult = async () => {
       await notice.read();
       if (!saved) return null;
@@ -1494,11 +1691,19 @@ export class WeiboAdapter {
       catch (cause) { throw Object.assign(new Error('评论成功回执保存异常，禁止重新评论', { cause }), { code: 'receipt_persistence_failed' }); }
       return { ...saved, state: 'succeeded' };
     };
+    const rawTarget = String(candidate.id || '');
+    const commentTarget = /^\d+$/.test(rawTarget) ? rawTarget : /^[A-Za-z0-9]+$/.test(rawTarget) ? weiboShortIdToNumeric(rawTarget) : '';
+    const collector = workbenchVerification && !engage && commentTarget ? createPostReceiptCollector({
+      operation: 'comment', targetId: commentTarget, page, attemptId, submittedText: content,
+      classify: classifyCommentReceipt, readJson: readJsonBounded,
+      onReceipt: receipt => saveComment({ ...receipt, url: candidate.url + (candidate.url.includes('?') ? '&' : '?') + 'comment_id=' + encodeURIComponent(receipt.receiptId) })
+    }) : null;
     this.manualCommentReceipt = { kind: 'comment', actionId, attemptId, page,
-      read: () => notice.read(), stop: () => notice.stop() };
+      read: collector ? acceptedResult : () => notice.read(),
+      stop: async () => { collector?.stop(); await notice.stop(); } };
     try {
     const receipt = page.waitForResponse(r => r.request().method() === 'POST' && /^\/ajax\/comments\/(create|reply|add)$/.test(new URL(r.url()).pathname), { timeout: 15000 }).catch(() => null);
-    await submitBeforeDeadline(submit, async () => { await notice.begin(); await onSubmit(); submitted = true; }, deadlineAt);
+    await submitBeforeDeadline(submit, async () => { if (beforeSubmit) await beforeSubmit(); await notice.begin(); await onSubmit(); submitted = true; collector?.begin(); }, deadlineAt);
     await page.waitForTimeout(300);
     if (await acceptedResult()) return acceptedResult();
     await detectChallenge(page, this.browserManager);
@@ -1509,6 +1714,8 @@ export class WeiboAdapter {
     const response = outcome.response;
     const payload = await readJsonBounded(response);
     if (await acceptedResult()) return acceptedResult();
+    await collector?.drain();
+    if (await acceptedResult()) return acceptedResult();
     const classification = classifyCommentReceipt(payload, Boolean(response?.ok()));
     if (response) {
       const code = String(payload?.error_code ?? payload?.code ?? payload?.data?.error_code ?? '无').replace(/[^\w-]/g, '').slice(0, 40);
@@ -1517,7 +1724,7 @@ export class WeiboAdapter {
     }
     if (classification.kind === 'verification') {
       const error = new VerificationError(classification.reason);
-      error.explicitlyUnpublished = classification.explicitlyUnpublished;
+      error.explicitlyUnpublished = !workbenchVerification && classification.explicitlyUnpublished;
       throw error;
     }
     const mutedMessage = mutedMessageFromReceipt(payload) || await visibleMutedMessage(page);
@@ -1547,13 +1754,513 @@ export class WeiboAdapter {
       const success = await acceptedResult();
       if (success) return success;
       if (error instanceof VerificationError && submitted) {
-        handedOff = true;
-        error.submittedUncertain = true;
+        await collector?.drain();
+        const confirmed = await acceptedResult();
+        if (confirmed) return confirmed;
+        if (collector && this.taskOwner() !== 'manual' && workbenchRejectedByVerification(collector.soleResponse)) {
+          error.explicitlyUnpublished = true;
+        } else {
+          collector?.handoff();
+          handedOff = true;
+          error.submittedUncertain = true;
+        }
       }
       throw error;
     } finally {
-      if (!handedOff) await notice.stop();
+      if (!handedOff) { await collector?.finish(); await notice.stop(); }
     }
+  }
+
+  async engageRestrictions(page, kind) {
+    await detectChallenge(page,this.browserManager);
+    if (['repost','comment'].includes(kind)) {
+      const muted=await visibleMutedMessage(page); if(muted) throw new MutedError(muted,kind);
+    }
+    const rate=await visibleRateMessage(page); if(rate) throw new RateLimitError(rate,kind);
+  }
+
+  async engageComposer(page, link, kind, { coupled = false } = {}) {
+    const card=await this.engagePostCard(page,weiboLinkStatusId(link));
+    if(!card) throw new UnsupportedPageError('无法唯一识别目标微博卡片');
+    const control=await engageControl(page,card.locator('[data-engage-toolbar]').first(),kind);
+    if(!control) throw new UnsupportedPageError('没有识别到'+(kind==='repost'?'转发':'评论')+'入口');
+    await control.click();
+    const placeholder=kind==='repost'?'分享心得':'评论';
+    const inline=page.locator('textarea[placeholder*="'+placeholder+'"]');
+    await inline.first().waitFor({state:'visible',timeout:8000}).catch(()=>{});
+    let editor=await firstVisible([inline, page.locator('.woo-modal-wrap textarea'),page.locator('.woo-modal-wrap [contenteditable="true"]')]);
+    if(!editor) throw new UnsupportedPageError('没有识别到'+(kind==='repost'?'转发':'评论')+'输入框');
+    // Find the smallest composer ancestor owning its submit, not a whole page.
+    await editor.evaluate((e,kind)=>{
+      document.querySelectorAll('[data-engage-composer]').forEach(n=>n.removeAttribute('data-engage-composer'));
+      const label=kind==='repost'?'转发':'评论';
+      for(let root=e.parentElement,n=0;root && n<7;root=root.parentElement,n++) {
+        if([...root.querySelectorAll('button,[role="button"]')].some(b=>b.textContent.trim()===label)) {root.setAttribute('data-engage-composer',kind);break;}
+      }
+    },kind);
+    let region=page.locator('[data-engage-composer="'+kind+'"]');
+    const label=kind==='repost'?'转发':'评论';
+    const submit=await firstVisible([region.getByRole('button',{name:label,exact:true}),region.getByText(label,{exact:true})]);
+    if(!submit) throw new UnsupportedPageError('没有识别到'+label+'提交按钮');
+    if (kind !== 'repost') return {editor,submit};
+    const coupleLabel='同时评论';
+    let couple=await firstVisible([
+      region.getByRole('checkbox',{name:coupleLabel,exact:true}),
+      region.locator('label').filter({hasText:coupleLabel}).locator('input[type="checkbox"]').first()
+    ]);
+    if(!couple) couple=await firstVisible([page.getByRole('checkbox',{name:coupleLabel,exact:true})]);
+    if(!couple){
+      const text=await firstVisible([region.getByText(coupleLabel,{exact:true})]);
+      couple=text ? text.locator('xpath=ancestor::label[1]//input[@type="checkbox"]').first() : null;
+    }
+    if(coupled && !couple) throw new UnsupportedPageError('没有识别到“'+coupleLabel+'”选项，未提交');
+    if(couple){
+      await setVisibleCheckboxState(couple,coupled,page);
+      if(await couple.isChecked().catch(()=>false)!==Boolean(coupled)) throw new UnsupportedPageError('“'+coupleLabel+'”选项状态未生效，未提交');
+    }
+    return {editor,submit};
+  }
+
+  async openWeibo(account, link) {
+    const page = await this.browserManager.page(account, this.taskOwner());
+    const statusId = weiboLinkStatusId(link);
+    const target = new URL(link).hostname === 'weibo.com' || new URL(link).hostname === 'www.weibo.com' ? link : 'https://weibo.com/detail/' + statusId;
+    const force = this.forceNextEngageNavigation === true;
+    this.forceNextEngageNavigation = false;
+    if (force || safeNavigationUrl(page.url()) !== safeNavigationUrl(target)) await gotoChecked(page, target, { stage: 'engage-link' });
+    await detectChallenge(page, this.browserManager);
+    return page;
+  }
+
+  async readEngagePost(page, id) {
+    const statusId = /^\d+$/.test(id) ? id : weiboShortIdToNumeric(id);
+    return page.evaluate(async sid => {
+      const response = await fetch('/ajax/statuses/show?id=' + encodeURIComponent(sid), { credentials: 'include' });
+      if (!response.ok) return null;
+      const payload = await response.json();
+      const post = payload?.data || payload;
+      return String(post?.idstr || post?.id || '') === sid ? post : null;
+    }, statusId).catch(() => null);
+  }
+
+  async readLikeState(page, id) {
+    const post = await this.readEngagePost(page, id);
+    return typeof post?.liked === 'boolean' ? post.liked : null;
+  }
+
+  async commentRows(page, id, authorUid) {
+    const statusId = /^\d+$/.test(id) ? id : weiboShortIdToNumeric(id);
+    const payload = await page.evaluate(async ({ sid, uid }) => {
+      const params = new URLSearchParams({ is_reload: '1', id: sid, is_show_bulletin: '3', is_mix: '0', count: '100', uid: String(uid || ''), fetch_level: '0', locale: 'zh-CN' });
+      const response = await fetch('/ajax/statuses/buildComments?' + params.toString(), { credentials: 'include' });
+      return response.ok ? response.json() : null;
+    }, { sid: statusId, uid: authorUid || '' }).catch(() => null);
+    return Array.isArray(payload?.data) ? payload.data : [];
+  }
+
+  async engagePostCard(page, id) {
+    const numeric = /^\d+$/.test(id) ? id : weiboShortIdToNumeric(id);
+    await page.locator('a[href*="'+id+'"], [data-mid="'+numeric+'"]').first().waitFor({state:'visible',timeout:10000}).catch(()=>{});
+    // Scope every toolbar to the exact detail card. A recommended post or a
+    // nested retweet's toolbar is never a substitute for the requested post.
+    const marked = await markEngagePost(page, id, numeric);
+    return marked ? page.locator('[data-engage-target="true"]') : null;
+  }
+
+  async repostWeibo(account, link, text, { beforeSubmit, onSubmit = () => {}, deadlineAt, attemptId = randomUUID(), actionId = null, onReceipt = () => {}, receiptTimeoutMs = 15000, alsoComment = false } = {}) {
+    await this.manualRepostReceipt?.stop?.();
+    const page = await this.openWeibo(account, link);
+    const { editor, submit } = await this.engageComposer(page, link, 'repost', { coupled: alsoComment });
+    if (text) await editor.fill(text);
+    const rawId = weiboLinkStatusId(link), targetId = /^\d+$/.test(rawId) ? rawId : weiboShortIdToNumeric(rawId);
+    const collector = createPostReceiptCollector({ page, attemptId, submittedText: text || '', operation: 'repost', targetId,
+      onReceipt, classify: classifyCommentReceipt, readJson: readJsonBounded, receiptTimeoutMs });
+    let handedOff = false, savedNotice = null;
+    const notice = await createRepostSuccessNoticeObserver(page, { attemptId, onSuccess: async receipt => {
+      savedNotice = { ...receipt, url:link }; await onReceipt(savedNotice);
+    } });
+    const readSuccess = async () => {
+      await notice.read(); await collector.drain();
+      if (collector.saveError) throw Object.assign(new Error('转发回执保存失败，禁止重发'), {code:'receipt_persistence_failed'});
+      if (savedNotice) return { ...savedNotice, state:'succeeded' };
+      const receipt = collector.accepted?.result;
+      return receipt?.kind === 'succeeded' ? { state:'succeeded', receiptId:receipt.id, url:receipt.id ? 'https://weibo.com/detail/'+receipt.id : link } : null;
+    };
+    this.manualRepostReceipt = { kind:'repost', actionId, attemptId, page,
+      stop:async()=>{ collector.stop(); await notice.stop(); }, read:readSuccess };
+    try {
+      await submitBeforeDeadline(submit, async () => { if (beforeSubmit) await beforeSubmit(); await notice.begin(); await onSubmit(); collector.begin(); }, deadlineAt);
+      while (!collector.expired) {
+        const success = await readSuccess(); if (success) return success;
+        const result = collector.read()?.result;
+        if (result?.kind === 'verification') throw new VerificationError(result.reason);
+        if (result?.kind === 'muted') throw new MutedError(result.reason, 'repost', true);
+        if (result?.kind === 'frequent') throw new RateLimitError(result.reason, 'repost', true);
+        if (result?.kind === 'failed') return { state:'failed',url:link,reason:result.reason || '微博明确拒绝转发' };
+        await this.engageRestrictions(page, 'repost');
+        await page.waitForTimeout(100);
+      }
+      return await readSuccess() || { state:'uncertain',url:link,reason:'转发已提交但未观察到成功提示或回执，不自动重试' };
+    } catch (error) {
+      const success = await readSuccess(); if (success) return success;
+      if (error instanceof VerificationError) { handedOff=true; collector.handoff(); error.submittedUncertain=true; }
+      throw error;
+    } finally { if (!handedOff) { collector.stop(); await notice.stop(); } }
+  }
+
+  async verifyRepost(account, action) {
+    if (action.success_source === 'page_notice' && action.state === 'succeeded') return {state:'succeeded',url:action.url || action.link,successSource:'page_notice'};
+    const page = await this.openWeibo(account, action.link || action.url);
+    if (!action.receipt_id) {
+      const originalId = weiboLinkStatusId(action.link || action.url);
+      const expectedId = /^\d+$/.test(originalId) ? originalId : weiboShortIdToNumeric(originalId);
+      const matches = new Map(), window = postTimeWindow({ startedAt: action.started_at,
+        submittedAt: action.submitted_at, completedAt: action.completed_at });
+      for (let pageNo = 1; pageNo <= 2; pageNo += 1) {
+        const payload = await boundedRead(() => page.evaluate(async ({ uid, page: currentPage }) => {
+          const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 3000);
+          try {
+            const response = await fetch(`/ajax/statuses/mymblog?uid=${encodeURIComponent(uid)}&page=${currentPage}&feature=0`, { credentials: 'include', signal: controller.signal });
+            return response.ok ? await response.json() : null;
+          } finally { clearTimeout(timer); }
+        }, { uid: account.uid, page: pageNo }));
+        const data = payload?.data || payload || {}, posts = data.list || data.statuses || data.data || [];
+        for (const post of posts) {
+          if (!withinPostWindow(post, window)) continue;
+          if (String(post?.user?.idstr || post?.user?.id || '') !== String(account.uid)) continue;
+          const retweeted = String(post?.retweeted_status?.idstr || post?.retweeted_status?.id || '');
+          if (retweeted !== expectedId) continue;
+          if (action.content && normalizeWeiboText(post.text_raw || post.text) !== normalizeWeiboText(action.content)) continue;
+          const id = String(post.idstr || post.id || '');
+          if (id) matches.set(id, post);
+        }
+      }
+      if (matches.size !== 1) return { state: 'uncertain', reason: matches.size
+        ? '近期微博存在多个相符转发，不能唯一归属' : '未取得回执且近期微博未找到唯一相符转发' };
+      const [receiptId, post] = matches.entries().next().value;
+      return { state: 'succeeded', receiptId, createdAt: post.created_at,
+        url: post.mblogid ? `https://weibo.com/${account.uid}/${post.mblogid}` : receiptUrl(receiptId), successSource: 'recent_repost_match' };
+    }
+    const post = await this.readEngagePost(page, String(action.receipt_id));
+    const originalId = weiboLinkStatusId(action.link || action.url);
+    const expectedId = /^\d+$/.test(originalId) ? originalId : weiboShortIdToNumeric(originalId);
+    const belongs = post && String(post.user?.idstr || post.user?.id || '') === String(account.uid)
+      && String(post.retweeted_status?.idstr || post.retweeted_status?.id || '') === expectedId
+      && (!action.content || normalizeWeiboText(post.text_raw || post.text) === normalizeWeiboText(action.content));
+    return belongs ? { state: 'succeeded', receiptId: action.receipt_id, url: 'https://weibo.com/detail/' + action.receipt_id } : { state: 'uncertain', reason: '未能核对到本账号的该条转发' };
+  }
+
+  async engageLikeButton(page, button, kind, link, {beforeSubmit,onSubmit=()=>{},deadlineAt}={}) {
+    const before=await visibleLikeState(button);
+    if(before) return {state:'skipped',alreadyDone:true,url:link,reason:'已经点过赞，跳过'};
+    await this.engageRestrictions(page,kind);
+    await submitBeforeDeadline(button,async()=>{if(beforeSubmit)await beforeSubmit();await onSubmit();},deadlineAt);
+    for(let n=0;n<30;n++) {
+      if(await visibleLikeState(button)) return {state:'succeeded',url:link,alreadyDone:false,successSource:'page_color'};
+      await this.engageRestrictions(page,kind);
+      await page.waitForTimeout(100);
+    }
+    return {state:'uncertain',url:link,reason:'点击后未观察到点赞由灰变橙，不自动重试'};
+  }
+
+  async likeWeibo(account, link, options = {}) {
+    const {blacklistUids=[],blacklistKeywords=[]}=options;
+    const page=await this.openWeibo(account,link),id=weiboLinkStatusId(link);
+    const post=await this.readEngagePost(page,id);
+    if(!post || typeof post.liked !== 'boolean') throw new UnsupportedPageError('外赞的已赞状态无法确认，未点击');
+    if ((blacklistUids.length && !post?.user?.idstr && !post?.user?.id) || (blacklistKeywords.length && post?.text_raw == null && post?.text == null)) return {state:'skipped',url:link,reason:'无法完整核对点赞黑名单，未执行点击'};
+    if(blacklistUids.map(String).includes(String(post?.user?.idstr || post?.user?.id || '')) || blacklistKeywords.some(word=>normalizeWeiboText(post?.text_raw || post?.text).includes(normalizeWeiboText(word)))) return {state:'skipped',url:link,reason:'命中点赞黑名单'};
+    const card=await this.engagePostCard(page,id);
+    if(!card) throw new UnsupportedPageError('无法唯一识别目标微博卡片');
+    const button=await engageControl(page,card.locator('[data-engage-toolbar]').first(),'like');
+    if(!button) throw new UnsupportedPageError('没有识别到点赞入口');
+    if(post?.liked === true) return {state:'skipped',alreadyDone:true,url:link,reason:'已经点过赞，跳过'};
+    return this.engageLikeButton(page,button,'like',link,options);
+  }
+
+  async resetEngageSession() {
+    this.engageScan = null;
+    this.forceNextEngageNavigation = false;
+  }
+
+  engageCatalog(link) {
+    const entry = this.engageCatalogs.get(link);
+    if (!entry || Date.now() - entry.updatedAt > 5 * 60 * 1000) {
+      this.engageCatalogs.delete(link);
+      return [];
+    }
+    return [...entry.keys];
+  }
+
+  rememberEngageCatalog(link, rows, scan) {
+    const entry = this.engageCatalogs.get(link);
+    const keys = entry && Date.now() - entry.updatedAt <= 5 * 60 * 1000 ? [...entry.keys] : [];
+    const known = new Set(keys);
+    for (const row of rows) if (row?.key && !known.has(row.key)) { known.add(row.key); keys.push(row.key); }
+    this.engageCatalogs.set(link, { keys, updatedAt: Date.now() });
+    scan.catalog = keys;
+  }
+
+  async streamingCommentSession(account, link, options = {}) {
+    const page = await this.openWeibo(account, link);
+    if (this.engageScan?.page?.isClosed?.()) this.engageScan = null;
+    if (this.engageScan?.page === page && this.engageScan.accountId === account.id && this.engageScan.link === link) return this.engageScan;
+    options.assertRunning?.();
+    if (!await page.locator('textarea[placeholder*="评论"]').first().isVisible().catch(()=>false)) {
+      await this.engageComposer(page,link,'comment');
+    }
+    const editor=page.locator('textarea[placeholder*="评论"]').first();
+    await editor.waitFor({state:'visible',timeout:8000});
+    await editor.scrollIntoViewIfNeeded();
+    // The editor and the comment list are rendered in separate requests. A
+    // fast shell can expose the editor while the list is still empty; do not
+    // let the first scan conclude that there are no comments.
+    for(let attempt=0;attempt<32;attempt++) {
+      const rows=await readStreamingComments(page,{viewportOnly:false});
+      if(rows.length)break;
+      await page.waitForTimeout(250);
+    }
+    this.engageScan={page,accountId:account.id,link,seen:new Set(),idle:0,scrolls:0,lastHeight:0,
+      catalog:this.engageCatalog(link)};
+    return this.engageScan;
+  }
+
+  async findStreamingComment(page, target) {
+    const rows=await readStreamingComments(page,{viewportOnly:false});
+    const key = target.key || target.id;
+    return rows.find(row=>row.key===key || row.id===target.id) || null;
+  }
+
+  async clickStreamingComment(page, link, target, options) {
+    let pinned,submitted=false, fresh;
+    try {
+      options.assertRunning?.();
+      await this.engageRestrictions(page,'comment_like');
+      if(options.beforeSubmit)await options.beforeSubmit();
+      options.assertRunning?.();
+      // Network probes and Vue rendering may replace the row. Re-resolve the
+      // same identity, then pin its exact node for the one permitted click.
+      for(let attempt=0;attempt<4 && !pinned;attempt++) {
+        fresh=await this.findStreamingComment(page,target);
+        if(!fresh)return {state:'skipped',missing:true,url:link,reason:'原评论身份已不可唯一定位，未提交点击'};
+        if(fresh.isReply && options.includeVisibleReplies !== true)return {state:'skipped',alreadyDone:true,url:link,reason:'未启用楼中楼点赞'};
+        if(fresh.liked)return {state:'skipped',alreadyDone:true,url:link};
+        const button=page.locator(fresh.selector);
+        let candidate;
+        try {
+          candidate=await button.elementHandle();
+          if(!candidate || !await candidate.evaluate(element=>element.isConnected)) { await candidate?.dispose?.().catch(()=>{}); continue; }
+          await candidate.scrollIntoViewIfNeeded();
+          if(!await candidate.evaluate(element=>element.isConnected)) { await candidate.dispose().catch(()=>{}); continue; }
+          pinned=candidate;
+        } catch(error) {
+          await candidate?.dispose?.().catch(()=>{});
+          if(isClosedPageError(error)) throw new EngagePageClosedError();
+          if(isDetachedDomError(error)) continue;
+          throw error;
+        }
+      }
+      if(!pinned)return {state:'skipped',missing:true,url:link};
+      const exact={keepHandle:true,click:args=>pinned.click(args),elementHandle:async()=>pinned};
+      await submitBeforeDeadline(exact,async()=>{
+        options.assertRunning?.();
+        if(!await pinned.evaluate(e=>e.isConnected))throw Object.assign(new Error('评论节点在点击前重绘'),{code:'engage_target_changed'});
+        const identity=await readStreamingComments(page,{viewportOnly:false,targetElement:pinned});
+        const pinnedRow=identity.find(row=>row.pinned);
+        if(!pinnedRow || (pinnedRow.key!==fresh.key && pinnedRow.id!==fresh.id))
+          throw Object.assign(new Error('点赞按钮已不属于原评论'),{code:'engage_target_changed'});
+        if(await visibleLikeState(pinned))throw Object.assign(new Error('评论已点赞'),{code:'engage_already_liked'});
+        await options.onTarget?.(fresh);
+        await options.onSubmit?.();submitted=true;
+      },options.deadlineAt);
+      for(let n=0;n<60;n++) {
+        if(await pinned.evaluate(e=>e.isConnected).catch(()=>false)) {
+          if(await visibleLikeState(pinned))return {state:'succeeded',targetId:fresh.id,url:link,successSource:'page_color'};
+        } else {
+          const readback=await this.findStreamingComment(page,fresh);
+          if(readback?.liked)return {state:'succeeded',targetId:fresh.id,url:link,successSource:'page_color'};
+        }
+        if(n===0 || n%5===0) await this.engageRestrictions(page,'comment_like');
+        await page.waitForTimeout(50);
+      }
+      return {state:'uncertain',url:link,reason:'内赞点击后未确认灰变橙，不自动重试'};
+    } catch(error) {
+      if(!submitted && isClosedPageError(error)) throw new EngagePageClosedError();
+      if(!submitted && isDetachedDomError(error))return {state:'skipped',missing:true,url:link,reason:'点赞按钮在点击预检前重绘，未提交点击'};
+      if(!submitted && error.code==='engage_already_liked')return {state:'skipped',alreadyDone:true,url:link,reason:error.message};
+      if(!submitted && error.code==='engage_target_changed')return {state:'skipped',missing:true,url:link,reason:error.message};
+      if(submitted && ![VerificationError,RateLimitError,MutedError,DailyStopError].some(Type=>error instanceof Type)
+        && !/ERR_|network|网络|断网/i.test(error.message || ''))return {state:'uncertain',url:link,reason:'内赞点击后页面变化，结果未知，不自动重试'};
+      throw error;
+    } finally {await pinned?.dispose?.().catch(()=>{});}
+  }
+
+  async likeNextComment(account,link,options={}) {
+    const scanStartedAt = Date.now();
+    let scan=await this.streamingCommentSession(account,link,options);
+    const excluded=new Set(options.excludedKeys || []);
+    const keywords=(options.keywords || String(options.keyword || '').split(/[、,，\r\n]+/)).map(normalizeWeiboText).filter(Boolean);
+    const blackUid=new Set((options.blacklistUids || []).map(String));
+    const blackKw=(options.blacklistKeywords || []).map(normalizeWeiboText).filter(Boolean);
+    let redraws=0, pageResets=0;
+    for(let turn=0;turn<1000;turn++) {
+      options.assertRunning?.();
+      if(scan.page?.isClosed?.()) {
+        if(++pageResets>3) throw new UnsupportedPageError('内赞页面连续关闭，未提交点击；请核对当前浏览器状态');
+        this.engageScan=null;
+        scan=await this.streamingCommentSession(account,link,options);
+        continue;
+      }
+      const page=scan.page;
+      try { await this.engageRestrictions(page,'comment_like'); } catch(error) {
+        if(!isClosedPageError(error)) throw error;
+        this.engageScan=null;
+        if(++pageResets>3) throw new UnsupportedPageError('内赞页面连续关闭，未提交点击；请核对当前浏览器状态');
+        scan=await this.streamingCommentSession(account,link,options);
+        continue;
+      }
+      let rows;
+      try { rows=await readStreamingComments(page); } catch(error) {
+        if(!isClosedPageError(error)) throw error;
+        this.engageScan=null;
+        if(++pageResets>3) throw new UnsupportedPageError('内赞页面连续关闭，未提交点击；请核对当前浏览器状态');
+        scan=await this.streamingCommentSession(account,link,options);
+        continue;
+      }
+      pageResets=0;
+      this.rememberEngageCatalog(link,rows,scan);
+      const rank=new Map((scan.catalog||[]).map((key,index)=>[key,index]));
+      rows.sort((a,b)=>(rank.get(a.key) ?? 1e9)-(rank.get(b.key) ?? 1e9) || a.top-b.top);
+      const target=rows.find(row=>!scan.seen.has(row.key) && (!excluded.has(row.key) || options.target?.id===row.key)
+        && (options.includeVisibleReplies === true || !row.isReply)
+        && (!options.target || row.id===options.target.id || row.key===options.target.key));
+      if(target) {
+        this.log('info', `内赞目标已定位（${Date.now() - scanStartedAt}ms，滚动 ${scan.scrolls} 次）`, { accountId: account.id, url: link });
+        if(target.liked || blackUid.has(target.authorUid) || (keywords.length && !keywords.some(word=>normalizeWeiboText(target.text).includes(word)))
+          || blackKw.some(word=>normalizeWeiboText(target.text).includes(word))) {scan.seen.add(target.key);continue;}
+        let result;
+        try { result=await this.clickStreamingComment(page,link,target,options); } catch(error) {
+          if(!(error instanceof EngagePageClosedError)) throw error;
+          this.engageScan=null;
+          if(++pageResets>3) throw new UnsupportedPageError('内赞页面连续关闭，未提交点击；请核对当前浏览器状态');
+          scan=await this.streamingCommentSession(account,link,options);
+          continue;
+        }
+        if(result.missing) {
+          if(++redraws<4)continue;
+          this.engageCatalogs.delete(link);
+          throw new UnsupportedPageError('内赞目标无法稳定确认：'+(result.reason || '评论身份或节点已变化')+'；未提交点击，请核对当前页面');
+        }
+        scan.seen.add(target.key);scan.idle=0;
+        if(result.alreadyDone)continue;
+        return result;
+      }
+      let position;
+      try { position=await scrollStreamingComments(page); } catch(error) {
+        if(!isClosedPageError(error)) throw error;
+        this.engageScan=null;
+        if(++pageResets>3) throw new UnsupportedPageError('内赞页面连续关闭，未提交点击；请核对当前浏览器状态');
+        scan=await this.streamingCommentSession(account,link,options);
+        continue;
+      }
+      scan.scrolls++;
+      await waitForStreamingCommentSettle(page);
+      let next;
+      try { next=await readStreamingComments(page); } catch(error) {
+        if(!isClosedPageError(error)) throw error;
+        this.engageScan=null;
+        if(++pageResets>3) throw new UnsupportedPageError('内赞页面连续关闭，未提交点击；请核对当前浏览器状态');
+        scan=await this.streamingCommentSession(account,link,options);
+        continue;
+      }
+      this.rememberEngageCatalog(link,next,scan);
+      const newRows=next.some(row=>!scan.seen.has(row.key) && !excluded.has(row.key) && (options.includeVisibleReplies === true || !row.isReply)
+        && (!options.target || row.id===options.target.id || row.key===options.target.key));
+      if(newRows) {scan.idle=0;continue;}
+      scan.idle=position.bottom && !position.moved && position.height===scan.lastHeight ? scan.idle+1 : 0;
+      scan.lastHeight=position.height;
+      if(scan.idle>=3) {
+        this.log('info', `内赞扫描到达末尾（${Date.now() - scanStartedAt}ms，滚动 ${scan.scrolls} 次）`, { accountId: account.id, url: link });
+        return {state:'skipped',exhausted:true,url:link,reason:'已从上到下扫描至评论区末尾，没有更多符合条件的未赞评论，内赞数量不足'};
+      }
+      if(scan.scrolls>=100)throw new UnsupportedPageError('评论区连续加载达到安全上限，不能确认已经到底；请核对，未把加载失败记作数量不足');
+    }
+    throw new UnsupportedPageError('评论扫描达到安全上限，未继续点击');
+  }
+
+  async engageCommentRows(account,link,{limit=100,assertRunning=()=>{}}={}) {
+    const page=await this.openWeibo(account,link);
+    const card=await this.engagePostCard(page,weiboLinkStatusId(link));
+    if(!card) throw new UnsupportedPageError('无法唯一识别目标微博卡片');
+    const control=await engageControl(page,card.locator('[data-engage-toolbar]').first(),'comment');
+    if(control && !await page.locator('textarea[placeholder*="评论"]').first().isVisible().catch(()=>false)) await control.click();
+    await page.locator('textarea[placeholder*="评论"], [data-commentid], [data-comment-id]').first().waitFor({state:'visible',timeout:8000}).catch(()=>{});
+    const found=new Map(); let stable=0;
+    for(let turn=0;turn<25;turn++) {
+      assertRunning(); await this.engageRestrictions(page,'comment_like');
+      const rows=await this.commentRows(page,weiboLinkStatusId(link),weiboLinkAuthorUid(link));
+      rows.forEach(row=>found.set(String(row.idstr || row.id),row));
+      const marked=await markEngageComments(page,[...found.values()]);
+      if(marked.length>=limit || stable>=3) return {page,rows:[...found.values()],marked};
+      const before=found.size;
+      await page.evaluate(()=>window.scrollBy(0,Math.round(innerHeight*.7)));
+      await page.waitForTimeout(400);
+      const next=await this.commentRows(page,weiboLinkStatusId(link),weiboLinkAuthorUid(link));
+      next.forEach(row=>found.set(String(row.idstr || row.id),row));
+      stable=before===found.size ? stable+1 : 0;
+    }
+    return {page,rows:[...found.values()],marked:await markEngageComments(page,[...found.values()])};
+  }
+
+  async scanComments(account,link,{keyword='',keywords,blacklistKeywords=[],blacklistUids=[],limit=100,assertRunning}={}) {
+    const {page,rows,marked}=await this.engageCommentRows(account,link,{limit,assertRunning});
+    const kw=(Array.isArray(keywords)?keywords:String(keyword||'').split(/[、,，\r\n]+/)).map(normalizeWeiboText).filter(Boolean);
+    const blackUid=new Set(blacklistUids.map(String)); const result=[];
+    for(const row of marked) {
+      const text=normalizeWeiboText(row.text);
+      if(blackUid.has(row.authorUid) || (kw.length && !kw.some(word=>text.includes(word))) || blacklistKeywords.some(word=>text.includes(normalizeWeiboText(word)))) continue;
+      const apiState=commentLikeState(rows,row.id); if(apiState===null || apiState) continue;
+      const button=page.locator('[data-engage-comment-like="'+row.id+'"]');
+      if(await visibleLikeState(button)) continue;
+      result.push({...row,text,liked:false}); if(result.length>=limit)break;
+    }
+    return result;
+  }
+
+  async likeComment(account,link,commentId,options={}) {
+    const page=await this.openWeibo(account,link);
+    const state=commentLikeState(await this.commentRows(page,weiboLinkStatusId(link),weiboLinkAuthorUid(link)),commentId);
+    if(state===null) throw new UnsupportedPageError('目标评论的已赞状态无法确认，未点击');
+    if(state) return {state:'skipped',alreadyDone:true,url:link,reason:'已经点过赞，跳过'};
+    let button=page.locator('[data-engage-comment-like="'+commentId+'"]');
+    if(!await button.count()) {
+      await this.engageCommentRows(account,link,{limit:100});
+      button=page.locator('[data-engage-comment-like="'+commentId+'"]');
+    }
+    if(!await button.count()) throw new UnsupportedPageError('没有识别到目标评论点赞入口，未借用其他评论按钮');
+    return this.engageLikeButton(page,button,'comment_like',link,options);
+  }
+
+  async verifyLike(account,link) {
+    const page=await this.openWeibo(account,link),card=await this.engagePostCard(page,weiboLinkStatusId(link));
+    const button=card && await engageControl(page,card.locator('[data-engage-toolbar]').first(),'like');
+    return button && await visibleLikeState(button) ? {state:'succeeded',url:link} : {state:'uncertain',url:link,reason:'未观察到已赞橙色状态'};
+  }
+
+  async verifyCommentLike(account,link,commentId) {
+    const page=await this.openWeibo(account,link);
+    if (/^(dom:|cid:)/.test(String(commentId || ''))) {
+      await this.streamingCommentSession(account,link);
+      const target=await this.findStreamingComment(page,{id:commentId});
+      if (target?.liked) return {state:'succeeded',url:link,successSource:'page_color',found:true};
+      return {state:'uncertain',url:link,found:Boolean(target),notLiked:Boolean(target),
+        reason:target ? '原评论明确未赞，等待人工验证后补点' : '未找到原评论，不能更换目标' };
+    }
+    let button=page.locator('[data-engage-comment-like="'+commentId+'"]');
+    if(!await button.count()) {await this.engageCommentRows(account,link,{limit:100});button=page.locator('[data-engage-comment-like="'+commentId+'"]');}
+    if(await button.count() && await visibleLikeState(button)) return {state:'succeeded',url:link,found:true};
+    return {state:'uncertain',url:link,found:Boolean(await button.count()),notLiked:Boolean(await button.count()),
+      reason:await button.count() ? '原评论明确未赞，等待人工验证后补点' : '未找到原评论，不能更换目标'};
   }
 
   static describeError(error) {

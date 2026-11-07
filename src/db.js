@@ -3,7 +3,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { config, defaultTaskConfig } from './config.js';
 import { id, json, now } from './util.js';
-import { migrateSharedMaterials, migrateAccountDeletion } from './migrations.js';
+import { migrateSharedMaterials, migrateAccountDeletion, migrateMaterialGroupsV2, migrateMaterialGroupIntegrity } from './migrations.js';
 import { normalizeTaskSettings } from '../public/defaults.js';
 import { displayStateSql, resultMetrics } from './result-state.js';
 
@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS comment_materials (
   id TEXT PRIMARY KEY,
   text TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS repost_materials (
+  id TEXT PRIMARY KEY,
+  text TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  group_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS jobs (
@@ -116,6 +123,8 @@ CREATE TABLE IF NOT EXISTS system_logs (
   account_id TEXT,
   topic_id TEXT,
   url TEXT,
+  job_id TEXT,
+  scope TEXT NOT NULL DEFAULT 'workbench',
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_logs_created ON system_logs(created_at DESC);
@@ -134,6 +143,36 @@ for (const sql of [
   'ALTER TABLE action_logs ADD COLUMN success_source TEXT',
   'ALTER TABLE action_logs ADD COLUMN verification_pending INTEGER NOT NULL DEFAULT 0'
 ]) { try { db.exec(sql); } catch {} }
+try { db.exec('ALTER TABLE action_logs ADD COLUMN link TEXT'); } catch {}
+for (const table of ['jobs', 'action_logs']) {
+  if (!db.prepare('PRAGMA table_info(' + table + ')').all().some(column => column.name === 'scope')) db.exec("ALTER TABLE " + table + " ADD COLUMN scope TEXT NOT NULL DEFAULT 'workbench'");
+}
+for (const [column, definition] of [['job_id', 'TEXT'], ['scope', "TEXT NOT NULL DEFAULT 'workbench'"]]) {
+  if (!db.prepare('PRAGMA table_info(system_logs)').all().some(item => item.name === column)) db.exec(`ALTER TABLE system_logs ADD COLUMN ${column} ${definition}`);
+}
+if (!db.prepare("SELECT 1 FROM settings WHERE key='task_scopes_v1'").get()) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec("UPDATE jobs SET scope='engage' WHERE json_valid(config_json) AND json_extract(config_json,'$.kind')='engage'; UPDATE action_logs SET scope=COALESCE((SELECT scope FROM jobs WHERE jobs.id=action_logs.job_id),'workbench');");
+    db.prepare("INSERT INTO settings(key,value) VALUES('task_scopes_v1','true')").run();
+    db.exec('COMMIT');
+  } catch (error) { db.exec('ROLLBACK'); throw error; }
+}
+db.exec('CREATE INDEX IF NOT EXISTS idx_jobs_scope ON jobs(scope,status,created_at); CREATE INDEX IF NOT EXISTS idx_actions_scope ON action_logs(scope,completed_at,kind,state);');
+db.exec('CREATE INDEX IF NOT EXISTS idx_logs_scope ON system_logs(scope,created_at);');
+if (!db.prepare("SELECT 1 FROM settings WHERE key='system_log_scopes_v1'").get()) {
+  const engageJobs = db.prepare("SELECT id,config_json,created_at,updated_at FROM jobs WHERE scope='engage'").all().map(job => {
+    let config = {};
+    try { config = JSON.parse(job.config_json || '{}'); } catch {}
+    return { ...job, accountIds: new Set(config.accountIds || []) };
+  });
+  const update = db.prepare('UPDATE system_logs SET scope=?,job_id=? WHERE id=?');
+  for (const row of db.prepare("SELECT id,account_id,created_at FROM system_logs WHERE scope='workbench' AND job_id IS NULL").all()) {
+    const candidates = engageJobs.filter(job => job.accountIds.has(row.account_id) && row.created_at >= job.created_at && row.created_at <= job.updated_at);
+    if (candidates.length === 1) update.run('engage', candidates[0].id, row.id);
+  }
+  db.prepare("INSERT INTO settings(key,value) VALUES('system_log_scopes_v1','true')").run();
+}
 
 db.exec(`CREATE TABLE IF NOT EXISTS post_result_repairs (
   id INTEGER PRIMARY KEY AUTOINCREMENT, action_id TEXT NOT NULL, job_id TEXT NOT NULL,
@@ -170,6 +209,30 @@ export function recordAccountRestriction({ accountId, type, kind = '', identity 
 export function listActiveAccountRestrictions(at = now()) {
   return db.prepare('SELECT * FROM account_restrictions WHERE expires_at > ? ORDER BY expires_at, account_id').all(at)
     .map(row => ({ accountId: row.account_id, type: row.type, kind: row.kind || '', identity: row.identity || '', reason: row.reason || '', detectedAt: row.detected_at, expiresAt: row.expires_at, jobId: row.job_id || '' }));
+}
+
+export function clearAccountRestrictions(accountId) {
+  if (!accountId) return 0;
+  return db.prepare('DELETE FROM account_restrictions WHERE account_id=?').run(accountId).changes;
+}
+
+// Manual "clear" must also stop an in-flight job from skipping the account for
+// the rest of its current round. Finished jobs keep their historical cursors.
+export function clearAccountRestrictionsFromOpenJobs({ accountId, identity = '' }) {
+  if (!accountId) return 0;
+  const rows = db.prepare("SELECT id FROM jobs WHERE status IN ('running','waiting','paused')").all();
+  let updated = 0;
+  for (const row of rows) {
+    const job = getJob(row.id);
+    if (!job) continue;
+    const matches = item => item && (item.accountId === accountId || (identity && item.identity === identity));
+    const muteLimits = (job.cursor.muteLimits || []).filter(item => !matches(item));
+    const rateLimits = (job.cursor.rateLimits || []).filter(item => !matches(item));
+    if (muteLimits.length === (job.cursor.muteLimits || []).length && rateLimits.length === (job.cursor.rateLimits || []).length) continue;
+    db.prepare('UPDATE jobs SET cursor_json=?,updated_at=? WHERE id=?').run(JSON.stringify({ ...job.cursor, muteLimits, rateLimits }), now(), job.id);
+    updated += 1;
+  }
+  return updated;
 }
 
 export function seedAccountRestrictionsFromJobs({ at = now(), muteMs = 24 * 60 * 60 * 1000, frequentMs = 60 * 60 * 1000 } = {}) {
@@ -221,6 +284,7 @@ if (JSON.stringify(migratedTemplates) !== JSON.stringify(templates)) setSetting(
 if (getSetting('comment_sequence') == null) setSetting('comment_sequence', 0);
 migrateSharedMaterials(db, config.dataDir);
 migrateAccountDeletion(db, config.dataDir);
+
 if (getSetting('post_sequence') == null) setSetting('post_sequence', 0);
 
 export function listAccounts(enabledOnly = false) {
@@ -346,29 +410,79 @@ export function listPostMaterials() {
 try { db.exec("ALTER TABLE post_materials ADD COLUMN group_id TEXT NOT NULL DEFAULT ''"); } catch {}
 try { db.exec("ALTER TABLE comment_materials ADD COLUMN group_id TEXT NOT NULL DEFAULT ''"); } catch {}
 try { db.exec("ALTER TABLE shared_post_materials ADD COLUMN group_id TEXT NOT NULL DEFAULT ''"); } catch {}
+migrateMaterialGroupsV2(db, config.dataDir);
+migrateMaterialGroupIntegrity(db, config.dataDir);
 
-export function listMaterialGroups() { return getSetting('material_groups', []); }
-export function createMaterialGroup(name) { const groups = listMaterialGroups(); const group = { id: id('mg_'), name: String(name || '').trim().slice(0, 20) }; if (!group.name) throw new Error('请输入分组名称'); groups.push(group); setSetting('material_groups', groups); return group; }
+export const MATERIAL_GROUP_TYPES = ['post', 'comment', 'repost'];
+export const MATERIAL_TABLES = { post: 'shared_post_materials', comment: 'comment_materials', repost: 'repost_materials' };
+
+export function listMaterialGroups(type = null) {
+  const groups = getSetting('material_groups', []);
+  return type ? groups.filter(group => group.type === type) : groups;
+}
+
+export function assertMaterialGroup(type, groupId = '') {
+  if (!MATERIAL_GROUP_TYPES.includes(type)) throw Object.assign(new Error('文案类型不正确'), { statusCode: 400 });
+  if (groupId && !listMaterialGroups(type).some(group => group.id === groupId)) throw Object.assign(new Error('目标分组不存在或不属于当前文案类型'), { statusCode: 400 });
+}
+
+export function createMaterialGroup(name, type = 'post') {
+  assertMaterialGroup(type);
+  const group = { id: id('mg_'), name: String(name || '').trim().slice(0, 20), type };
+  if (!group.name) throw Object.assign(new Error('请输入分组名称'), { statusCode: 400 });
+  db.exec('SAVEPOINT material_group_write');
+  try { const groups = listMaterialGroups(); groups.push(group); setSetting('material_groups', groups); db.exec('RELEASE material_group_write'); }
+  catch (error) { db.exec('ROLLBACK TO material_group_write; RELEASE material_group_write'); throw error; }
+  return group;
+}
+
+export function renameMaterialGroup(groupId, name) {
+  const groups = listMaterialGroups(), group = groups.find(item => item.id === groupId);
+  if (!group) throw Object.assign(new Error('分组不存在'), { statusCode: 404 });
+  const nextName = String(name || '').trim().slice(0, 20);
+  if (!nextName) throw Object.assign(new Error('请输入分组名称'), { statusCode: 400 });
+  group.name = nextName; setSetting('material_groups', groups); return group;
+}
+
 export function deleteMaterialGroup(groupId) {
-  setSetting('material_groups', listMaterialGroups().filter(group => group.id !== groupId));
-  for (const table of ['post_materials', 'comment_materials', 'shared_post_materials']) db.prepare('UPDATE ' + table + " SET group_id='' WHERE group_id=?").run(groupId);
   const clean = list => Array.isArray(list) ? list.filter(idValue => idValue !== groupId) : list;
+  const groups = listMaterialGroups();
+  const target = groups.find(group => group.id === groupId);
+  setSetting('material_groups', groups.filter(group => group.id !== groupId));
+  if (target && MATERIAL_TABLES[target.type]) db.prepare('UPDATE ' + MATERIAL_TABLES[target.type] + " SET group_id='' WHERE group_id=?").run(groupId);
+
+  const engage = getSetting('engage_defaults', {});
+  setSetting('engage_defaults', { ...engage, commentGroupIds: clean(engage.commentGroupIds), repostGroupIds: clean(engage.repostGroupIds) });
   const defaults = getSetting('task_defaults', {});
-  if (Array.isArray(defaults.postGroupIds) || Array.isArray(defaults.commentGroupIds))
-    setSetting('task_defaults', { ...defaults, postGroupIds: clean(defaults.postGroupIds), commentGroupIds: clean(defaults.commentGroupIds) });
+  if (['postGroupIds', 'commentGroupIds', 'repostGroupIds'].some(key => Array.isArray(defaults[key]))) {
+    setSetting('task_defaults', { ...defaults, postGroupIds: clean(defaults.postGroupIds), commentGroupIds: clean(defaults.commentGroupIds), repostGroupIds: clean(defaults.repostGroupIds) });
+  }
   const templates = getSetting('task_templates', []);
-  let changed = false;
   const nextTemplates = templates.map(template => {
     const configValue = template.config || {};
-    if (!Array.isArray(configValue.postGroupIds) && !Array.isArray(configValue.commentGroupIds)) return template;
-    changed = true;
-    return { ...template, config: { ...configValue, postGroupIds: clean(configValue.postGroupIds), commentGroupIds: clean(configValue.commentGroupIds) } };
+    if (!['postGroupIds', 'commentGroupIds', 'repostGroupIds'].some(key => Array.isArray(configValue[key]))) return template;
+    const next = { ...configValue };
+    for (const key of ['postGroupIds', 'commentGroupIds', 'repostGroupIds']) if (Array.isArray(next[key])) next[key] = clean(next[key]);
+    return { ...template, config: next };
   });
-  if (changed) setSetting('task_templates', nextTemplates);
+  setSetting('task_templates', nextTemplates);
+  setSetting('engage_templates', getSetting('engage_templates', []).map(template => ({ ...template, config: {
+    ...template.config, commentGroupIds: clean(template.config?.commentGroupIds), repostGroupIds: clean(template.config?.repostGroupIds)
+  } })));
 }
-export function setMaterialsGroup(type, ids, groupId) { const table = type === 'post' ? 'shared_post_materials' : 'comment_materials'; const update = db.prepare('UPDATE ' + table + ' SET group_id=? WHERE id=?'); db.exec('BEGIN'); try { for (const materialId of ids) update.run(groupId || '', materialId); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; } return type === 'post' ? listPostMaterials() : listCommentMaterials(); }
+
+export function setMaterialsGroup(type, ids, groupId) {
+  assertMaterialGroup(type, groupId);
+  const table = MATERIAL_TABLES[type];
+  const update = db.prepare('UPDATE ' + table + ' SET group_id=? WHERE id=?');
+  db.exec('BEGIN');
+  try { for (const materialId of ids) update.run(groupId || '', materialId); db.exec('COMMIT'); }
+  catch (error) { db.exec('ROLLBACK'); throw error; }
+  return type === 'post' ? listPostMaterials() : type === 'repost' ? listRepostMaterials() : listCommentMaterials();
+}
 
 export function addPostMaterials(accountOrTexts, legacyTexts, groupId = '') {
+  assertMaterialGroup('post', groupId);
   const texts = legacyTexts || accountOrTexts;
   const insert = db.prepare('INSERT OR IGNORE INTO shared_post_materials(id,text,group_id,created_at) VALUES(?,?,?,?)');
   db.exec('BEGIN');
@@ -393,6 +507,7 @@ export function listCommentMaterials() {
 }
 
 export function addCommentMaterials(texts, groupId = '') {
+  assertMaterialGroup('comment', groupId);
   const insert = db.prepare('INSERT INTO comment_materials(id,text,group_id,created_at) VALUES(?,?,?,?)');
   db.exec('BEGIN');
   try {
@@ -411,6 +526,45 @@ export function deleteCommentMaterial(materialId) {
 
 export function deleteCommentMaterials(materialIds) {
   return deleteMany(db.prepare('DELETE FROM comment_materials WHERE id=?'), materialIds);
+}
+
+export function listRepostMaterials() {
+  return db.prepare('SELECT * FROM repost_materials ORDER BY created_at,id').all()
+    .map(row => ({ ...row, enabled: Boolean(row.enabled) }));
+}
+
+export function addRepostMaterials(texts, groupId = '') {
+  assertMaterialGroup('repost', groupId);
+  const insert = db.prepare('INSERT INTO repost_materials(id,text,group_id,created_at) VALUES(?,?,?,?)');
+  db.exec('BEGIN');
+  try {
+    for (const text of texts) {
+      const raw = String(text).trim();
+      if (raw && !db.prepare('SELECT 1 FROM repost_materials WHERE TRIM(text)=?').get(raw)) insert.run(id('repost_'), raw, groupId || '', now());
+    }
+    db.exec('COMMIT');
+  } catch (error) { db.exec('ROLLBACK'); throw error; }
+  return listRepostMaterials();
+}
+
+export function deleteRepostMaterial(materialId) {
+  return db.prepare('DELETE FROM repost_materials WHERE id=?').run(materialId).changes > 0;
+}
+
+export function deleteRepostMaterials(materialIds) {
+  return deleteMany(db.prepare('DELETE FROM repost_materials WHERE id=?'), materialIds);
+}
+
+export function pickRepostMaterial() {
+  const rows = db.prepare('SELECT * FROM repost_materials WHERE enabled=1').all();
+  if (!rows.length) return null;
+  const lastText = getSetting('last_repost_text', '') || rows.find(item => item.id === getSetting('last_repost_material_id', ''))?.text?.trim();
+  const choices = rows.filter(item => item.text.trim() !== lastText);
+  if (!choices.length) throw new Error('没有与上次不同的转发原文，请补充文案');
+  const selected = choices[Math.floor(Math.random() * choices.length)];
+  setSetting('last_repost_material_id', selected.id);
+  setSetting('last_repost_text', selected.text.trim());
+  return selected;
 }
 
 function deleteMany(statement, ids) {
@@ -445,7 +599,7 @@ export function nextCommentSequence() {
 }
 
 export function nextSequence(kind) {
-  const key = kind === 'post' ? 'post_sequence' : 'comment_sequence';
+  const key = kind === 'post' ? 'post_sequence' : kind === 'repost' ? 'repost_sequence' : 'comment_sequence';
   db.exec('BEGIN IMMEDIATE');
   try {
     const next = Number(getSetting(key, 0)) + 1;
@@ -465,6 +619,7 @@ export function createJob(snapshot) {
     jobId, 'running', JSON.stringify(snapshot), JSON.stringify({ stepIndex: 0 }),
     JSON.stringify({ success: 0, failed: 0, uncertain: 0, skipped: 0 }), stamp, stamp
   );
+  db.prepare('UPDATE jobs SET scope=? WHERE id=?').run(snapshot.kind === 'engage' ? 'engage' : 'workbench', jobId);
   return getJob(jobId);
 }
 
@@ -473,13 +628,13 @@ export function getJob(jobId) {
   return row ? normalizeJob(row) : null;
 }
 
-export function getActiveJob() {
-  const row = db.prepare(`SELECT * FROM jobs WHERE status IN ('running','paused','waiting') ORDER BY created_at DESC LIMIT 1`).get();
+export function getActiveJob(scope = null) {
+  const row = scope ? db.prepare("SELECT * FROM jobs WHERE scope=? AND status IN ('running','paused','waiting') ORDER BY created_at DESC,rowid DESC LIMIT 1").get(scope) : db.prepare("SELECT * FROM jobs WHERE status IN ('running','paused','waiting') ORDER BY created_at DESC,rowid DESC LIMIT 1").get();
   return row ? normalizeJob(row) : null;
 }
 
-export function listJobs(limit = 20) {
-  return db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?').all(limit).map(normalizeJob);
+export function listJobs(limit = 20, scope = null) {
+  return (scope ? db.prepare('SELECT * FROM jobs WHERE scope=? ORDER BY created_at DESC,rowid DESC LIMIT ?').all(scope, limit) : db.prepare('SELECT * FROM jobs ORDER BY created_at DESC,rowid DESC LIMIT ?').all(limit)).map(normalizeJob);
 }
 
 function normalizeJob(row) {
@@ -505,9 +660,10 @@ export function updateJob(jobId, patch) {
 export function createActionLog(data) {
   const actionId = id('act_');
   db.prepare(`INSERT INTO action_logs(id,job_id,step_key,kind,account_id,topic_id,target_id,content,state,url,error,sequence_number,sequence_confirmed,receipt_id,receipt_url,started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(actionId, data.jobId, data.stepKey, data.kind, data.accountId, data.topicId, data.targetId || null,
+    .run(actionId, data.jobId, data.stepKey, data.kind, data.accountId, data.topicId && db.prepare('SELECT 1 FROM topics WHERE id=?').get(data.topicId) ? data.topicId : null, data.targetId || null,
       data.content || null, data.state || 'started', data.url || null, data.error || null,
       data.sequenceNumber ?? null, Number(Boolean(data.sequenceConfirmed)), data.receiptId || null, data.receiptUrl || null, now());
+  db.prepare('UPDATE action_logs SET scope=?,link=? WHERE id=?').run(getJob(data.jobId)?.scope || 'workbench', data.link || (String(data.topicId || '').startsWith('https://') ? data.topicId : null), actionId);
   return actionId;
 }
 
@@ -517,7 +673,7 @@ export function updateActionLog(actionId, patch) {
   // An attempt token fences old asynchronous callbacks, including after a
   // user explicitly confirms that an earlier attempt was not published.
   if (patch.attemptId && patch.attemptId !== row.attempt_id) return row;
-  if (['post','comment'].includes(row.kind) && row.state === 'succeeded') {
+  if (['post','comment','repost','like','comment_like'].includes(row.kind) && row.state === 'succeeded') {
     if (patch.state && patch.state !== 'succeeded') return row;
     if (patch.sequenceConfirmed === false) return row;
   }
@@ -535,7 +691,7 @@ export function updateActionLog(actionId, patch) {
 }
 
 export function beginPostAttempt(actionId, attemptId) {
-  db.prepare("UPDATE action_logs SET attempt_id=?,submitted_at=NULL WHERE id=? AND kind IN ('post','comment') AND state IN ('prepared','verification_wait')").run(attemptId, actionId);
+  db.prepare("UPDATE action_logs SET attempt_id=?,submitted_at=NULL WHERE id=? AND kind IN ('post','comment','repost','like','comment_like') AND state IN ('prepared','verification_wait')").run(attemptId, actionId);
   return getActionLog(actionId);
 }
 
@@ -597,26 +753,30 @@ export function recordCheckin(accountId, topicId, localDate, status = 'succeeded
 }
 
 export function log(level, message, extra = {}) {
-  db.prepare('INSERT INTO system_logs(level,message,account_id,topic_id,url,created_at) VALUES(?,?,?,?,?,?)')
-    .run(level, message, extra.accountId || null, extra.topicId || null, extra.url || null, now());
+  const job = extra.jobId ? getJob(extra.jobId) : null;
+  const scope = extra.scope || job?.scope || 'workbench';
+  db.prepare('INSERT INTO system_logs(level,message,account_id,topic_id,url,job_id,scope,created_at) VALUES(?,?,?,?,?,?,?,?)')
+    .run(level, message, extra.accountId || null, extra.topicId || null, extra.url || null, extra.jobId || null, scope, now());
 }
 
-export function listSystemLogs(limit = 200) {
+export function listSystemLogs(limit = 200, scope = null) {
   return db.prepare(`SELECT l.*,a.name account_name,t.name topic_name FROM system_logs l
     LEFT JOIN accounts a ON a.id=l.account_id LEFT JOIN topics t ON t.id=l.topic_id
-    ORDER BY l.created_at DESC LIMIT ?`).all(limit);
+    ${scope ? 'WHERE l.scope=?' : ''} ORDER BY l.created_at DESC LIMIT ?`).all(...(scope ? [scope, limit] : [limit]));
 }
 
-export function listRecordsByShanghaiDate(date, limit = 500) {
-  const logs = db.prepare(`SELECT l.*,a.name account_name,t.name topic_name FROM system_logs l LEFT JOIN accounts a ON a.id=l.account_id LEFT JOIN topics t ON t.id=l.topic_id WHERE strftime('%Y-%m-%d', l.created_at, '+8 hours')=? ORDER BY l.created_at DESC LIMIT ?`).all(date, limit);
-  const actions = db.prepare(`SELECT l.*,${displayStateSql(db)} display_state,a.name account_name,t.name topic_name FROM action_logs l LEFT JOIN accounts a ON a.id=l.account_id LEFT JOIN topics t ON t.id=l.topic_id WHERE strftime('%Y-%m-%d', l.started_at, '+8 hours')=? ORDER BY l.started_at DESC LIMIT ?`).all(date, limit);
-  const jobs = db.prepare(`SELECT * FROM jobs WHERE strftime('%Y-%m-%d', created_at, '+8 hours')=? ORDER BY created_at DESC LIMIT ?`).all(date, limit).map(normalizeJob);
+export function listRecordsByShanghaiDate(date, limit = 500, scope = null) {
+  const scopeClause = scope ? ' AND l.scope=?' : '';
+  const args = scope ? [date, scope, limit] : [date, limit];
+  const logs = db.prepare(`SELECT l.*,a.name account_name,t.name topic_name FROM system_logs l LEFT JOIN accounts a ON a.id=l.account_id LEFT JOIN topics t ON t.id=l.topic_id WHERE strftime('%Y-%m-%d', l.created_at, '+8 hours')=?${scopeClause} ORDER BY l.created_at DESC LIMIT ?`).all(...args);
+  const actions = db.prepare(`SELECT l.*,${displayStateSql(db)} display_state,a.name account_name,t.name topic_name FROM action_logs l LEFT JOIN accounts a ON a.id=l.account_id LEFT JOIN topics t ON t.id=l.topic_id WHERE strftime('%Y-%m-%d', l.started_at, '+8 hours')=?${scope ? ' AND l.scope=?' : ''} ORDER BY l.started_at DESC LIMIT ?`).all(...args);
+  const jobs = db.prepare(`SELECT * FROM jobs WHERE strftime('%Y-%m-%d', created_at, '+8 hours')=?${scope ? ' AND scope=?' : ''} ORDER BY created_at DESC LIMIT ?`).all(...args).map(normalizeJob);
   return { logs, actions, jobs };
 }
 
 // 全天按任务聚合，绕开 listRecordsByShanghaiDate 的 500 条窗口。
-export function countActionsByJob(date) {
-  const rows = db.prepare(`SELECT l.job_id,${displayStateSql(db)} state,COUNT(*) total FROM action_logs l WHERE strftime('%Y-%m-%d',l.started_at,'+8 hours')=? GROUP BY l.job_id,(${displayStateSql(db)})`).all(date);
+export function countActionsByJob(date, scope = null) {
+  const rows = db.prepare(`SELECT l.job_id,${displayStateSql(db)} state,COUNT(*) total FROM action_logs l WHERE strftime('%Y-%m-%d',l.started_at,'+8 hours')=?${scope ? ' AND l.scope=?' : ''} GROUP BY l.job_id,(${displayStateSql(db)})`).all(...(scope ? [date, scope] : [date]));
   const map = {};
   for (const row of rows) {
     const bucket = map[row.job_id] || (map[row.job_id] = { succeeded: 0, failed: 0, uncertain: 0, skipped: 0 });
@@ -626,9 +786,11 @@ export function countActionsByJob(date) {
 }
 
 export function clearAllDataForTests() {
-  db.exec('DELETE FROM action_logs; DELETE FROM jobs; DELETE FROM checkins; DELETE FROM comment_history; DELETE FROM post_materials; DELETE FROM shared_post_materials; DELETE FROM comment_materials; DELETE FROM topics; DELETE FROM accounts; DELETE FROM account_restrictions; DELETE FROM system_logs;');
+  db.exec('DELETE FROM action_logs; DELETE FROM jobs; DELETE FROM checkins; DELETE FROM comment_history; DELETE FROM post_materials; DELETE FROM shared_post_materials; DELETE FROM comment_materials; DELETE FROM repost_materials; DELETE FROM topics; DELETE FROM accounts; DELETE FROM account_restrictions; DELETE FROM system_logs;');
   setSetting('last_comment_material_id', '');
   setSetting('comment_sequence', 0);
   setSetting('post_sequence', 0);
   setSetting('last_comment_text', '');
+  setSetting('last_repost_material_id', '');
+  setSetting('last_repost_text', '');
 }

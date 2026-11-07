@@ -188,7 +188,7 @@ export class NavigationRecovery {
       const networkWaiting = job.cursor.networkRecovery?.state === 'offline';
       const updated = this.save(jobId, { ...recovery, state: 'recovered', successes: 2, nextCheckAt: null, restoredAt: new Date(this.runner.now()).toISOString() },
         { status: networkWaiting ? 'paused' : waiting ? 'waiting' : 'running', waitReason: networkWaiting ? '等待网络恢复' : waiting ? '等待人工验证及补做' : null });
-      log('info', '故障页面连续两次只读检查通过，恢复原任务步骤');
+      log('info', '故障页面连续两次只读检查通过，恢复原任务步骤', { jobId });
       if (networkWaiting) this.runner.network.arm(jobId);
       else if (!waiting) void this.runner.run(updated.id);
     } catch {

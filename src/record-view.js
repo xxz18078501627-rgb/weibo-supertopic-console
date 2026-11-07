@@ -16,7 +16,7 @@ export function problemType(message = '', state = '') {
   return '异常';
 }
 
-const KINDS = ['checkin', 'post', 'comment'];
+const KINDS = ['checkin', 'post', 'comment', 'repost', 'like', 'comment_like'];
 const counts = () => Object.fromEntries(KINDS.map(kind => [kind, { succeeded: 0, failed: 0, uncertain: 0, skipped: 0 }]));
 const stamp = row => row.completed_at || row.created_at || row.started_at || '';
 const matchesLevel = (row, level) => level === 'all' || row.level === level;
@@ -60,8 +60,8 @@ function clusterIssues(events) {
   return clusters;
 }
 
-export function recordView(date, { query = '', abnormalOnly = false, identity = '', offset = 0, limit = 20, level = 'all', flow = false, cursor = '', snapshot = '' } = {}) {
-  const jobs = db.prepare('SELECT id,config_json,cursor_json,created_at FROM jobs ORDER BY created_at DESC').all();
+export function recordView(date, { query = '', abnormalOnly = false, identity = '', offset = 0, limit = 20, level = 'all', flow = false, cursor = '', snapshot = '', scope = 'workbench' } = {}) {
+  const jobs = db.prepare('SELECT id,config_json,cursor_json,created_at FROM jobs WHERE scope=? ORDER BY created_at DESC').all(scope);
   const jobMap = new Map();
   const identityIndex = new Map();
   for (const job of jobs) {
@@ -99,7 +99,7 @@ export function recordView(date, { query = '', abnormalOnly = false, identity = 
     issueEvents.push({ identity: account?.identity || '', name: account?.name || '系统', uid: account?.uid || '', type, kind: kind || '', at: stamp(row), source, account });
   };
 
-  const actions = db.prepare(`SELECT l.*,${displayStateSql(db)} display_state,t.name topic_name FROM action_logs l LEFT JOIN topics t ON t.id=l.topic_id WHERE strftime('%Y-%m-%d',l.started_at,'+8 hours')=? ORDER BY l.started_at DESC,l.id DESC`).all(date);
+  const actions = db.prepare(`SELECT l.*,${displayStateSql(db)} display_state,t.name topic_name FROM action_logs l LEFT JOIN topics t ON t.id=l.topic_id WHERE strftime('%Y-%m-%d',l.started_at,'+8 hours')=? AND l.scope=? ORDER BY l.started_at DESC,l.id DESC`).all(date, scope);
   const entries = [];
   for (const action of actions) {
     const account = ensure(action.account_id, action.job_id);
@@ -116,7 +116,7 @@ export function recordView(date, { query = '', abnormalOnly = false, identity = 
     if (['failed', 'uncertain', 'submitted', 'verification_wait'].includes(action.state) || (action.state === 'skipped' && /禁言|频繁/.test(action.error || ''))) addIssue(account, row.type, action.kind, row, 'action');
   }
 
-  const logs = db.prepare("SELECT l.*,t.name topic_name FROM system_logs l LEFT JOIN topics t ON t.id=l.topic_id WHERE strftime('%Y-%m-%d',l.created_at,'+8 hours')=? ORDER BY l.created_at DESC,l.id DESC").all(date);
+  const logs = db.prepare("SELECT l.*,t.name topic_name FROM system_logs l LEFT JOIN topics t ON t.id=l.topic_id WHERE strftime('%Y-%m-%d',l.created_at,'+8 hours')=? AND l.scope=? ORDER BY l.created_at DESC,l.id DESC").all(date, scope);
   const recoveredAt = logs.find(row => /网络已恢复/.test(row.message))?.created_at || '';
   for (const log of logs) {
     const account = ensure(log.account_id);
@@ -131,7 +131,7 @@ export function recordView(date, { query = '', abnormalOnly = false, identity = 
     if (['warning', 'error'].includes(log.level) && !diagnostic && !(type === '网络异常' && log.created_at <= recoveredAt)) addIssue(account, type, kind, row, 'system');
   }
 
-  const cards = db.prepare("SELECT * FROM verification_cards WHERE strftime('%Y-%m-%d',triggered_at,'+8 hours')=? OR strftime('%Y-%m-%d',updated_at,'+8 hours')=?").all(date, date);
+  const cards = db.prepare("SELECT c.* FROM verification_cards c JOIN jobs j ON j.id=c.job_id WHERE j.scope=? AND (strftime('%Y-%m-%d',c.triggered_at,'+8 hours')=? OR strftime('%Y-%m-%d',c.updated_at,'+8 hours')=?)").all(scope, date, date);
   for (const card of cards) {
     if (card.status === 'resolved') continue;
     const account = ensure(card.account_id, card.job_id);
@@ -215,7 +215,7 @@ export function recordView(date, { query = '', abnormalOnly = false, identity = 
       })),
     counts: perKind,
     abnormalCount: [...accounts.values()].filter(a => a.tags.length).length,
-    jobCounts: countActionsByJob(date),
+    jobCounts: countActionsByJob(date, scope),
     details: page,
     detailTotal: total,
     nextCursor,

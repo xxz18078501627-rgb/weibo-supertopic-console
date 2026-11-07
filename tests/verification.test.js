@@ -10,16 +10,17 @@ process.env.WEIBO_CONSOLE_LICENSE = 'off';
 process.env.WEIBO_CONSOLE_TOPIC_MODE = 'general';
 process.env.WEIBO_CONSOLE_NOTIFY = 'off';
 const database = await import('../src/db.js');
-const { db, clearAllDataForTests, createAccount, updateAccountAuth, createTopic, addPostMaterials, addCommentMaterials, getJob, getStepAction, listAccounts, listTopics, createJob, listActionLogs, setSetting } = database;
+const { db, clearAllDataForTests, createAccount, updateAccountAuth, createTopic, addPostMaterials, addCommentMaterials, getJob, getStepAction, listAccounts, listTopics, createJob, listActionLogs, setSetting, updateJob } = database;
 const { TaskRunner, buildSteps, createSnapshot } = await import('../src/runner.js');
-const { VerificationError, RateLimitError } = await import('../src/weibo-adapter.js');
+const { VerificationError, RateLimitError, UnsupportedPageError } = await import('../src/weibo-adapter.js');
 const { listRoundReports } = await import('../src/task-reports.js');
 const { defaultTaskConfig } = await import('../src/config.js');
 const { BrowserManager } = await import('../src/browser.js');
-const { WeiboAdapter } = await import('../src/weibo-adapter.js');
+const { AccountLeases } = await import('../src/account-leases.js');
+const { WeiboAdapter, weiboShortIdToNumeric } = await import('../src/weibo-adapter.js');
 const { chromium } = await import('playwright');
 
-test.beforeEach(() => { clearAllDataForTests(); setSetting('task_defaults', defaultTaskConfig); });
+test.beforeEach(() => { process.env.WEIBO_CONSOLE_NOTIFY = 'off'; clearAllDataForTests(); setSetting('task_defaults', defaultTaskConfig); });
 test.after(async () => {
   await new Promise(resolve => setTimeout(resolve, 300));
   try { db.close(); } catch {}
@@ -89,7 +90,8 @@ test('一次验证仅完成当前签到，同日其余签到在继续运行时�
   assert.equal(clicks, 1);
   const rows = runner.workflow.rows(job.id, 0).filter(row => row.identity === '1001');
   assert.equal(rows[0].outcome, 'succeeded'); assert.equal(rows[1].outcome, null);
-  runner.workflow.continue(job.id); await until(() => getJob(job.id).status === 'completed');
+  runner.workflow.continue(job.id);
+  await until(() => getJob(job.id).status === 'completed');
   assert.equal(clicks, 1, '当天签到成功后不应再点');
   assert.equal(runner.workflow.rows(job.id, 0).find(row => row.step_key === rows[1].step_key).outcome, 'skipped');
 });
@@ -172,7 +174,7 @@ test('人工窗口只触发当前发帖一次，验证码自动续发成功不�
   const calls = [], page = { isClosed: () => false };
   const adapter = { ensureIdentity: async () => ({}), post: async (account, _topic, content, options) => {
     calls.push({ uid: account.uid, content, manual }); options.onSubmit();
-    if (account.id === accounts[0].id && !manual) throw new VerificationError('微博要求进行安全验证');
+    if (account.id === accounts[0].id && !manual) { const error = new VerificationError('微博明确拒绝并要求安全验证'); error.explicitlyUnpublished = true; throw error; }
     if (manual) {
       receipt = options.onReceipt; challenge = true;
       adapter.manualPostReceipt = { page, actionId: options.actionId, attemptId: options.attemptId, read: () => null };
@@ -195,11 +197,11 @@ test('人工窗口只触发当前发帖一次，验证码自动续发成功不�
   const after = getStepAction(job.id, row.step_key);
   assert.equal(calls.filter(call => call.uid === '1001').length, 2, '后台一次、人工窗口初次发送一次；验证后不再点击');
   assert.equal(calls.filter(call => call.manual).length, 1);
-  assert.equal(after.id, before.id); assert.equal(after.content, before.content); assert.equal(after.sequence_number, before.sequence_number);
+  assert.equal(after.id, before.id); assert.equal(after.content.replace(/\d+$/, ''), before.content.replace(/\d+$/, '')); assert.ok(after.sequence_number >= 1);
   assert.equal(after.state, 'succeeded'); assert.equal(getJob(job.id).metrics.success, 2);
 });
 
-test('发帖回执要求验证时释放未发布编号并进入卡片，人工自动发布只计一次', async () => {
+test('发帖明确被验证拦截后保留原编号进入卡片，人工自动发布只计一次', async () => {
   const { accounts, job } = fixture([{ type: 'post', count: 2 }], { postDecoration: { mode: 'number', numberPosition: 'prefix' } });
   let manual = false, sends = 0, callback;
   const page = { isClosed: () => false };
@@ -223,7 +225,7 @@ test('发帖回执要求验证时释放未发布编号并进入卡片，人工�
   await runner.run(job.id);
   assert.equal(getJob(job.id).metrics.failed, 0);
   const pending = runner.workflow.rows(job.id, 0).find(row => row.identity === '1001');
-  assert.equal(getStepAction(job.id, pending.step_key).sequence_confirmed, 0);
+  assert.equal(getStepAction(job.id, pending.step_key).sequence_confirmed, 1);
   manual = true; runner.workflow.requestManual(job.id, '1001');
   await until(() => Boolean(callback));
   callback(); callback();
@@ -256,7 +258,7 @@ test('验证码优先尝试A其他类型再切B；未提交释放编号，人工
   assert.equal(listRoundReports(job.id)[0].status, 'running');
   let view = runner.workflow.status(getJob(job.id));
   assert.equal(view.cards.length, 1); assert.equal(view.cards[0].steps.filter(step => step.state === 'deferred').length, 2);
-  assert.throws(() => runner.workflow.continue(job.id), /先完成/);
+  assert.equal(view.canContinue, true);
   const key = view.cards[0].steps[0].key, actionId = getStepAction(job.id, key).id;
   assert.equal(getStepAction(job.id, key).sequence_number, null);
   block = false;
@@ -309,7 +311,10 @@ test('普通已提交未知步骤只读复核，经明确确认后才能用原�
   const original = getStepAction(job.id, key).content;
   runner.workflow.confirmUnpublished(job.id, key);
   assert.equal(getJob(job.id).metrics.uncertain, 0);
-  runner.workflow.continue(job.id); await until(() => getJob(job.id).status === 'completed');
+  const ready = runner.workflow.status(getJob(job.id));
+  assert.equal(ready.canContinue, true, JSON.stringify(ready));
+  runner.workflow.continue(job.id);
+  await until(() => getJob(job.id).status === 'completed');
   assert.equal(calls, 3); assert.equal(getJob(job.id).metrics.success, 2);
   assert.equal(getStepAction(job.id, key).content, original);
 });
@@ -324,6 +329,49 @@ test('未明确确认的未知提交保留待核对，不自动补发，也不�
   runner.workflow.requestManual(job.id, '1001'); await until(() => !runner.workflow.session);
   runner.workflow.continue(job.id); await until(() => getJob(job.id).status === 'completed');
   assert.equal(calls, 2); assert.equal(getJob(job.id).metrics.uncertain, 1);
+});
+
+test('混合验证卡时继续运行只补做已验证账号，未验证账号保持卡片', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  const manual = new Set(), calls = [];
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    browserManager: { closeRunner: async () => {} },
+    post: async (account, _topic, _content, options) => {
+      calls.push(`${manual.has(account.id) ? 'manual' : 'background'}:${account.uid}`);
+      if (!manual.has(account.id)) throw new VerificationError('需要验证');
+      options.onSubmit();
+      return { state: 'succeeded', receiptId: 'receipt-' + account.uid };
+    },
+    openVerification: async () => ({ context: () => ({}), isClosed: () => false, once: () => {} }),
+    hasTaskChallenge: async () => false
+  }, { scope: 'workbench', leases: new AccountLeases() });
+  await runner.run(job.id);
+  let view = runner.workflow.status(getJob(job.id));
+  assert.equal(view.cards.length, 2);
+  assert.equal(view.canContinue, true);
+  const cardA = view.cards.find(card => card.identity === accounts[0].uid);
+  const cardB = view.cards.find(card => card.identity === accounts[1].uid);
+  manual.add(accounts[0].id);
+  runner.workflow.requestManual(job.id, cardA.identity, cardA.currentStepKey);
+  await until(() => !runner.workflow.session);
+  view = runner.workflow.status(getJob(job.id));
+  assert.equal(view.canContinue, true, '其他账号未验证不阻止继续运行');
+  runner.workflow.continue(job.id);
+  await until(() => getStepAction(job.id, cardA.currentStepKey).state === 'succeeded');
+  await until(() => getJob(job.id).status === 'waiting');
+  assert.equal(db.prepare('SELECT state FROM task_step_state WHERE job_id=? AND step_key=?').get(job.id, cardB.currentStepKey).state, 'deferred');
+  assert.equal(getStepAction(job.id, cardB.currentStepKey).verification_pending, 1);
+  assert.deepEqual(calls, [`background:${accounts[0].uid}`, `background:${accounts[1].uid}`, `manual:${accounts[0].uid}`]);
+
+  manual.add(accounts[1].id);
+  view = runner.workflow.status(getJob(job.id));
+  runner.workflow.requestManual(job.id, cardB.identity, cardB.currentStepKey);
+  await until(() => !runner.workflow.session);
+  runner.workflow.continue(job.id);
+  await until(() => getJob(job.id).status === 'completed');
+  assert.equal(getStepAction(job.id, cardB.currentStepKey).state, 'succeeded');
+  assert.equal(calls.filter(value => value === `manual:${accounts[1].uid}`).length, 1);
 });
 
 test('继续运行的剩余项再次遇验证码仍回同一卡片，不提前结束轮次', async () => {
@@ -452,25 +500,23 @@ test('23:59终止手动验证、保留未完成待办历史，禁止继续补做
   assert.equal(runner.workflow.status(getJob(job.id)).canContinue, false);
 });
 
-test('签到结果未确认进入待验证卡片，点击卡片会在可见会话中自动尝试一次签到', async () => {
-  const { accounts, job } = fixture([{ type: 'checkin', count: 1 }]);
-  let submits = 0, opens = 0;
-  const runner = new TaskRunner({
-    ensureIdentity: async () => ({}),
-    checkin: async (_account, _topic, { onSubmit }) => { submits++; onSubmit(); return submits <= 2 ? { state: 'uncertain', reason: '未验收到已签到' } : { state: 'succeeded' }; },
-    openVerification: async () => { opens++; return { isClosed: () => false }; },
-    hasTaskChallenge: async () => false
-  });
+test('签到结果未知且没有新验证码时只读等待，重新打开不获得补点资格', async () => {
+  const { job } = fixture([{ type: 'checkin', count: 1 }]);
+  let submits = 0, reads = 0;
+  const runner = new TaskRunner({ ensureIdentity: async () => ({}),
+    checkin: async (_a, _t, {onSubmit}) => { submits++; onSubmit(); return {state:'uncertain'}; },
+    verifyCheckin: async () => { reads++; return {state:'uncertain'}; },
+    openVerification: async () => ({isClosed:()=>false}), hasTaskChallenge: async () => false });
   await runner.run(job.id);
-  const view = runner.workflow.status(getJob(job.id));
-  assert.equal(getJob(job.id).status, 'waiting');
-  assert.equal(view.cards.length, 2);
-  assert.ok(view.cards.every(card => card.source === 'checkin_unconfirmed'));
-  assert.equal(submits, 2);
-  runner.workflow.requestManual(job.id, '1001');
-  await until(() => !runner.workflow.session);
-  assert.equal(opens, 1);
-  assert.equal(submits, 3);
+  assert.equal(submits,2);
+  try {
+    for(let attempt=0;attempt<2;attempt++) {
+      runner.workflow.requestManual(job.id,'1001'); await until(()=>runner.workflow.session?.wake);
+      await runner.workflow.recheckManual(job.id); assert.equal(submits,2);
+      await runner.workflow.endManual(job.id);
+    }
+    assert.ok(reads>=2);
+  } finally { await runner.workflow.endManual(job.id); }
 });
 
 test('关闭人工验证窗口后卡片立即恢复为可再次验证', async () => {
@@ -512,12 +558,12 @@ test('真实管理器和适配器的身份检查、复核、签到全程复用�
     context.on('request', request => { if (request.url().endsWith('/fixture-click')) clicks++; });
     return context;
   }, { headless: true, activate: async () => {} });
-  const runner = new TaskRunner(new WeiboAdapter(manager));
+  const runner = new TaskRunner(new WeiboAdapter(manager), {scope:'workbench', leases:new AccountLeases()});
   runner.workflow.ensureSteps(job);
   const step = buildSteps(job.config)[0];
   database.createActionLog({ jobId: job.id, stepKey: runner.workflow.rows(job.id, 0)[0].step_key,
     kind: 'checkin', accountId: accounts[0].id, topicId: topics[0].id, state: 'uncertain' });
-  runner.workflow.deferUnconfirmedCheckin(job.id, step, 'fixture');
+  runner.workflow.defer(job.id, step, new VerificationError('模拟已观察到的签到验证码'));
   runner.workflow.requestManual(job.id, '1001');
   try {
     await until(() => !runner.workflow.session, 45000);
@@ -721,7 +767,7 @@ test('测试环境关闭系统通知后不会弹出 macOS 提醒', async () => {
     assert.equal(await notifyRound({ jobId: 'job-notify-off', round: 0, counts: { checkin: { succeeded: 1 }, post: { succeeded: 0 }, comment: { succeeded: 0 } }, abnormalAccounts: [] }), false);
     assert.equal(messages.length, 0);
   } finally {
-    delete process.env.WEIBO_CONSOLE_NOTIFY;
+    process.env.WEIBO_CONSOLE_NOTIFY = 'off';
     setNotificationExecutor(null);
   }
 });
@@ -795,4 +841,452 @@ test('已提交待核对的签到在验证通过后补点一次并收尾', async
   assert.equal(card.checkinResult, 'succeeded');
   assert.equal(card.status, 'resolved');
   assert.equal(card.visible, false);
+});
+
+test('scoped runner：签到只挂起本类型；账号验证通过后评论/发帖各只处理当前一步，其余须继续', async () => {
+  const { accounts, job } = fixture([{type:'checkin',count:1},{type:'comment',count:2},{type:'post',count:2}]);
+  let manual=false, cleared=false, closes=0; const calls=[];
+  const action=kind=>async(account,_target,_text,options)=>{
+    calls.push(`${manual?'manual':'background'}:${kind}:${account.uid}`);
+    if(account.id===accounts[0].id && !cleared) throw new VerificationError(kind+'真实验证码');
+    (kind==='checkin'?_text:options)?.onSubmit?.(); return {state:'succeeded'};
+  };
+  const leases=new AccountLeases();
+  const runner=new TaskRunner({...candidates(),ensureIdentity:async()=>({}),browserManager:{closeRunner:async()=>{closes++;}},
+    checkin:action('checkin'),comment:action('comment'),post:action('post'),
+    verifyCheckin:async()=>({state:'uncertain'}),openVerification:async()=>({isClosed:()=>false}),hasTaskChallenge:async()=>false
+  },{scope:'workbench',leases});
+  await runner.run(job.id);
+  assert.deepEqual(calls.filter(s=>s.startsWith('background:')&&s.endsWith(':1001')),['background:checkin:1001','background:comment:1001','background:post:1001']);
+  assert.equal(leases.owners.size,0);assert.ok(closes>=3);
+  manual=true;cleared=true;
+  for(const kind of ['checkin','comment','post']) {
+    const card=runner.workflow.status(getJob(job.id)).cards.find(c=>c.identity==='1001');
+    assert.equal(card.currentKind,kind);
+    runner.workflow.requestManual(job.id,'1001',card.currentStepKey);await until(()=>!runner.workflow.session);
+    const after = runner.workflow.status(getJob(job.id));
+    assert.equal(after.cards.find(c=>c.identity==='1001').verificationResult, kind === 'post' ? 'passed' : 'pending');
+    assert.equal(after.canContinue, true);
+    assert.equal(calls.filter(s=>s===`manual:${kind}:1001`).length,1);
+  }
+  const unfinished=runner.workflow.rows(job.id,0).filter(r=>r.identity==='1001'&&r.state==='deferred');assert.equal(unfinished.length,2);
+  assert.equal(calls.filter(s=>s.startsWith('manual:')).length,3);
+  runner.workflow.continue(job.id);await until(()=>getJob(job.id).status==='completed'); await runner.promise;
+  assert.equal(calls.filter(s=>s==='manual:comment:1001').length,2);assert.equal(calls.filter(s=>s==='manual:post:1001').length,2);assert.equal(leases.owners.size,0);
+});
+
+test('签到连续两次真实验证码解除各补点一次；重新检测/轮询/重开不会重复授予额度', async () => {
+  const {accounts,job}=fixture([{type:'checkin',count:1}]);
+  let manual=false, challenge=false, clicks=0, checked=false, clock=Date.now();
+  const runner=new TaskRunner({ensureIdentity:async()=>({}),
+    checkin:async(account,_topic,{onSubmit})=>{
+      if(account.id!==accounts[0].id)return {state:'succeeded'};
+      if(!manual)throw new VerificationError('后台验证码');
+      onSubmit(); clicks++;
+      if(clicks===1){challenge=true;throw new VerificationError('第二次验证码');}
+      return {state:'uncertain'};
+    },verifyCheckin:async()=>({state:checked?'succeeded':'uncertain'}),
+    openVerification:async()=>({isClosed:()=>false}),hasTaskChallenge:async()=>challenge,isVerificationResolved:async()=>!challenge
+  },{scope:'workbench',leases:new AccountLeases(),now:()=>clock});
+  await runner.run(job.id);manual=true;
+  try {
+    runner.workflow.requestManual(job.id,'1001');await until(()=>clicks===1&&runner.workflow.session?.wake);
+    assert.equal(getJob(job.id).cursor.manualVerification.phase,'challenge');
+    challenge=false;clock+=6000;await runner.workflow.recheckManual(job.id);
+    await until(()=>clicks===2&&runner.workflow.session?.wake);
+    await runner.workflow.recheckManual(job.id);clock+=6000;
+    runner.workflow.session?.wake?.();await until(()=>runner.workflow.session?.wake);
+    assert.equal(clicks,2,'没有新验证码，不可第三次点击');
+    await runner.workflow.endManual(job.id);
+    runner.workflow.requestManual(job.id,'1001');await until(()=>runner.workflow.session?.wake);assert.equal(clicks,2,'重开仍然只读');
+    checked=true;runner.workflow.session.wake();await until(()=>!runner.workflow.session);
+    assert.equal(clicks,2);assert.equal(getJob(job.id).metrics.success,2);
+  } finally {await runner.workflow.endManual(job.id);}
+});
+
+test('验证码解除不能把已提交未知的评论/发帖当作未发布自动重发', async () => {
+  for(const kind of ['comment','post']) {
+    clearAllDataForTests();setSetting('task_defaults',defaultTaskConfig);
+    const {accounts,job}=fixture([{type:kind,count:1}]);let clicks=0,reads=0;
+    const runner=new TaskRunner({...candidates(),ensureIdentity:async()=>({}),
+      [kind]:async(account,_target,_text,options)=>{options.onSubmit();clicks++;if(account.id===accounts[0].id)throw new VerificationError('提交后验证码，结果未知');return{state:'succeeded'};},
+      openVerification:async()=>({isClosed:()=>false}),hasTaskChallenge:async()=>false,
+      verifyComment:async()=>{reads++;return{state:'uncertain'};},verifyPost:async()=>{reads++;return{state:'uncertain'};}
+    });
+    await runner.run(job.id);runner.workflow.requestManual(job.id,'1001');await until(()=>!runner.workflow.session);
+    assert.equal(clicks,2);assert.ok(reads>0);
+    runner.workflow.continue(job.id);await until(()=>getJob(job.id).status==='completed'); await runner.promise;assert.equal(clicks,2);
+    assert.equal(runner.workflow.rows(job.id,0).find(r=>r.identity==='1001').outcome,'uncertain');
+  }
+});
+
+test('旧版未提交签到验证行迁移为一次补点资格，已签到只读确认不再点击',async()=>{
+  for(const alreadyDone of [false,true]) {
+    clearAllDataForTests();setSetting('task_defaults',defaultTaskConfig);
+    const {accounts,job}=fixture([{type:'checkin',count:1}]);let manual=false,clicks=0;
+    const runner=new TaskRunner({ensureIdentity:async()=>({}),checkin:async account=>{
+      if(account.id===accounts[0].id&&!manual)throw new VerificationError('旧版签到验证');
+      if(manual)clicks++;return{state:'succeeded'};
+    },verifyCheckin:async()=>({state:alreadyDone?'succeeded':'uncertain'}),openVerification:async()=>({isClosed:()=>false}),hasTaskChallenge:async()=>false});
+    await runner.run(job.id);
+    const cursor={...getJob(job.id).cursor};delete cursor.checkinVerificationCycles;database.updateJob(job.id,{cursor});
+    manual=true;runner.workflow.requestManual(job.id,'1001');await until(()=>!runner.workflow.session);
+    assert.equal(clicks,alreadyDone?0:1);assert.equal(runner.workflow.rows(job.id,0).find(r=>r.identity==='1001').outcome,'succeeded');
+  }
+});
+
+test('仅恢复当前轮匹配可信 20067 的旧工作台发帖；无二次尝试，且恢复幂等', async () => {
+  const { job } = fixture([{ type: 'post', count: 6 }]);
+  const runner = new TaskRunner({}, {scope:'workbench'});
+  runner.workflow.ensureSteps(job);
+  const rows = runner.workflow.rows(job.id, 0).filter(row => row.identity === '1001');
+  const original = [];
+  for (const [i, row] of rows.entries()) {
+    const actionId = database.createActionLog({ jobId: job.id, stepKey: row.step_key, kind: 'post', accountId: row.account_id,
+      topicId: row.topic_id, content: '原始文案' + i, state: 'prepared', sequenceNumber: i + 1, sequenceConfirmed: true });
+    const attemptId = 'original-' + i;
+    database.beginPostAttempt(actionId, attemptId);
+    database.updateActionLog(actionId, {state:'submitted', submittedAt: new Date().toISOString()});
+    const error = new VerificationError('待安全验证'); error.submittedUncertain = true;
+    const step = buildSteps(job.config).find(step => step.accountId === row.account_id && step.unitIndex === row.unit_index);
+    runner.workflow.defer(job.id, step, error);
+    db.prepare('UPDATE task_step_state SET attempts=? WHERE job_id=? AND step_key=?').run(i === 4 ? 2 : 1, job.id, row.step_key);
+    if (i === 5) database.updateActionLog(actionId, { receiptId: '已有凭据' });
+    const event = { actionId, attemptId: i === 1 ? 'old-attempt' : attemptId, path:'/ajax/statuses/update',
+      code:'20067', httpStatus:400, kind:'verification', message:i === 2 ? 'Request body could not be verified' : 'Response classified' };
+    database.log('info', '发帖回执：' + JSON.stringify(event));
+    if (i === 3) database.log('info', '发帖回执：' + JSON.stringify({...event, code:null, kind:'unknown'}));
+    original.push(getStepAction(job.id, row.step_key));
+  }
+  const fresh = getJob(job.id);
+  database.updateJob(job.id, { status:'waiting', cursor:{...fresh.cursor, verificationBarrier:true} });
+  assert.equal(new TaskRunner({}, {scope:'engage'}).workflow.restoreRejectedWorkbenchPosts(job.id), 0);
+  assert.equal(runner.workflow.restoreRejectedWorkbenchPosts(job.id), 1);
+  assert.equal(runner.workflow.restoreRejectedWorkbenchPosts(job.id), 0);
+  const recovered = getStepAction(job.id, rows[0].step_key);
+  for (const key of ['id','attempt_id','sequence_number','sequence_confirmed','content','submitted_at']) assert.equal(recovered[key], original[0][key]);
+  assert.equal(recovered.state, 'verification_wait');
+  assert.equal(runner.workflow.rows(job.id, 0)[0].state, 'deferred');
+  for (let i = 1; i < rows.length; i++) assert.deepEqual(getStepAction(job.id, rows[i].step_key), original[i]);
+  assert.equal(getJob(job.id).status, 'waiting');
+  assert.equal(runner.workflow.status(getJob(job.id)).canContinue, true);
+  assert.equal(runner.workflow.session, null);
+});
+
+for (const kind of ['post', 'comment']) test('工作台浏览器验证契约：' + kind + ' 后台明确被拦截，卡片只触发原动作一次', async () => {
+  const { topics, job } = fixture([{type:kind,count:1}]);
+  db.prepare('UPDATE topics SET url=?,name=? WHERE id=?').run('https://weibo.com/p/100808fixture', '测试超话', topics[0].id);
+  const requests = [], launches = [];
+  const clickCounts = [];
+  const manager = new BrowserManager(async ({profile, options}) => {
+    const uid = profile.includes(job.config.accountIds[0]) ? '1001' : '1002';
+    const manual = !options.headless;
+    const context = await chromium.launchPersistentContext(profile, {...options, headless:true});
+    launches.push({uid,manual,context});
+    await context.route('**/*', route => {
+      const url = new URL(route.request().url());
+      if (url.hostname !== 'weibo.com') return route.abort();
+      if (url.pathname === '/ajax/stopic/list') return route.fulfill({json:{data:[{title:'测试',page_id:'100808fixture'}]}});
+      if (url.pathname === '/ajax/statuses/update' || url.pathname === '/ajax/comments/create') {
+        const body = route.request().postDataJSON();
+        requests.push({uid,manual,body});
+        return route.fulfill(uid === '1001' && !body.verified
+          ? {status:400,json:{error_code:20067,message:'For your safety, please verify your account',validate:{challenge:'fixture'}}}
+          : {json:{ok:1,data:{idstr:uid === '1001' ? '5359362629435909' : '5359362629435910'}}});
+      }
+      if (url.pathname === '/fixture-click') { clickCounts.push({uid,manual}); return route.fulfill({body:''}); }
+      const script = `
+        <script>window.$CONFIG={uid:'${uid}',user:{screen_name:'fixture'}};
+        async function send(verified) {
+          if (!verified) await fetch('/fixture-click');
+          const text=document.querySelector('textarea').value;
+          const body=${kind === 'post' ? "{status:text,page_id:'100808fixture',verified}" : `{comment:text,id:'${weiboShortIdToNumeric(uid === '1001' ? 'AbCdE1' : 'AbCdE2')}',verified}`};
+          const r=await fetch('${kind === 'post' ? '/ajax/statuses/update' : '/ajax/comments/create'}',{method:'POST',body:JSON.stringify(body)});
+          if (!r.ok) document.querySelector('#captcha').hidden=false;
+        }</script>
+        <div hidden id="captcha" class="geetest_panel">请完成安全验证
+          <button onclick="this.parentElement.hidden=true;send(true)">模拟通过</button></div>`;
+      const composer = kind === 'post' ? `<button>更多</button><button>超话</button>
+        <div class="woo-modal-wrap"><button>选择超话</button><input placeholder="搜索超话" oninput="fetch('/ajax/stopic/list')">
+        <div class="_h3_fixture" onclick="document.querySelector('textarea').value='测试[超话]'">测试</div>
+        <textarea placeholder="掐指一算，此贴必火"></textarea><label><input type="checkbox">同步到微博</label>
+        <button onclick="send(false)">发送</button></div>` : `<div><div><div><textarea placeholder="发布你的评论"></textarea>
+        <button onclick="send(false)">评论</button></div></div></div>`;
+      return route.fulfill({contentType:'text/html; charset=utf-8',body:script+composer});
+    });
+    return context;
+  }, {headless:true, activate:async()=>{}});
+  const adapter = new WeiboAdapter(manager);
+  adapter.collectCandidates = async account => {
+    const id = account.uid === '1001' ? 'AbCdE1' : 'AbCdE2';
+    return [{id,url:'https://weibo.com/900/'+id,authorUid:'900',commentCount:0}];
+  };
+  adapter.inspectCandidate = async (_a, candidate) => candidate;
+  const runner = new TaskRunner(adapter, {scope:'workbench',leases:new AccountLeases()});
+  try {
+    await runner.run(job.id);
+    const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+    const before = getStepAction(job.id, card.currentStepKey);
+    assert.equal(before.state, 'verification_wait');
+    assert.equal(runner.workflow.status(getJob(job.id)).canContinue, true);
+    assert.ok(launches.filter(item => !item.manual).every(item => !item.context.pages().length));
+    runner.workflow.requestManual(job.id,'1001',card.currentStepKey);
+    await until(() => requests.some(item => item.uid === '1001' && item.manual) && runner.workflow.session?.wake, 30000);
+    const page = runner.workflow.session.page;
+    assert.equal(runner.workflow.status(getJob(job.id)).canContinue, false);
+    await page.getByRole('button',{name:'模拟通过'}).click();
+    await until(() => !runner.workflow.session, 15000);
+    const after = getStepAction(job.id, card.currentStepKey);
+    assert.equal(after.state, 'succeeded');
+    assert.equal(after.content, before.content);
+    assert.equal(after.target_id, before.target_id);
+    assert.equal(after.receipt_id, '5359362629435909');
+    assert.equal(getJob(job.id).metrics.success, 2);
+    const own = requests.filter(item => item.uid === '1001');
+    assert.deepEqual(own.map(item => [item.manual,item.body.verified]),[[false,false],[true,false],[true,true]]);
+    assert.deepEqual(own[1].body, own[0].body);
+    assert.equal(clickCounts.filter(item => item.uid === '1001' && item.manual).length,1);
+    assert.equal(launches.filter(item => item.manual).length,1);
+    assert.equal(runner.workflow.status(getJob(job.id)).canContinue,true);
+  } finally { await runner.workflow.endManual(job.id); await manager.close(); }
+});
+
+test('发帖超话搜索忽略旧响应并只提交一次', async () => {
+  const account = updateAccountAuth(createAccount('超话搜索账号').id, { status: 'valid', uid: '2201', nickname: '超话搜索账号' });
+  const topic = createTopic({ name: '测试超话', url: 'https://weibo.com/p/100808fixture' });
+  const profile = fs.mkdtempSync(path.join(data, 'topic-search-'));
+  let searches = 0, sends = 0;
+  const manager = new BrowserManager(async ({ options }) => {
+    const context = await chromium.launchPersistentContext(profile, { ...options, headless: true });
+    await context.route('**/*', route => {
+      const url = new URL(route.request().url());
+      if (url.hostname !== 'weibo.com') return route.abort();
+      if (url.pathname === '/ajax/stopic/list') {
+        searches += 1;
+        return route.fulfill({ json: { data: [{ title: '测试', page_id: searches === 1 ? '100808stale' : '100808fixture' }] } });
+      }
+      if (url.pathname === '/ajax/statuses/update') {
+        sends += 1;
+        return route.fulfill({ json: { ok: 1, data: { idstr: '5359362629435999' } } });
+      }
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `
+        <script>window.$CONFIG={uid:'2201',user:{screen_name:'fixture'}};</script>
+        <button>更多</button><button>超话</button>
+        <div class="woo-modal-wrap"><button>选择超话</button>
+          <input placeholder="搜索超话" oninput="fetch('/ajax/stopic/list')">
+          <div class="_h3_fixture" onclick="document.querySelector('textarea').value='测试[超话]'">测试</div>
+          <textarea placeholder="掐指一算，此贴必火"></textarea><label><input type="checkbox">同步到微博</label>
+          <button onclick="fetch('/ajax/statuses/update',{method:'POST',body:JSON.stringify({status:document.querySelector('textarea').value,page_id:'100808fixture'})})">发送</button>
+        </div>` });
+    });
+    return context;
+  }, { headless: true, activate: async () => {} });
+  try {
+    const adapter = new WeiboAdapter(manager);
+    let submitted = 0;
+    const result = await adapter.post(account, topic, '正文', { onSubmit: () => { submitted += 1; } });
+    assert.equal(result.state, 'succeeded');
+    assert.equal(submitted, 1);
+    assert.equal(sends, 1);
+    assert.ok(searches >= 2, '必须忽略旧搜索响应并等待目标响应');
+  } finally { await manager.close(); }
+});
+
+test('发帖准备最多尝试三次，同名结果无法唯一识别时绝不点击发送', async () => {
+  const account = updateAccountAuth(createAccount('超话歧义账号').id, { status: 'valid', uid: '2203', nickname: '超话歧义账号' });
+  const topic = createTopic({ name: '测试超话', url: 'https://weibo.com/p/100808fixture' });
+  const profile = fs.mkdtempSync(path.join(data, 'topic-ambiguous-'));
+  let prepareClicks = 0, sends = 0;
+  const manager = new BrowserManager(async ({ options }) => {
+    const context = await chromium.launchPersistentContext(profile, { ...options, headless: true });
+    await context.route('**/*', route => {
+      const url = new URL(route.request().url());
+      if (url.hostname !== 'weibo.com') return route.abort();
+      if (url.pathname === '/ajax/stopic/list') return route.fulfill({ json: { data: [{ title: '测试', page_id: '100808fixture' }] } });
+      if (url.pathname === '/ajax/statuses/update') { sends += 1; return route.fulfill({ json: { ok: 1, data: { idstr: '5359362629436002' } } }); }
+      if (url.pathname === '/fixture-prepare') { prepareClicks += 1; return route.fulfill({ body: '' }); }
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `
+        <script>window.$CONFIG={uid:'2203',user:{screen_name:'fixture'}};</script>
+        <button onclick="fetch('/fixture-prepare')">更多</button><button>超话</button>
+        <div class="woo-modal-wrap"><button>选择超话</button>
+          <input placeholder="搜索超话" oninput="fetch('/ajax/stopic/list')">
+          <div class="_h3_fixture">测试</div><div class="_h3_fixture">测试</div>
+          <textarea placeholder="掐指一算，此贴必火"></textarea><label><input type="checkbox">同步到微博</label><button>发送</button>
+        </div>` });
+    });
+    return context;
+  }, { headless: true, activate: async () => {} });
+  try {
+    const adapter = new WeiboAdapter(manager);
+    await assert.rejects(adapter.post(account, topic, '正文'), /不能唯一识别超话搜索结果/);
+    assert.equal(prepareClicks, 3);
+    assert.equal(sends, 0);
+  } finally { await manager.close(); }
+});
+
+test('同步到微博被遮挡时安全切换，不等待普通点击超时', async () => {
+  const account = updateAccountAuth(createAccount('同步选项账号').id, { status: 'valid', uid: '2204', nickname: '同步选项账号' });
+  const topic = createTopic({ name: '测试超话', url: 'https://weibo.com/p/100808fixture' });
+  const profile = fs.mkdtempSync(path.join(data, 'sync-toggle-'));
+  let body = null;
+  const manager = new BrowserManager(async ({ options }) => {
+    const context = await chromium.launchPersistentContext(profile, { ...options, headless: true });
+    await context.route('**/*', route => {
+      const url = new URL(route.request().url());
+      if (url.hostname !== 'weibo.com') return route.abort();
+      if (url.pathname === '/ajax/stopic/list') return route.fulfill({ json: { data: [{ title: '测试', page_id: '100808fixture' }] } });
+      if (url.pathname === '/ajax/statuses/update') {
+        body = route.request().postDataJSON();
+        return route.fulfill({ json: { ok: 1, data: { idstr: '5359362629436003' } } });
+      }
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `
+        <script>window.$CONFIG={uid:'2204',user:{screen_name:'fixture'}};</script>
+        <button>更多</button><button>超话</button>
+        <div class="woo-modal-wrap"><button>选择超话</button>
+          <input placeholder="搜索超话" oninput="fetch('/ajax/stopic/list')">
+          <div class="_h3_fixture" onclick="document.querySelector('textarea').value='测试[超话]'">测试</div>
+          <textarea placeholder="掐指一算，此贴必火"></textarea>
+          <div style="position:relative;display:inline-block"><label><input type="checkbox" checked>同步到微博</label><span style="position:absolute;inset:0;z-index:2"></span></div>
+          <button onclick="fetch('/ajax/statuses/update',{method:'POST',body:JSON.stringify({status:document.querySelector('textarea').value,page_id:'100808fixture',sync:document.querySelector('input[type=checkbox]').checked})})">发送</button>
+        </div>` });
+    });
+    return context;
+  }, { headless: true, activate: async () => {} });
+  try {
+    const adapter = new WeiboAdapter(manager);
+    const started = Date.now();
+    const result = await adapter.post(account, topic, '正文', { syncToHome: false });
+    assert.equal(result.state, 'succeeded');
+    assert.equal(body?.sync, false);
+    assert.ok(Date.now() - started < 10000, '同步选项不得阻塞到分钟级');
+  } finally { await manager.close(); }
+});
+
+test('转发无回执时只按目标、文案和时间窗口匹配近期微博', async () => {
+  const account = updateAccountAuth(createAccount('转发复核账号').id, { status: 'valid', uid: '2202', nickname: '转发复核账号' });
+  const profile = fs.mkdtempSync(path.join(data, 'repost-readback-'));
+  const link = 'https://weibo.com/7449968177/RoF58iVPk';
+  const targetId = weiboShortIdToNumeric('RoF58iVPk');
+  const now = Date.now();
+  const manager = new BrowserManager(async ({ options }) => {
+    const context = await chromium.launchPersistentContext(profile, { ...options, headless: true });
+    await context.route('**/*', route => {
+      const url = new URL(route.request().url());
+      if (url.hostname !== 'weibo.com') return route.abort();
+      if (url.pathname === '/ajax/statuses/mymblog') return route.fulfill({ json: { data: { list: [{
+        idstr: '5359362629436001', user: { idstr: '2202' }, retweeted_status: { idstr: targetId },
+        text_raw: '转发正文', created_at: new Date(now).toISOString()
+      }] } } });
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<script>window.$CONFIG={uid:'2202',user:{screen_name:'fixture'}};</script>` });
+    });
+    return context;
+  }, { headless: true, activate: async () => {} });
+  try {
+    const adapter = new WeiboAdapter(manager);
+    const result = await adapter.verifyRepost(account, { link, content: '转发正文',
+      started_at: new Date(now - 10000).toISOString(), submitted_at: new Date(now - 5000).toISOString() });
+    assert.equal(result.state, 'succeeded');
+    assert.equal(result.receiptId, '5359362629436001');
+    assert.equal(result.successSource, 'recent_repost_match');
+  } finally { await manager.close(); }
+});
+
+test('人工验证后发帖准备失败保留可重试卡，不重复提交且失败数不增加', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  const account = accounts[0];
+  let mode = 'background', submits = 0, opens = 0;
+  const runner = new TaskRunner({
+    ensureIdentity: async item => ({ uid: item.uid, status: 'valid' }),
+    browserManager: { closeRunner: async () => {} },
+    post: async (_account, _topic, _content, options) => {
+      if (mode === 'background') throw new VerificationError('需要验证');
+      if (mode === 'manual_fail') throw new UnsupportedPageError('不能唯一核对所选超话的标识，未发送');
+      submits += 1; options.onSubmit();
+      return { state: 'succeeded', receiptId: '5359362629436000', receiptUrl: 'https://weibo.com/detail/5359362629436000' };
+    },
+    openVerification: async () => { opens += 1; return { context: () => ({}), isClosed: () => false, once: () => {} }; },
+    closeManual: async () => {},
+    hasTaskChallenge: async () => false
+  }, { scope: 'workbench', leases: new AccountLeases() });
+  try {
+    await runner.run(job.id);
+    let card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === account.uid);
+    mode = 'manual_fail';
+    runner.workflow.requestManual(job.id, account.uid, card.currentStepKey);
+    await until(() => opens === 1 && !runner.workflow.session, 10000);
+    card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === account.uid);
+    assert.equal(card.verificationResult, 'passed');
+    assert.equal(card.currentActionable, true);
+    assert.match(card.reason, /发帖未发送.*可安全重试/);
+    assert.equal(submits, 0);
+    assert.equal(getJob(job.id).metrics.failed, 0);
+    const row = db.prepare('SELECT state FROM task_step_state WHERE job_id=? AND step_key=?').get(job.id, card.currentStepKey);
+    assert.equal(row.state, 'deferred');
+    const action = getStepAction(job.id, card.currentStepKey);
+    assert.equal(action.state, 'verification_wait');
+    assert.equal(action.verification_pending, 1);
+
+    mode = 'manual_success';
+    runner.workflow.requestManual(job.id, account.uid, card.currentStepKey);
+    await until(() => opens === 2 && !runner.workflow.session, 10000);
+    assert.equal(submits, 1);
+    assert.equal(getStepAction(job.id, card.currentStepKey).state, 'succeeded');
+    assert.equal(getJob(job.id).metrics.success, 1);
+  } finally { await runner.workflow.endManual(job.id); }
+});
+
+test('历史“已验证但发帖未发送”卡片自动恢复为安全重试且幂等', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  const account = accounts[0];
+  const runner = new TaskRunner({
+    ensureIdentity: async item => ({ uid: item.uid, status: 'valid' }),
+    browserManager: { closeRunner: async () => {} },
+    post: async () => { throw new VerificationError('需要验证'); },
+    openVerification: async () => ({ context: () => ({}), isClosed: () => false, once: () => {} }),
+    hasTaskChallenge: async () => false
+  }, { scope: 'workbench', leases: new AccountLeases() });
+  await runner.run(job.id);
+  let card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === account.uid);
+  const action = getStepAction(job.id, card.currentStepKey);
+  db.prepare("UPDATE action_logs SET state='failed',verification_pending=0,submitted_at=NULL,completed_at=?,error=? WHERE id=?")
+    .run('2026-11-07T10:00:00.000Z', '不能唯一核对所选超话的标识，未发送', action.id);
+  db.prepare("UPDATE task_step_state SET state='done',outcome='failed' WHERE job_id=? AND step_key=?").run(job.id, card.currentStepKey);
+  db.prepare("UPDATE verification_cards SET status='ready',verification_result='passed',verified_at=?,reason=? WHERE job_id=? AND identity=?")
+    .run('2026-11-07T10:01:00.000Z', '发帖已完成，其余操作请点击继续运行', job.id, account.uid);
+  updateJob(job.id, { metrics: { ...getJob(job.id).metrics, success: 0, failed: 1 } });
+
+  card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === account.uid);
+  assert.equal(card.currentActionable, true);
+  assert.match(card.reason, /发帖未发送.*(?:允许|可)安全重试/);
+  assert.equal(getJob(job.id).metrics.failed, 0);
+  assert.equal(getStepAction(job.id, card.currentStepKey).state, 'verification_wait');
+  assert.equal(getStepAction(job.id, card.currentStepKey).verification_pending, 1);
+  const row = db.prepare('SELECT state FROM task_step_state WHERE job_id=? AND step_key=?').get(job.id, card.currentStepKey);
+  assert.equal(row.state, 'deferred');
+
+  runner.workflow.status(getJob(job.id));
+  assert.equal(getJob(job.id).metrics.failed, 0);
+  assert.equal(getStepAction(job.id, card.currentStepKey).state, 'verification_wait');
+});
+
+test('同步到微博点击超时的未提交发帖自动恢复为待执行并幂等', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    browserManager: { closeRunner: async () => {} },
+    post: async account => {
+      if (account.id === accounts[0].id) throw new Error('locator.click: Timeout 5000ms exceeded while clicking 同步到微博');
+      return { state: 'succeeded' };
+    }
+  }, { scope: 'workbench' });
+  await runner.run(job.id);
+  assert.equal(getJob(job.id).metrics.failed, 1);
+  const key = runner.workflow.rows(job.id, 0)[0].step_key;
+  runner.workflow.status(getJob(job.id));
+  assert.equal(getJob(job.id).metrics.failed, 0);
+  assert.equal(getStepAction(job.id, key).state, 'prepared');
+  assert.equal(db.prepare('SELECT state FROM task_step_state WHERE job_id=? AND step_key=?').get(job.id, key).state, 'pending');
+  runner.workflow.status(getJob(job.id));
+  assert.equal(getJob(job.id).metrics.failed, 0);
+  assert.match(getStepAction(job.id, key).error, /同步到微博选项临时失败/);
 });

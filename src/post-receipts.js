@@ -16,7 +16,7 @@ function safeHint(payload, submittedText, fallback) {
   return text.trim().slice(0, 160) || fallback;
 }
 
-function inspectBody(raw, submittedText, topicId) {
+function inspectBody(raw, submittedText, topicId, commentTarget = null) {
   if (typeof raw !== 'string' || !raw.trim()) return { owned: true, trusted: false };
   let fields;
   try {
@@ -41,13 +41,18 @@ function inspectBody(raw, submittedText, topicId) {
     const body = new URLSearchParams(raw);
     fields = name => body.getAll(name);
   }
-  const topics = TOPIC_FIELDS.flatMap(fields);
+  const topics = commentTarget === null ? TOPIC_FIELDS.flatMap(fields) : [];
+  if (commentTarget !== null) {
+    const targets = ['id', 'mid', 'status_id'].flatMap(fields);
+    if (!targets.length) return { owned: true, trusted: false };
+    if (targets.some(value => String(value) !== String(commentTarget))) return { owned: false };
+  }
   // The live stopic publisher sends the public page ID as 1022:100808… .
   // Accept only this observed wrapper, retaining exact target identity.
   const sameTopic = value => value != null && (String(value) === String(topicId)
     || (/^100808[a-z0-9]+$/i.test(String(topicId)) && String(value) === `1022:${topicId}`));
   if (topics.some(value => !sameTopic(value))) return { owned: false };
-  const texts = TEXT_FIELDS.flatMap(fields);
+  const texts = (commentTarget === null ? TEXT_FIELDS : [...TEXT_FIELDS, 'comment']).flatMap(fields);
   if (!texts.length || texts.some(value => typeof value !== 'string')) return { owned: true, trusted: false };
   if (texts.some(value => value.trim() !== submittedText.trim())) return { owned: false };
   return { owned: true, trusted: true };
@@ -62,7 +67,7 @@ function inspectBody(raw, submittedText, topicId) {
  * saveError even when read() contains successful evidence.
  */
 export function createPostReceiptCollector({
-  page, attemptId, submittedText, topicId, onReceipt, classify, readJson,
+  page, attemptId, submittedText, topicId, onReceipt, classify, readJson, operation = 'post', targetId = null,
   log = () => {}, receiptTimeoutMs = 15_000, signal,
 }) {
   const context = page.context();
@@ -121,7 +126,7 @@ export function createPostReceiptCollector({
       if (url.hostname !== 'weibo.com' || request.method() !== 'POST') return;
       if (request.frame().page() !== page) return;
       path = url.pathname;
-      if (!POST_PATH.test(path)) {
+      if (!(operation === 'repost' ? path === '/ajax/statuses/repost' : operation === 'comment' ? /^\/ajax\/comments\/(create|add)$/.test(path) : POST_PATH.test(path))) {
         // A route change must be diagnosable without storing bodies/queries.
         // Never accept an unfamiliar POST as proof of publishing.
         if (/publish|create|update|stopic|statuses/.test(path)) record(path.replace(/[a-z0-9_-]{25,}/ig, '[id]'), null, null, 'unknown', 'Unrecognized publish-like request path');
@@ -136,7 +141,15 @@ export function createPostReceiptCollector({
     try { body = request.postData(); } catch { body = null; }
     entry.body = Promise.resolve(body)
       .then(raw => {
-        const ownership = inspectBody(raw, submittedText, topicId);
+        let ownership;
+        if (operation === 'repost') {
+          let fields; try { const json = JSON.parse(raw); fields = key => json?.[key]; }
+          catch { const form = new URLSearchParams(raw || ''); fields = key => form.get(key); }
+          const text = fields('status') ?? fields('text');
+          const sameText = submittedText ? text === submittedText : ['', '转发微博', undefined, null].includes(text);
+          const sameTarget = String(fields('id') || '') === String(targetId);
+          ownership = { owned: sameTarget && sameText, trusted: sameTarget && sameText };
+        } else ownership = inspectBody(raw, submittedText, topicId, operation === 'comment' ? String(targetId) : null);
         if (!ownership.trusted) record(path, null, null, 'unknown', ownership.owned ? 'Request fields unavailable' : 'Request body does not match current composer');
         return ownership;
       })
@@ -178,7 +191,7 @@ export function createPostReceiptCollector({
     // Preserve the proof before awaiting persistence and reserve the callback
     // exactly once, even when a second success arrives during the save.
     accepted = observed;
-    const receiptUrl = result.id ? `https://weibo.com/detail/${encodeURIComponent(result.id)}` : null;
+    const receiptUrl = result.id && operation !== 'comment' ? `https://weibo.com/detail/${encodeURIComponent(result.id)}` : null;
     try {
       await onReceipt({ state: 'succeeded', receiptId: result.id || null, receiptUrl,
         url: receiptUrl, attemptId, successSource: 'api_receipt', error: '' });
@@ -271,6 +284,9 @@ export function createPostReceiptCollector({
 
   return {
     begin, read, events, drain, finish, stop, handoff,
+    // Replay eligibility is stricter than recognizing a challenge: a later
+    // or unreadable submit must not inherit the earlier rejection.
+    get soleResponse() { return sequence === 1 && !pending.size && latestSequence === 1 ? latest : null; },
     get accepted() { return accepted; },
     get latest() { return latest; },
     get saveError() { return saveError; },

@@ -2,16 +2,17 @@ import { EventEmitter } from 'node:events';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   db, beginPostAttempt, createActionLog, createJob, findIncompleteAction, getAccount, getActionLog, getActiveJob, getCheckin, getJob,
-  getSetting, getStepAction, hasCommented, listAccounts, listCommentedTargetIdsForIdentity, listCommentMaterials, listPostMaterials, listTopics, nextSequence,
+  getSetting, getStepAction, hasCommented, listAccounts, listCommentedTargetIdsForIdentity, listCommentMaterials, listJobs, listPostMaterials, listTopics, nextSequence,
   listActiveAccountRestrictions, recordAccountRestriction, recordCheckin, recordComment, setSetting, updateActionLog, updateJob, log
 } from './db.js';
 import { config as appConfig, defaultTaskConfig } from './config.js';
 import { COMMENT_SECTIONS, isFixedTopic } from '../public/topic-policy.js';
 import { BrowserBusyError } from './browser.js';
 import { AuthenticationError, IdentityMismatchError, MutedError, RateLimitError, UnsupportedPageError, VerificationError, WeiboAdapter, weiboShortIdToNumeric } from './weibo-adapter.js';
-import { id, pickRandom, serializeError, shanghaiDate } from './util.js';
-import { normalizeTaskSettings } from '../public/defaults.js';
+import { id, pickRandom, serializeError, shanghaiDate, kindLabel } from './util.js';
+import { normalizeTaskSettings, normalizeEngageSettings } from '../public/defaults.js';
 import { listAccountGroups } from './account-groups.js';
+import { buildEngageSteps, createEngageSnapshot, validateEngageSnapshot, parseWeiboLink, engageStepCoupling } from './engage.js';
 import { startRound, finishRound, runningRounds, refreshRoundSummary } from './task-reports.js';
 import { DAILY_STOP_REASON, DailyStopError, dailyStopStatus, deadlineFor } from './daily-stop.js';
 import { VerificationWorkflow } from './verification-workflow.js';
@@ -32,6 +33,7 @@ function commentScanSummary(stats) {
 }
 
 export function buildSteps(snapshot) {
+  if (snapshot.kind === 'engage') return buildEngageSteps(snapshot);
   const steps = [];
   for (let round = 0; round < snapshot.rounds; round += 1) {
     for (const topicId of snapshot.topicIds) {
@@ -58,6 +60,7 @@ export function buildSteps(snapshot) {
 }
 
 export function validateSnapshot(snapshot) {
+  if (snapshot.kind === 'engage') return validateEngageSnapshot(snapshot);
   const errors = [];
   if (appConfig.topicMode === 'fixed') {
     const topics = listTopics();
@@ -85,6 +88,7 @@ export function validateSnapshot(snapshot) {
 }
 
 export function createSnapshot(input, accounts, topics) {
+  if (input?.kind === 'engage') return createEngageSnapshot(input, accounts);
   if (appConfig.topicMode === 'fixed') {
     topics = topics.filter(isFixedTopic).slice(0, 1);
     if (input?.topicIds && (input.topicIds.length !== 1 || input.topicIds[0] !== topics[0]?.id)) throw Object.assign(new Error('当前仅支持苏新皓超话'), { statusCode: 400 });
@@ -133,15 +137,19 @@ export function decorateText(raw, decoration = {}, kind = 'comment', sequence = 
 }
 
 export class TaskRunner extends EventEmitter {
-  constructor(adapter, { now = Date.now } = {}) {
+  constructor(adapter, { now = Date.now, scope = null, leases = null } = {}) {
     super();
     this.adapter = adapter;
+    this.scope = scope;
+    this.leases = leases;
     this.adapter.log = log;
     this.promise = null;
     this.verificationTimers = new Map();
+    this.readbackTimers = new Map();
     this.now = now;
     this.executionStorage = new AsyncLocalStorage();
     this.currentExecution = null;
+    this.engageSession = null;
     this.accountRestrictions = [];
     this.accountRestrictionsAt = 0;
     this.workflow = new VerificationWorkflow(this, buildSteps);
@@ -158,12 +166,15 @@ export class TaskRunner extends EventEmitter {
   }
 
   restrictionFor(accountId, kind, identity = '') {
-    return this.activeAccountRestrictions().find(item => (item.accountId === accountId || (identity && item.identity === identity)) && (item.type === 'mute' || (item.type === 'frequent' && item.kind === kind))) || null;
+    return listActiveAccountRestrictions(new Date(this.now()).toISOString()).find(item => (item.accountId === accountId || (identity && item.identity === identity)) && ((item.type === 'mute' && ['post','comment','repost'].includes(kind)) || (item.type === 'frequent' && item.kind === kind))) || null;
   }
 
   dailyStopStatus() { return dailyStopStatus(this.now()); }
 
+  dailyStopEnabled() { return this.scope !== 'engage'; }
+
   taskDeadline(job) {
+    if (job?.scope === 'engage' || this.scope === 'engage') return Infinity;
     if (!job.cursor.deadlineAt) {
       job = updateJob(job.id, { cursor: { ...job.cursor, deadlineAt: new Date(deadlineFor(Date.parse(job.created_at))).toISOString() } });
     }
@@ -172,7 +183,7 @@ export class TaskRunner extends EventEmitter {
 
   isExpired(jobId) {
     const job = getJob(jobId);
-    return Boolean(job && (job.cursor.dailyStop || this.now() >= this.taskDeadline(job)));
+    return Boolean(job && job.scope !== 'engage' && (job.cursor.dailyStop || this.now() >= this.taskDeadline(job)));
   }
 
   assertExecutionAlive() {
@@ -194,14 +205,24 @@ export class TaskRunner extends EventEmitter {
     if (this.navigation.waiting(job)) throw Object.assign(new Error('页面恢复等待中，禁止提交'), { code: 'navigation_unavailable', navigationHandled: true });
   }
 
+  activeManualStep(jobId, step) {
+    const session = this.workflow.session;
+    return Boolean(session && session.jobId === jobId && session.stepKey === stepKeyFor(step)
+      && !session.cancelled && !session.windowClosed && !session.page?.isClosed?.());
+  }
+
   markSubmitted(jobId, step, actionId, attemptId = null) {
     this.assertMaySubmit(jobId);
     if (getActionLog(actionId)?.state === 'succeeded') throw new DailyStopError('当前操作已确认成功，禁止再次提交');
     const context = this.executionStorage.getStore();
-    if (context) context.submitted = true;
     if (attemptId && getActionLog(actionId)?.attempt_id !== attemptId) throw new DailyStopError();
-    updateActionLog(actionId, { state: 'submitted', attemptId, submittedAt: new Date(this.now()).toISOString() });
     const manual = this.workflow.session;
+    if (manual?.jobId === jobId && manual.stepKey === stepKeyFor(step)
+      && (manual.cancelled || manual.windowClosed || manual.page?.isClosed?.())) {
+      throw new VerificationError('验证窗口已结束，未提交');
+    }
+    if (context) context.submitted = true;
+    updateActionLog(actionId, { state: 'submitted', attemptId, submittedAt: new Date(this.now()).toISOString() });
     if (manual?.jobId === jobId && manual.stepKey === stepKeyFor(step)) {
       manual.submitted = true;
       manual.attemptId = getActionLog(actionId)?.attempt_id;
@@ -211,7 +232,8 @@ export class TaskRunner extends EventEmitter {
   }
 
   enforceDailyStop() {
-    for (const row of db.prepare("SELECT id FROM jobs WHERE status IN ('running','waiting','paused')").all()) {
+    if (!this.dailyStopEnabled()) return;
+    for (const row of db.prepare("SELECT id,scope FROM jobs WHERE status IN ('running','waiting','paused')").all().filter(row => !this.scope || row.scope === this.scope)) {
       let job = getJob(row.id);
       const deadline = this.taskDeadline(job);
       if (!job.cursor.dailyStop && this.now() < deadline) continue;
@@ -222,7 +244,7 @@ export class TaskRunner extends EventEmitter {
         job = updateJob(job.id, { stopRequested: true, pausedByUser: false, waitReason: DAILY_STOP_REASON,
           cursor: { ...job.cursor, verificationRecovery: null, stopReason: DAILY_STOP_REASON,
             dailyStop: { requestedAt: new Date(this.now()).toISOString(), deadlineAt: new Date(deadline).toISOString() } } });
-        log('warning', DAILY_STOP_REASON);
+        log('warning', DAILY_STOP_REASON, { jobId: job.id, scope: job.scope });
         this.emitUpdate(job);
       }
       const context = this.currentExecution;
@@ -276,17 +298,83 @@ export class TaskRunner extends EventEmitter {
     const context = { jobId: job.id, step, submitted: false, cancelled: false };
     const cancelled = new Promise((_, reject) => { context.cancel = () => { if (!context.cancelled) { context.cancelled = true; reject(new DailyStopError()); } }; });
     this.currentExecution = context;
-    const timer = setTimeout(() => this.enforceDailyStop(), Math.max(0, this.taskDeadline(getJob(job.id)) - this.now()));
-    timer.unref?.();
+    const remaining = this.taskDeadline(getJob(job.id)) - this.now();
+    const timer = Number.isFinite(remaining) ? setTimeout(() => this.enforceDailyStop(), Math.max(0, remaining)) : null;
+    timer?.unref?.();
     try {
       return await this.executionStorage.run(context, () => Promise.race([Promise.resolve().then(callback), cancelled]));
     } finally {
-      clearTimeout(timer); clearTimeout(context.graceTimer);
+      if (timer) clearTimeout(timer); clearTimeout(context.graceTimer);
       if (this.currentExecution === context) this.currentExecution = null;
     }
   }
 
-  current() { return getActiveJob(); }
+  workbenchVerification(job) {
+    return job?.scope === 'workbench' && job?.config?.kind !== 'engage' && this.scope !== 'engage';
+  }
+
+  groupedEngage(job) {
+    return job?.config?.kind === 'engage' && Number(job.config.schedulerVersion || 0) >= 4;
+  }
+
+  async releaseEngageSession() {
+    const session = this.engageSession;
+    if (!session) return;
+    this.engageSession = null;
+    try {
+      try { await this.adapter.resetEngageSession?.(); }
+      finally { await this.adapter.browserManager?.closeRunner?.(); }
+    } finally { session.release?.(); }
+  }
+
+  async ensureStepIdentity(job, account) {
+    const session = this.engageSession;
+    const manager = this.adapter.browserManager;
+    if (this.groupedEngage(job) && session?.accountId === account.id && session.identified
+      && (!manager || manager.generation == null || (manager.accountId === account.id && manager.generation === session.generation))) return;
+    await this.adapter.ensureIdentity(account);
+    if (this.groupedEngage(job) && this.engageSession === session && session) {
+      session.identified = true;
+      session.generation = manager?.generation;
+    }
+  }
+
+  async withAccountLease(job, account, callback, { step, manual = false } = {}) {
+    if (this.groupedEngage(job) && step && !manual) {
+      const key = JSON.stringify([job.id, step.round, step.topicId, account.id]);
+      if (this.engageSession && this.engageSession.key !== key) await this.releaseEngageSession();
+      if (!this.engageSession) {
+        const release = this.leases?.acquire(account, this.scope || job.scope || job.id);
+        this.engageSession = { key, jobId:job.id, round:step.round, link:step.topicId, accountId:account.id, release, identified:false };
+      }
+      // Keep the account's persistent context alive across recoverable
+      // outcomes.  The workflow releases it only when the group is finished or
+      // the task is paused/stopped; closing here caused empty verification or
+      // rate-limit failures to reopen the same account for the next action.
+      return callback();
+    }
+    if (!this.leases) return callback();
+    const release = this.leases.acquire(account, this.scope || job.scope || job.id);
+    try { return await callback(); }
+    finally { try { await this.adapter.browserManager?.closeRunner?.(); } finally { release(); } }
+  }
+
+  async finishEngageGroupIfNeeded(jobId, row, outcome) {
+    const session = this.engageSession, job = getJob(jobId);
+    if (!session || session.jobId !== jobId) return;
+    const next = this.workflow.rows(jobId, row.round_index).find(item => item.state === 'pending');
+    if (!job || job.status === 'paused' || job.stopRequested || job.cursor.manualVerification || job.cursor.verificationBarrier
+      || !next || next.account_id !== session.accountId
+      || next.topic_id !== session.link || next.round_index !== session.round) await this.releaseEngageSession();
+  }
+
+  async dismissBackgroundChallenge(error) {
+    if (this.scope !== 'engage' || !error?.challengePage) return false;
+    try { return await this.adapter.dismissBackgroundChallenge?.(error.challengePage) || false; }
+    catch (failure) { log('warning', '关闭后台验证页失败：' + failure.message, { jobId: error.jobId }); return false; }
+  }
+
+  current() { return getActiveJob(this.scope); }
 
   acceptedPost(actionId) {
     const action = getActionLog(actionId);
@@ -296,6 +384,9 @@ export class TaskRunner extends EventEmitter {
 
   settlePostAction(actionId, patch, { emit: allowEmit = true } = {}) {
     let action, emit = false;
+    const before = getActionLog(actionId);
+    if (patch.attemptId && patch.attemptId !== before?.attempt_id) return before;
+    if (before?.kind === 'repost' && patch.receiptId && db.prepare("SELECT 1 FROM action_logs WHERE kind='repost' AND receipt_id=? AND id<>?").get(String(patch.receiptId), actionId)) throw Object.assign(new Error('该转发回执已属于另一条操作'), { code: 'receipt_persistence_failed' });
     db.exec('SAVEPOINT settle_post_action');
     try {
       action = updateActionLog(actionId, patch);
@@ -366,6 +457,21 @@ export class TaskRunner extends EventEmitter {
           post[state] = Number(post[state] || 0) + 1;
           db.prepare('UPDATE daily_stats SET counts_json=? WHERE date=?').run(JSON.stringify(counts), date);
         }
+        const scope = current.scope || getJob(current.job_id)?.scope || 'workbench';
+        const scoped = db.prepare('SELECT counts_json FROM daily_scope_stats WHERE date=? AND scope=?').get(date, scope);
+        if (scoped) {
+          const counts = JSON.parse(scoped.counts_json || '{}'), post = counts.post || (counts.post = {});
+          post[current.state] = Math.max(0, Number(post[current.state] || 0) - 1);
+          post[state] = Number(post[state] || 0) + 1;
+          db.prepare('UPDATE daily_scope_stats SET counts_json=? WHERE date=? AND scope=?').run(JSON.stringify(counts), date, scope);
+        }
+        const completedDate = shanghaiDate(new Date(current.completed_at || current.started_at));
+        const successful = db.prepare('SELECT success_json FROM daily_scope_stats WHERE date=? AND scope=?').get(completedDate, scope);
+        if (successful && (current.state === 'succeeded' || state === 'succeeded')) {
+          const values = JSON.parse(successful.success_json || '{}');
+          values.post = Math.max(0, Number(values.post || 0) + (state === 'succeeded' ? 1 : -1));
+          db.prepare('UPDATE daily_scope_stats SET success_json=? WHERE date=? AND scope=?').run(JSON.stringify(values), completedDate, scope);
+        }
       }
       db.exec('RELEASE SAVEPOINT repair_post_result');
     } catch (error) { db.exec('ROLLBACK TO SAVEPOINT repair_post_result; RELEASE SAVEPOINT repair_post_result'); throw error; }
@@ -392,7 +498,7 @@ export class TaskRunner extends EventEmitter {
 
 
   async repairUncertainPosts(jobId, { limit = 4, includeReceiptFailures = false, actionIds = null } = {}) {
-    const job = getJob(jobId), active = getActiveJob();
+    const job = getJob(jobId), active = this.current();
     const conflict = message => Object.assign(new Error(message), { statusCode: 409 });
     if (!job || !['paused', 'completed', 'stopped'].includes(job.status)) throw conflict('请先让任务结束或安全暂停，再核对历史发帖');
     if (this.repairing || this.promise || this.currentExecution || this.workflow.busy() ||
@@ -407,7 +513,7 @@ export class TaskRunner extends EventEmitter {
     const results = [];
     try {
       for (const action of actions) {
-        const current = getActiveJob();
+        const current = this.current();
         if (current && !(current.status === 'paused' && current.pausedByUser)) throw conflict('有任务开始运行，已停止历史核对');
         const account = getAccount(action.account_id), topic = listTopics().find(item => item.id === action.topic_id);
         let result = { state: 'uncertain', reason: '原账号或超话不可用，无法核对' };
@@ -417,7 +523,7 @@ export class TaskRunner extends EventEmitter {
             result = await this.adapter.findPublishedPost(account, { content: action.content, topic, startedAt: action.started_at,
               submittedAt: action.submitted_at, completedAt: action.completed_at, syncToHome: job.config.syncToHome === true,
               maxBatches: 20, signal: controller.signal, assertRunning: () => {
-                const running = getActiveJob();
+                const running = this.current();
                 if (controller.signal.aborted || (running && !(running.status === 'paused' && running.pausedByUser))) throw conflict('只读核对已超时或被中断');
               } });
             if (result.state === 'succeeded' && !this.postClaimIsUnique(action, result)) result = { state: 'uncertain', reason: '帖子可能属于另一条操作，不能唯一归属' };
@@ -441,8 +547,27 @@ export class TaskRunner extends EventEmitter {
     if (!job || !action || action.job_id !== jobId) throw Object.assign(new Error('找不到这条待核对操作'), { statusCode: 404 });
     if (!['uncertain', 'submitted'].includes(action.state)) throw Object.assign(new Error('只有待核对操作可以复核'), { statusCode: 400 });
     if (this.repairing || this.promise || this.currentExecution || this.workflow.busy()) throw Object.assign(new Error('请等待当前浏览器操作和验证会话结束'), { statusCode: 409 });
+    if (['repost','like','comment_like'].includes(action.kind)) {
+      this.repairing = true;
+      try {
+        const account = getAccount(action.account_id);
+        const result = await this.withAccountLease(job, account, async () => {
+          await this.adapter.ensureIdentity(account);
+          if (action.kind === 'repost') return this.adapter.verifyRepost(account, action);
+          if (action.kind === 'like') return this.adapter.verifyLike(account, action.link || action.url);
+          return this.adapter.verifyCommentLike(account, action.link || action.url, action.target_id);
+        });
+        if (result.state === 'succeeded') {
+          this.settlePostAction(action.id, { state: 'succeeded', error: '', url: result.url || action.url, receiptId: result.receiptId });
+          const row = db.prepare('SELECT * FROM task_step_state WHERE job_id=? AND step_key=?').get(jobId, action.step_key);
+          if (row) db.prepare("UPDATE task_step_state SET state='done',outcome='succeeded' WHERE job_id=? AND step_key=?").run(jobId, action.step_key);
+          this.workflow.updateProgress(jobId); refreshRoundSummary(jobId, row?.round_index || 0);
+        }
+        return result;
+      } finally { this.repairing = false; }
+    }
     if (action.kind === 'comment') {
-      const result = await this.recheckCommentAction(jobId, actionId);
+      const result = await this.withAccountLease(job, getAccount(action.account_id), () => this.recheckCommentAction(jobId, actionId));
       if (result.state === 'succeeded' && this.workflow.enabled(job)) this.workflow.updateProgress(jobId);
       return result;
     }
@@ -458,6 +583,65 @@ export class TaskRunner extends EventEmitter {
       const result = this.repairPostResult(action, found);
       return { state: result.state, receiptId: result.receipt_id, url: result.receipt_url || result.url };
     } finally { this.repairing = false; }
+  }
+
+  scheduleAutoReadbacks(jobId = null) {
+    if (this.scope !== 'engage') return;
+    const job = jobId ? getJob(jobId) : listJobs(20, 'engage').find(item => ['completed', 'stopped'].includes(item.status));
+    if (!job || !['completed', 'stopped'].includes(job.status) || job.scope !== 'engage') return;
+    if (this.readbackTimers.has(job.id)) return;
+    if (!this.autoReadbackCandidates(job).length) return;
+    const timer = setTimeout(() => void this.runAutoReadbacks(job.id), 1000);
+    timer.unref?.();
+    this.readbackTimers.set(job.id, timer);
+  }
+
+  autoReadbackCandidates(job) {
+    const ledger = job?.cursor?.autoReadbacks || {};
+    return db.prepare(`SELECT * FROM action_logs WHERE job_id=? AND kind IN ('comment','repost')
+      AND state='uncertain' AND submitted_at IS NOT NULL AND error LIKE '%频繁%'
+      ORDER BY started_at,id`).all(job.id).filter(action => Number(ledger[action.id]?.attempts || 0) < 2);
+  }
+
+  async runAutoReadbacks(jobId) {
+    this.readbackTimers.delete(jobId);
+    let job = getJob(jobId);
+    if (!job || job.scope !== 'engage' || !['completed', 'stopped'].includes(job.status)) return;
+    if (this.promise || this.currentExecution || this.workflow.busy()) {
+      const timer = setTimeout(() => void this.runAutoReadbacks(jobId), 15000);
+      timer.unref?.();
+      this.readbackTimers.set(jobId, timer);
+      return;
+    }
+    for (const action of this.autoReadbackCandidates(job)) {
+      try {
+        const result = await this.recheckUncertainAction(jobId, action.id);
+        job = getJob(jobId);
+        const ledger = { ...(job.cursor?.autoReadbacks || {}) };
+        const previous = ledger[action.id] || { attempts: 0 };
+        ledger[action.id] = { attempts: Number(previous.attempts || 0) + 1,
+          lastCheckedAt: new Date(this.now()).toISOString(), state: result?.state || 'uncertain',
+          reason: String(result?.reason || '').slice(0, 240) };
+        job = updateJob(jobId, { cursor: { ...job.cursor, autoReadbacks: ledger } });
+      } catch (error) {
+        if (Number(error?.statusCode) === 409) break;
+        job = getJob(jobId);
+        if (!job) break;
+        const ledger = { ...(job.cursor?.autoReadbacks || {}) };
+        const previous = ledger[action.id] || { attempts: 0 };
+        ledger[action.id] = { attempts: Number(previous.attempts || 0) + 1,
+          lastCheckedAt: new Date(this.now()).toISOString(), state: 'uncertain',
+          reason: String(error?.message || '只读复核失败').slice(0, 240) };
+        job = updateJob(jobId, { cursor: { ...job.cursor, autoReadbacks: ledger } });
+      }
+    }
+    job = getJob(jobId);
+    if (job) this.emitUpdate(job);
+    if (job && this.autoReadbackCandidates(job).length) {
+      const timer = setTimeout(() => void this.runAutoReadbacks(jobId), 10000);
+      timer.unref?.();
+      this.readbackTimers.set(jobId, timer);
+    }
   }
 
   async recheckCommentAction(jobId, actionId) {
@@ -488,14 +672,15 @@ export class TaskRunner extends EventEmitter {
     this.emitUpdate(corrected);
     const row = db.prepare('SELECT * FROM task_step_state WHERE job_id=? AND step_key=?').get(jobId, action.step_key);
     if (row) db.prepare("UPDATE task_step_state SET state='done',outcome='succeeded' WHERE job_id=? AND step_key=?").run(jobId, action.step_key);
-    if (topic) log('success', '待核对评论已通过倒序昵称和完整文案复核', { accountId: account.id, topicId: topic.id, url: updated.url });
+    if (topic) log('success', '待核对评论已通过倒序昵称和完整文案复核', { accountId: account.id, topicId: topic?.id, url: updated.url });
     return { state: 'succeeded', url: updated.url, metrics };
   }
 
   start(input, accounts, topics) {
     this.enforceDailyStop();
-    if (this.dailyStopStatus().blocked) throw new DailyStopError('每日23:59停止任务，00:00后可开始新任务');
-    const existing = getActiveJob();
+    if (this.dailyStopEnabled() && this.dailyStopStatus().blocked) throw new DailyStopError('每日23:59停止任务，00:00后可开始新任务');
+    const existing = getActiveJob(input?.kind === 'engage' ? 'engage' : 'workbench');
+    if (this.scope && this.scope !== (input?.kind === 'engage' ? 'engage' : 'workbench')) throw Object.assign(new Error('任务类型不匹配'), { statusCode: 400 });
     if (existing) return { job: existing, created: false };
     const snapshot = createSnapshot(input, accounts, topics);
     const errors = validateSnapshot(snapshot);
@@ -505,9 +690,10 @@ export class TaskRunner extends EventEmitter {
       throw error;
     }
     let job = createJob(snapshot);
-    job = updateJob(job.id, { cursor: { ...job.cursor, deadlineAt: new Date(deadlineFor(this.now())).toISOString() } });
+    if (this.dailyStopEnabled()) job = updateJob(job.id, { cursor: { ...job.cursor, deadlineAt: new Date(deadlineFor(this.now())).toISOString() } });
     this.workflow.ensureSteps(job);
-    setSetting('task_defaults', { ...input, accountIds: undefined, topicIds: undefined });
+    if (snapshot.kind === 'engage') setSetting('engage_defaults', normalizeEngageSettings(input));
+    else setSetting('task_defaults', { ...input, accountIds: undefined, topicIds: undefined });
     this.emitUpdate(job);
     this.run(job.id);
     return { job, created: true };
@@ -521,13 +707,26 @@ export class TaskRunner extends EventEmitter {
       if (this.navigation.waiting(job) && !job.stopRequested && !job.pausedByUser) { this.navigation.arm(jobId); return; }
       if (job && !job.stopRequested && !['stopped','completed'].includes(job.status) && !job.pausedByUser && !await this.network.probe(job)) { this.network.pause(jobId); return; }
       return this.loop(jobId);
-    })().finally(() => { this.promise = null; this.runningJobId = null; });
+    })().finally(async () => {
+      try { await this.releaseEngageSession(); }
+      finally {
+        this.promise = null; this.runningJobId = null;
+        // Pause and edit availability are derived from both the persisted job
+        // and live runner state. Publish one final snapshot after the current
+        // browser operation has actually released its safe point.
+        const settled = getJob(jobId);
+        if (settled && (this.scope === 'engage' || settled.config?.kind === 'engage')) {
+          this.emitUpdate(settled);
+          if (['completed', 'stopped'].includes(settled.status)) this.scheduleAutoReadbacks(jobId);
+        }
+      }
+    });
     return this.promise;
   }
 
   async recover() {
     this.enforceDailyStop();
-    const job = getActiveJob();
+    const job = this.current();
     if (!job) return job;
     if (appConfig.topicMode === 'fixed' && validateSnapshot(job.config).length) {
       const paused = updateJob(job.id, { status: 'paused', pausedByUser: true, waitReason: validateSnapshot(job.config).join('；') });
@@ -540,6 +739,7 @@ export class TaskRunner extends EventEmitter {
     if (job.cursor.networkRecovery?.state === 'offline' && !job.pausedByUser) { this.network.arm(job.id); return job; }
     if (this.workflow.enabled(job)) {
       this.workflow.recover(job.id);
+      this.workflow.restoreRejectedWorkbenchPosts(job.id);
       if (!job.pausedByUser && job.status !== 'paused' && !getJob(job.id).cursor.verificationBarrier) this.run(job.id);
       return getJob(job.id);
     }
@@ -574,7 +774,7 @@ export class TaskRunner extends EventEmitter {
 
   resume(jobId) {
     this.enforceDailyStop();
-    if (this.dailyStopStatus().blocked || this.isExpired(jobId)) throw new DailyStopError('任务已到每日截止时间，00:00后请新建任务');
+    if ((this.dailyStopEnabled() && this.dailyStopStatus().blocked) || this.isExpired(jobId)) throw new DailyStopError('任务已到每日截止时间，00:00后请新建任务');
     const job = getJob(jobId);
     if (job && appConfig.topicMode === 'fixed' && validateSnapshot(job.config).length) throw Object.assign(new Error(validateSnapshot(job.config).join('；')), { statusCode: 400 });
     if (!job || job.status !== 'paused') return job;
@@ -601,6 +801,7 @@ export class TaskRunner extends EventEmitter {
     this.assertEditable(job, version);
     const legacySegmentIds = (job.config.actionPlan || []).map((item, index) => item.segmentId || job.config.segmentIds?.[index] || `legacy-${index}`);
     const candidate = createSnapshot({ ...job.config, segmentIds: legacySegmentIds, ...(input || {}), materials: undefined }, listAccounts(), listTopics());
+    if (job.config.kind === 'engage') { candidate.schedulerVersion = job.config.schedulerVersion; candidate.snapshotVersion = job.config.snapshotVersion; }
     const originalTypes = new Map(legacySegmentIds.map((segmentId, index) => [segmentId, job.config.actionPlan[index].type]));
     candidate.segmentIds = candidate.segmentIds.map((segmentId, index) => originalTypes.has(segmentId) && originalTypes.get(segmentId) !== candidate.actionPlan[index].type ? id('seg_') : segmentId);
     if (new Set(candidate.segmentIds).size !== candidate.segmentIds.length) throw Object.assign(new Error('操作段标识重复，请刷新后重新修改'), { statusCode: 400 });
@@ -640,7 +841,7 @@ export class TaskRunner extends EventEmitter {
   }
 
   assertEditable(job, version) {
-    if (this.dailyStopStatus().blocked || this.isExpired(job.id)) throw new DailyStopError('已到每日截止时间，不能修改或继续任务');
+    if ((this.dailyStopEnabled() && this.dailyStopStatus().blocked) || this.isExpired(job.id)) throw new DailyStopError('已到每日截止时间，不能修改或继续任务');
     if (job.status !== 'paused' || !job.pausedByUser) throw Object.assign(new Error('任务必须手动暂停且当前步骤结束后才能修改'), { statusCode: 409 });
     if (this.promise || this.workflow.busy() || job.cursor.manualVerification) throw Object.assign(new Error('请等待当前操作和人工验证结束后再修改'), { statusCode: 409 });
     if (version != null && Number(version) !== Number(job.cursor.configVersion || 0)) throw Object.assign(new Error('任务参数已在其他页面更新，请刷新后重新修改'), { statusCode: 409 });
@@ -750,24 +951,26 @@ export class TaskRunner extends EventEmitter {
         continue;
       }
       const account = getAccount(step.accountId);
-      const topic = listTopics().find(item => item.id === step.topicId);
-      if (!account || !topic) {
-        await this.finishStep(job, step, 'failed', '账号或超话已不存在');
+      const isEngage = job.config.kind === 'engage';
+      const topic = isEngage ? { id: null, url: linkForStep(job, step), name: '指定微博' } : listTopics().find(item => item.id === step.topicId);
+      const link = isEngage ? String(step.topicId || '') : null;
+      if (!account || (!isEngage && !topic)) {
+        await this.finishStep(job, step, 'failed', isEngage ? '账号或链接已不存在' : '账号或超话已不存在');
         continue;
       }
       const identity = String(account.uid || `account:${account.id}`);
       const muted = (job.cursor?.muteLimits || []).find(item => item.round === step.round && item.identity === identity);
-      if (muted && ['post', 'comment'].includes(step.kind)) {
-        await this.finishStep(job, step, 'skipped', `本轮账号已禁言，跳过${step.kind === 'post' ? '发帖' : '评论'}；${muted.reason}`);
+      if (muted && ['post', 'comment', 'repost'].includes(step.kind)) {
+        await this.finishStep(job, step, 'skipped', `本轮账号已禁言，跳过${kindLabel(step.kind)}；${muted.reason}`);
         continue;
       }
       const kindLimit = (job.cursor?.rateLimits || []).find(item => item.round === step.round && item.identity === identity && item.kind === step.kind);
       if (kindLimit) {
-        await this.finishStep(job, step, 'skipped', `本轮${step.kind === 'post' ? '发帖' : step.kind === 'comment' ? '评论' : '签到'}频繁，跳过此操作；${kindLimit.reason}`);
+        await this.finishStep(job, step, 'skipped', `本轮${kindLabel(step.kind)}频繁，跳过此操作；${kindLimit.reason}`);
         continue;
       }
       const nextStep = steps[index + 1];
-      const cursor = { ...job.cursor, current: { ...step, accountName: account.name, topicName: topic.name } };
+      const cursor = { ...job.cursor, current: { ...step, accountName: account.name, topicName: topic?.name || link || '' } };
       job = updateJob(jobId, { status: 'running', cursor, waitReason: null });
       this.emitUpdate(job);
       let skipped = false;
@@ -797,16 +1000,24 @@ export class TaskRunner extends EventEmitter {
           const state = error.rejected ? 'skipped' : 'uncertain';
           const identity = String(account.uid || `account:${account.id}`);
           const restrictedKind = error.kind || step.kind;
+          const action = getStepAction(jobId, stepKeyFor(step));
+          const submitted = Boolean(action?.submitted_at) || ['submitted', 'uncertain'].includes(action?.state);
           recordAccountRestriction({ accountId: account.id, identity, type: 'frequent', kind: restrictedKind, reason, detectedAt: new Date(this.now()).toISOString(), expiresAt: new Date(this.now() + 60 * 60 * 1000).toISOString(), jobId });
           this.accountRestrictionsAt = 0;
           const current = getJob(jobId);
           const rateLimits = [...(current.cursor?.rateLimits || [])];
-          if (!rateLimits.some(item => item.round === step.round && item.identity === identity && item.kind === step.kind)) {
-            rateLimits.push({ round: step.round, identity, accountId: account.id, kind: step.kind, at: new Date().toISOString(), reason });
+          if (!rateLimits.some(item => item.round === step.round && item.identity === identity && item.kind === restrictedKind)) {
+            rateLimits.push({ round: step.round, identity, accountId: account.id, kind: restrictedKind, at: new Date().toISOString(), reason });
           }
-          updateJob(jobId, { cursor: { ...current.cursor, rateLimits, notice: `本轮${step.kind === 'post' ? '发帖' : '评论'}频繁，后续同类操作已跳过：${reason}` } });
-          log('warning', `本轮${step.kind === 'post' ? '发帖' : '评论'}频繁，后续同类操作跳过：${reason}`, { accountId: account.id, topicId: topic.id });
-          await this.advance(jobId, step, state, `本轮${step.kind === 'post' ? '发帖' : '评论'}频繁，跳过后续同类操作`);
+          const label = kindLabel(restrictedKind);
+          updateJob(jobId, { cursor: { ...current.cursor, rateLimits, notice: `本轮${label}频繁，仅跳过后续${label}：${reason}` } });
+          log('warning', `本轮${label}频繁，仅跳过后续${label}：${reason}`, { accountId: account.id, topicId: topic?.id, jobId });
+          if (restrictedKind !== step.kind && !submitted) {
+            if (action && !['succeeded','submitted','uncertain'].includes(action.state)) updateActionLog(action.id, { state: 'prepared', error: '' });
+            await this.interruptibleWait(jobId, 1000, `本轮${label}频繁，继续执行${kindLabel(step.kind)}`);
+            continue;
+          }
+          await this.advance(jobId, step, submitted ? 'uncertain' : state, `本轮${label}频繁，跳过后续${label}`);
           continue;
         }
         if (error instanceof MutedError) {
@@ -817,12 +1028,14 @@ export class TaskRunner extends EventEmitter {
             muteLimits.push({ round: step.round, identity, accountId: account.id, at: new Date().toISOString(), reason });
           }
           updateJob(jobId, { cursor: { ...current.cursor, muteLimits, notice: `本轮账号禁言，后续发帖和评论已跳过：${reason}` } });
-          log('warning', `本轮账号禁言，后续发帖和评论跳过：${reason}`, { accountId: account.id, topicId: topic.id });
+          recordAccountRestriction({ accountId: account.id, identity, type: 'mute', reason, detectedAt: new Date(this.now()).toISOString(), expiresAt: new Date(this.now() + 24 * 60 * 60 * 1000).toISOString(), jobId });
+          this.accountRestrictionsAt = 0;
+          log('warning', `本轮账号禁言，后续发帖和评论跳过：${reason}`, { accountId: account.id, topicId: topic?.id, jobId });
           await this.advance(jobId, step, error.rejected ? 'failed' : 'uncertain', '本轮账号禁言，后续发帖和评论已跳过');
           continue;
         }
         if (error instanceof VerificationError) {
-          log('warning', error.message, { accountId: account.id, topicId: topic.id });
+          log('warning', error.message, { accountId: account.id, topicId: topic?.id, jobId });
           const action = getStepAction(jobId, stepKeyFor(step));
           const current = getJob(jobId);
           const verificationRecovery = {
@@ -852,11 +1065,11 @@ export class TaskRunner extends EventEmitter {
         }
         if (error instanceof AuthenticationError) {
           const reason = error instanceof IdentityMismatchError ? `UID 不符，账号已跳过：${error.message}` : `登录失效，账号已跳过：${account.name}`;
-          log('error', reason, { accountId: account.id, topicId: topic.id });
+          log('error', reason, { accountId: account.id, topicId: topic?.id, jobId });
           await this.skipAccount(jobId, step, reason);
           continue;
         }
-        log('error', serializeError(error), { accountId: account.id, topicId: topic.id });
+        log('error', serializeError(error), { accountId: account.id, topicId: topic?.id, jobId });
         await this.finishStep(getJob(jobId), step, 'failed', serializeError(error));
       }
       job = getJob(jobId);
@@ -871,11 +1084,12 @@ export class TaskRunner extends EventEmitter {
   }
 
   async execute(job, step, account, topic, { reuseVisiblePage = false } = {}) {
+    if (job.config.kind === 'engage') return this.executeEngage(job, step, account, topic, { reuseVisiblePage });
     if (step.kind === 'checkin') {
       const localDate = shanghaiDate();
       const previous = getCheckin(account.id, topic.id, localDate);
       if (previous?.status === 'succeeded') {
-        log('info', '今天已经签到，跳过', { accountId: account.id, topicId: topic.id });
+        log('info', '今天已经签到，跳过', { accountId: account.id, topicId: topic?.id });
         return { state: 'skipped' };
       }
       return this.loggedAction(job, step, account, topic, null, null, async actionId => {
@@ -888,16 +1102,18 @@ export class TaskRunner extends EventEmitter {
         return result;
       });
     }
+    const manual = this.workbenchVerification(job) && this.workflow.session?.jobId === job.id
+      && this.workflow.session.stepKey === stepKeyFor(step);
     if (step.kind === 'post') {
       const existing = getStepAction(job.id, stepKeyFor(step));
       if (existing?.sequence_number != null) this.restoreSequence(job.id, step, 'post', existing.sequence_number, Boolean(existing.sequence_confirmed));
       const materials = Array.isArray(job.config.materials.posts) ? job.config.materials.posts : (job.config.materials.posts[account.id] || []);
       const material = pickRandom(materials);
       if (!material) throw new UnsupportedPageError(`账号“${account.name}”没有可用发帖文案`);
-      const content = this.actionContent(job, step, 'post', job.config.postDecoration, () => material.text);
+      const content = (manual && existing?.submitted_at && existing.content) || this.actionContent(job, step, 'post', job.config.postDecoration, () => material.text);
       return this.loggedAction(job, step, account, topic, null, content, async actionId => {
         const attemptId = getActionLog(actionId).attempt_id;
-        let result = await this.adapter.post(account, topic, content, { attemptId, actionId, syncToHome: job.config.syncToHome === true, deadlineAt: this.taskDeadline(getJob(job.id)), onReceipt: receipt => {
+        let result = await this.adapter.post(account, topic, content, { attemptId, actionId, workbenchVerification: this.workbenchVerification(job), syncToHome: job.config.syncToHome === true, deadlineAt: this.taskDeadline(getJob(job.id)), onReceipt: receipt => {
           // Saving evidence is allowed after Stop; scheduling more work is not.
           this.settlePostAction(actionId, { ...receipt, state: 'succeeded', attemptId });
         }, onSubmit: () => this.markSubmitted(job.id, step, actionId, attemptId) });
@@ -910,12 +1126,209 @@ export class TaskRunner extends EventEmitter {
         return this.acceptedPost(actionId) || result;
       });
     }
+    if (manual) {
+      const original = getStepAction(job.id, stepKeyFor(step));
+      if (original?.target_id && original.url && original.content) {
+        const candidate = { id: original.target_id, url: original.url.split('?')[0] };
+        if (original.sequence_number != null) this.restoreSequence(job.id, step, 'comment', original.sequence_number, Boolean(original.sequence_confirmed));
+        const content = original.submitted_at ? original.content : this.actionContent(job, step, 'comment',
+          job.config.commentDecoration || job.config.decoration, () => original.content);
+        return this.loggedAction(job, step, account, topic, candidate.id, content, async actionId => {
+          const options = this.commentSubmitOptions(job, step, actionId);
+          const result = await this.adapter.comment(account, candidate, content, options);
+          this.assertExecutionAlive();
+          const state = result.retryElsewhere ? 'failed' : result.state;
+          this.settlePostAction(actionId, { state, url: result.url, error: result.reason, attemptId: options.attemptId });
+          return { ...result, state, retryElsewhere: false };
+        });
+      }
+      if (original?.submitted_at) return { state: 'uncertain', reason: '原评论缺少目标或文案，不能在验证窗口更换目标' };
+    }
     return this.executeComment(job, step, account, topic);
+  }
+
+  async assertEngageConnectivity(job, step, { forceNetwork = false } = {}) {
+    if (!await this.network.probe(getJob(job.id), { force: forceNetwork })) {
+      this.network.pause(job.id, step);
+      throw new NetworkOfflineError('提交前检测到网络断开');
+    }
+    const current=getJob(job.id);
+    const manual = this.groupedEngage(job) && this.activeManualStep(job.id, step);
+    // Grouped engage intentionally pauses the mainline while a verification
+    // window is active.  The selected manual step is the only operation that
+    // may continue through that pause.
+    if(this.groupedEngage(job) && !manual && (current.pausedByUser || current.stopRequested || current.status==='paused')) {
+      throw Object.assign(new Error('转赞评已暂停或停止，未提交新操作'),{code:'engage_interrupted',unsubmitted:true});
+    }
+    if (this.groupedEngage(job) && current.cursor.manualVerification && !manual)
+      throw Object.assign(new Error('当前步骤不属于已打开的人工验证会话'),{code:'engage_interrupted',unsubmitted:true});
+    this.assertMaySubmit(job.id);
+  }
+
+  engageSubmitOptions(job, step, actionId) {
+    const attemptId = getActionLog(actionId)?.attempt_id;
+    return { attemptId, actionId, beforeSubmit: () => this.assertEngageConnectivity(job, step, { forceNetwork: true }), deadlineAt: this.taskDeadline(getJob(job.id)), onSubmit: () => this.markSubmitted(job.id, step, actionId, attemptId) };
+  }
+
+  engageCouplingFor(job, step) {
+    const coupling = engageStepCoupling(job.config, step);
+    if (!coupling?.isPrimary) return { coupling: null, enabled: false, companionKind: '' };
+    const disabled = job.cursor?.disabledCouplings?.[stepKeyFor(step)] === coupling.companionKind;
+    return { coupling, enabled: !disabled, companionKind: coupling.companionKind };
+  }
+
+  pickSnapshotRepost(job) {
+    const materials = job.config.materials.reposts || [];
+    const lastText = getSetting('last_repost_text', '') || materials.find(item => item.id === getSetting('last_repost_material_id', ''))?.text?.trim();
+    const choices = materials.filter(item => item.text.trim() !== lastText);
+    if (!choices.length) throw new UnsupportedPageError('没有与上次不同的转发原文，请补充文案');
+    const selected = pickRandom(choices);
+    setSetting('last_repost_material_id', selected.id);
+    setSetting('last_repost_text', selected.text.trim());
+    return selected;
+  }
+
+  async executeEngage(job, step, account, topic, { reuseVisiblePage = false } = {}) {
+    const link = String(step.topicId || step.link || '');
+    if (step.kind === 'repost') return this.executeRepost(job, step, account, link);
+    if (step.kind === 'comment') return this.executeEngageComment(job, step, account, link);
+    if (step.kind === 'like') return this.executeLikePost(job, step, account, link);
+    if (step.kind === 'comment_like') return this.executeInnerLike(job, step, account, link);
+    return { state: 'failed', reason: '未知的转赞评操作' };
+  }
+
+  async executeRepost(job, step, account, link) {
+    const existing = getStepAction(job.id, stepKeyFor(step));
+    if (existing?.sequence_number != null) this.restoreSequence(job.id, step, 'repost', existing.sequence_number, Boolean(existing.sequence_confirmed));
+    const withText = (job.config.actionPlan[step.actionIndex]?.repostForm || job.config.repostForm) !== 'plain';
+    const content = withText ? this.actionContent(job, step, 'repost', job.config.repostDecoration, () => this.pickSnapshotRepost(job).text) : '';
+    const coupling = this.engageCouplingFor(job, step);
+    return this.loggedAction(job, step, account, { id: null, url: link }, null, content || null, async actionId => {
+      const attemptId = getActionLog(actionId).attempt_id;
+      const result = await this.adapter.repostWeibo(account, link, content, { attemptId, actionId, beforeSubmit: () => this.assertEngageConnectivity(job, step, { forceNetwork: true }), onSubmit: () => this.markSubmitted(job.id, step, actionId, attemptId), deadlineAt: this.taskDeadline(getJob(job.id)), onReceipt: receipt => this.settlePostAction(actionId, { ...receipt, state: 'succeeded', attemptId }), alsoComment: coupling.enabled });
+      this.assertExecutionAlive();
+      if (result.state === 'uncertain' && !await this.network.probe(getJob(job.id))) throw new NetworkOfflineError('转发提交后网络不可用，等待只读核验');
+      updateActionLog(actionId, { state: result.state, url: result.url || link, error: result.reason, successSource:result.successSource });
+      return result;
+    });
+  }
+
+  async executeEngageComment(job, step, account, link) {
+    const existing = getStepAction(job.id, stepKeyFor(step));
+    if (existing?.sequence_number != null) this.restoreSequence(job.id, step, 'comment', existing.sequence_number, Boolean(existing.sequence_confirmed));
+    const parsed = parseWeiboLink(link);
+    const candidate = { id: parsed.id, url: parsed.authorUid ? link : 'https://weibo.com/detail/' + parsed.id, authorUid: parsed.authorUid };
+    const decoration = job.config.commentDecoration || job.config.decoration;
+    const content = this.actionContent(job, step, 'comment', decoration, () => this.pickSnapshotComment(job).text);
+    return this.loggedAction(job, step, account, { id: null, url: link }, candidate.id, content, async actionId => {
+      updateActionLog(actionId, { url: link, targetId: candidate.id });
+      const result = await this.adapter.comment(account, candidate, content, { ...this.commentSubmitOptions(job, step, actionId), engage:true, beforeSubmit: () => this.assertEngageConnectivity(job, step, { forceNetwork: true }) });
+      if (result.state === 'uncertain' && !await this.network.probe(getJob(job.id))) throw new NetworkOfflineError('评论提交后网络不可用，等待只读核验');
+      this.assertExecutionAlive();
+      updateActionLog(actionId, { state: result.state, url: result.url || link, error: result.reason, targetId: candidate.id });
+      if (result.state === 'succeeded') recordComment(account.id, candidate.id, result.url || link);
+      return result;
+    });
+  }
+
+  async executeLikePost(job, step, account, link) {
+    return this.loggedAction(job, step, account, { id: null, url: link }, null, null, async actionId => {
+      const result = await this.adapter.likeWeibo(account, link, { ...this.engageSubmitOptions(job, step, actionId), blacklistUids: job.config.likeBlacklistUids, blacklistKeywords: job.config.likeBlacklistKeywords });
+      this.assertExecutionAlive();
+      if (result.state === 'uncertain' && !await this.network.probe(getJob(job.id))) throw new NetworkOfflineError('点赞提交后网络不可用，等待只读核验');
+      updateActionLog(actionId, { state: result.state, url: result.url || link, error: result.reason, successSource:result.successSource });
+      return result;
+    });
+  }
+
+  async executeInnerLike(job, step, account, link) {
+    if (this.groupedEngage(job) && this.adapter.likeNextComment) return this.executeStreamingInnerLike(job, step, account, link);
+    return this.loggedAction(job, step, account, { id: null, url: link }, null, null, async actionId => {
+      const existing = getActionLog(actionId);
+      let commentId = existing?.target_id, result;
+      // Already-liked targets never consume a requested new like. Only replace
+      // a target when the adapter explicitly confirms no click was submitted.
+      for(let skipped=0;skipped<500;skipped++) {
+        this.assertMaySubmit(job.id);
+        if(!commentId) commentId=await this.innerLikeTarget(getJob(job.id),step,account,link);
+        if(!commentId) return {state:'skipped',reason:'没有更多符合条件的未赞评论'};
+        updateActionLog(actionId,{targetId:commentId,url:link});
+        result=await this.adapter.likeComment(account,link,commentId,this.engageSubmitOptions(job,step,actionId));
+        if(result.alreadyDone === true && !getActionLog(actionId)?.submitted_at) {commentId=null;continue;}
+        break;
+      }
+      if(!result || result.alreadyDone) return {state:'skipped',reason:'没有更多未赞评论'};
+      this.assertExecutionAlive();
+      if (result.state === 'uncertain' && !await this.network.probe(getJob(job.id))) throw new NetworkOfflineError('点赞提交后网络不可用，等待只读核验');
+      updateActionLog(actionId, { state: result.state, url: result.url || link, error: result.reason, successSource:result.successSource });
+      return result;
+    });
+  }
+
+  async executeStreamingInnerLike(job, step, account, link) {
+    return this.loggedAction(job, step, account, {id:null,url:link}, null, null, async actionId => {
+      const fresh = getJob(job.id);
+      const usedKey = JSON.stringify([step.round,link,account.id]);
+      const used = fresh.cursor.engageInnerSeen?.[usedKey] || [];
+      const action = getActionLog(actionId);
+      const assertRunning = () => {
+        this.assertMaySubmit(job.id);
+        const current = getJob(job.id);
+        const manual = this.activeManualStep(job.id, step);
+        if (!manual && (current.pausedByUser || current.status === 'paused' || current.stopRequested)) {
+          throw Object.assign(new Error('任务已暂停或停止，内赞扫描已中断'), {code:'engage_interrupted',unsubmitted:true});
+        }
+        if (current.cursor.manualVerification && !manual)
+          throw Object.assign(new Error('当前内赞不属于已打开的人工验证会话'),{code:'engage_interrupted',unsubmitted:true});
+      };
+      const result = await this.adapter.likeNextComment(account, link, {
+        ...this.engageSubmitOptions(job,step,actionId), assertRunning, excludedKeys:used,
+        includeVisibleReplies: job.config.actionPlan?.[step.actionIndex]?.includeVisibleReplies === true,
+        keyword:job.config.innerLikeKeyword, keywords:job.config.innerLikeKeywords,
+        blacklistKeywords:job.config.likeBlacklistKeywords, blacklistUids:job.config.likeBlacklistUids,
+        target:action.target_id ? {id:action.target_id,key:action.target_id} : null,
+        onTarget:target => {
+          assertRunning();
+          updateActionLog(actionId,{targetId:target.key || target.id,url:link});
+          const current = getJob(job.id), seen = current.cursor.engageInnerSeen || {};
+          updateJob(job.id,{cursor:{...current.cursor,engageInnerSeen:{...seen,[usedKey]:[...new Set([...(seen[usedKey] || []),target.key || target.id])]}}});
+        }
+      });
+      if (result.state === 'uncertain' && !await this.network.probe(getJob(job.id))) throw new NetworkOfflineError('点赞提交后网络不可用，等待只读核验');
+      this.assertExecutionAlive();
+      updateActionLog(actionId,{state:result.state,url:result.url || link,error:result.reason,successSource:result.successSource});
+      return result;
+    });
+  }
+
+  async innerLikeTarget(job, step, account, link) {
+    const poolKey = 'innerLike:' + step.round + ':' + link + ':' + account.id;
+    const fresh = getJob(job.id);
+    const pools = { ...(fresh.cursor?.engageInnerPools || {}) };
+    let pool = pools[poolKey];
+    if (!Array.isArray(pool) || !pool.some(idValue => !((fresh.cursor?.engageInnerUsed || {})['innerLikeUsed:' + step.round + ':' + link + ':' + account.id] || []).includes(idValue))) {
+      const matched = await this.adapter.scanComments(account, link, {
+        keyword: job.config.innerLikeKeyword, keywords: job.config.innerLikeKeywords,
+        blacklistKeywords: job.config.likeBlacklistKeywords,
+        blacklistUids: job.config.likeBlacklistUids,
+        limit: Math.min(500, Math.max(20, Number(job.config.actionPlan[step.actionIndex]?.count || 1) + ((fresh.cursor?.engageInnerUsed || {})['innerLikeUsed:' + step.round + ':' + link + ':' + account.id] || []).length + 10)), assertRunning:()=>this.assertMaySubmit(job.id)
+      });
+      pool = (matched || []).map(item => String(item.id));
+      pools[poolKey] = pool;
+      updateJob(job.id, { cursor: { ...getJob(job.id).cursor, engageInnerPools: pools } });
+    }
+    const usedKey = 'innerLikeUsed:' + step.round + ':' + link + ':' + account.id;
+    const used = new Set((fresh.cursor?.engageInnerUsed || {})[usedKey] || []);
+    const target = pool.find(idValue => !used.has(idValue));
+    if (!target) return null;
+    used.add(target);
+    updateJob(job.id, { cursor: { ...getJob(job.id).cursor, engageInnerUsed: { ...(getJob(job.id).cursor?.engageInnerUsed || {}), [usedKey]: [...used] } } });
+    return target;
   }
 
   commentSubmitOptions(job, step, actionId) {
     const attemptId = getActionLog(actionId)?.attempt_id;
-    return { attemptId, actionId, deadlineAt: this.taskDeadline(getJob(job.id)),
+    return { attemptId, actionId, workbenchVerification: this.workbenchVerification(job), deadlineAt: this.taskDeadline(getJob(job.id)),
       onSubmit: () => this.markSubmitted(job.id, step, actionId, attemptId),
       onReceipt: receipt => this.settlePostAction(actionId, { ...receipt, state: 'succeeded', attemptId }) };
   }
@@ -1298,7 +1711,7 @@ export class TaskRunner extends EventEmitter {
   releaseSequence(jobId, step) {
     const job = getJob(jobId); if (!job) return;
     const stepKey = stepKeyFor(step);
-    if (['post','comment'].includes(step.kind) && getStepAction(jobId, stepKey)?.state === 'succeeded') return;
+    if (['post','comment','repost','like','comment_like'].includes(step.kind) && getStepAction(jobId, stepKey)?.state === 'succeeded') return;
     const reservation = job.cursor?.sequenceReservations?.[stepKey];
     if (!reservation) return;
     const reservations = { ...(job.cursor?.sequenceReservations || {}) };
@@ -1322,22 +1735,23 @@ export class TaskRunner extends EventEmitter {
     }
     if (existing?.state === 'succeeded') return { state: 'succeeded', url: existing.url };
     const reservation = getJob(job.id)?.cursor?.sequenceReservations?.[stepKey];
-    const actionId = existing?.id || createActionLog({ jobId: job.id, stepKey, kind: step.kind, accountId: account.id, topicId: topic.id, targetId, content, state: 'prepared', sequenceNumber: reservation?.number, sequenceConfirmed: reservation?.confirmed });
-    if (['post','comment'].includes(step.kind)) beginPostAttempt(actionId, id('attempt_'));
+    const actionId = existing?.id || createActionLog({ jobId: job.id, stepKey, kind: step.kind, accountId: account.id, topicId: topic?.id, link: job.config.kind === 'engage' ? linkForStep(job, step) : null, targetId, content, state: 'prepared', sequenceNumber: reservation?.number, sequenceConfirmed: reservation?.confirmed });
+    if (job.config.kind === 'engage') updateActionLog(actionId, { url: linkForStep(job, step) });
+    if (['post','comment','repost','like','comment_like'].includes(step.kind)) beginPostAttempt(actionId, id('attempt_'));
     if (existing && this.workflow.enabled(job)) updateActionLog(actionId, { content, sequenceNumber: reservation?.number ?? existing.sequence_number, sequenceConfirmed: reservation?.confirmed ?? Boolean(existing.sequence_confirmed) });
     try {
       const result = await callback(actionId);
       if (['succeeded', 'uncertain'].includes(result?.state)) this.confirmSequence(job.id, step);
       else if (['failed', 'cancelled'].includes(result?.state)) this.releaseSequence(job.id, step);
-      log(result.state === 'succeeded' ? 'success' : 'warning', `${step.kind}：${result.state}`, { accountId: account.id, topicId: topic.id, url: result.url });
+      log(result.state === 'succeeded' ? 'success' : 'warning', `${step.kind}：${result.state}`, { accountId: account.id, topicId: topic?.id, url: result.url });
       return result;
     } catch (error) {
       const accepted = getActionLog(actionId);
-      if (['post','comment'].includes(step.kind) && accepted?.state === 'succeeded') {
+      if (['post','comment','repost','like','comment_like'].includes(step.kind) && accepted?.state === 'succeeded') {
         this.confirmSequence(job.id, step);
         return { state: 'succeeded', url: accepted.receipt_url || accepted.url, receiptId: accepted.receipt_id, receiptUrl: accepted.receipt_url };
       }
-      if (['post','comment'].includes(step.kind) && error.code === 'receipt_persistence_failed') {
+      if (['post','comment','repost','like','comment_like'].includes(step.kind) && error.code === 'receipt_persistence_failed') {
         updateActionLog(actionId, { state: 'uncertain', error: error.message, verificationPending: false });
         this.confirmSequence(job.id, step);
         this.emitUpdate(updateJob(job.id, { status: 'paused', pausedByUser: true, waitReason: error.message }));
@@ -1345,6 +1759,10 @@ export class TaskRunner extends EventEmitter {
       }
       if (await this.navigation.handle(error, job.id, step)) throw error;
       if (await this.network.handle(error, job.id, step)) throw error;
+      if (error.code === 'engage_interrupted' && this.groupedEngage(job) && !getActionLog(actionId)?.submitted_at) {
+        updateActionLog(actionId,{state:'prepared'});
+        throw error;
+      }
       if (error instanceof DailyStopError && error.unsubmitted) {
         const context = this.executionStorage.getStore();
         if (context) context.submitted = false;
@@ -1483,9 +1901,11 @@ export class TaskRunner extends EventEmitter {
   emitUpdate(job) { this.emit('update', job ? { ...job, progress: taskProgress(job) } : job); }
 }
 
-export function createRunner(browserManager) {
-  return new TaskRunner(new WeiboAdapter(browserManager));
+export function createRunner(browserManager, options = {}) {
+  return new TaskRunner(new WeiboAdapter(browserManager), options);
 }
+
+function linkForStep(job, step) { return step.link || job.config.linkIdentities?.[step.topicId]?.url || step.topicId; }
 
 function stepKeyFor(step) {
   return `${step.round}:${step.topicId}:${step.accountId}:${step.segmentId || step.actionIndex}:${step.unitIndex}`;

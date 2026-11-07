@@ -2,17 +2,22 @@
 
 这是一个只在本机运行的控制台。它使用独立 Chrome 登录目录管理多个微博账号，并按“轮次 → 超话 → 账号 → 操作段”的顺序串行执行签到、文字发帖和评论。
 
-当前版本：**v1.0.1 Windows 修订版**（2026-11-02，同版本替换下载包）。修复 Windows 依赖安装、后台启动、健康检查和重启，保留此前发布结果识别、人工验证、页面恢复与统计改进；完整变更见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本：**v1.1.0**（2026-11-08）。新增转赞评无头运行、应用内 GitHub 更新、Mac DMG 与 Windows 安装器、独立版本目录和失败回滚；完整变更见 [CHANGELOG.md](CHANGELOG.md)。
 
-## 安装（Mac / Windows 通用）
+## 安装
 
-1. 从 GitHub Releases 下载 `weibo-console-<版本>.zip` 并解压。
-2. Mac：`bash install.sh`；Windows：`powershell -ExecutionPolicy Bypass -File install.ps1`。
-3. 打开 http://localhost:4178 ，确认本地服务页面可访问；首次安装显示激活页即完成安装验收。
+1. Mac 按芯片下载 `weibo-console-1.1.0-mac-arm64.dmg` 或 `weibo-console-1.1.0-mac-x64.dmg`。
+2. Windows x64 下载 `weibo-console-1.1.0-windows-x64.exe`。
+3. 打开 http://localhost:4178 ，首次显示激活页即完成安装验收。
 
-安装仅准备本地运行环境、启动服务并配置开机自启，不包含扫码登录微博、创建任务或执行签到、发帖、评论。激活软件、输入访问口令、登录账号及运行任务由用户在安装完成后另行决定。
+安装仅准备本地运行环境、启动服务和当前用户登录自启，不包含扫码登录微博、创建任务或执行业务操作。
 
-安装脚本会自动准备便携 Node 24、依赖和浏览器；详细步骤与排障见 [INSTALL.md](INSTALL.md)，给 agent 的说明见 [AGENTS.md](AGENTS.md)。
+完整步骤、SHA256、系统放行、数据目录和排障：
+
+- [Mac 手动安装与更新](docs/手动安装与更新-Mac.md)
+- [Windows 手动安装与更新](docs/手动安装与更新-Windows.md)
+
+原有 `weibo-console-1.1.0.zip` 保留给旧版更新器过渡使用；新安装优先使用 DMG 或 EXE。通用说明见 [INSTALL.md](INSTALL.md)。
 
 ## 主要功能
 
@@ -30,12 +35,13 @@
 ## 更新与维护
 
 ```bash
-node bootstrap.mjs update          # 更新程序，保留 data/（账号、文案、激活状态）
+node bootstrap.mjs update          # 命令行更新；页面也可从侧边栏“更新”进入
+node bootstrap.mjs rollback        # 管理版健康检查失败时回退到上一个已安装版本
 node bootstrap.mjs doctor          # 体检：Node / 依赖 / 浏览器 / 端口 / 网络 / 激活
 node bootstrap.mjs service install # 开机自启（Mac launchd / Windows 计划任务）
 ```
 
-从 v1.0.0 更新后，首次启动会自动补充数据库字段并迁移旧的待验证展示状态，无需重新添加账号或扫码登录。请先在页面安全暂停当前任务，再更新。已下载旧 v1.0.1 的用户需重新下载修订包，按 [INSTALL.md](INSTALL.md) 的“同版本修复”步骤在原目录替换程序；旧更新器会跳过同版本，直接执行 update 不会取得本次修复。
+页面更新只显示当前系统和架构的 Release；下载必须来自官方 GitHub 域名并通过 SHA256。更新会创建数据库快照，切换独立版本目录和 `current.json`，不改动 `data/`。任务、扫码、人工验证或浏览器占用时只允许预下载，不允许应用。v1.0.1 用户在旧安装目录升级到 v1.1.0 后，后续版本可从页面更新。
 
 ## 开发
 
@@ -114,4 +120,4 @@ npm test
 npm run test:e2e
 ```
 
-测试使用临时数据和模拟微博页面，不需要真实账号。GitHub CI 运行 macOS / Node 24 单元测试，以及 Windows 原生服务测试和全新安装验收：中文及空格目录、便携 Node、依赖安装、计划任务与当前用户启动文件夹、浏览器激活页、重启和卸载。端到端任务测试使用 macOS Google Chrome 与模拟微博页面；安装验收不使用真实微博账号。
+测试使用临时数据和模拟微博页面，不需要真实账号。GitHub CI 在 macOS 与 Windows 原生 runner 上运行测试；Windows 还验证中文及空格目录、便携 Node、计划任务与当前用户启动文件夹、浏览器激活页、重启和卸载。端到端任务测试使用 macOS Google Chrome 与模拟微博页面；安装验收不使用真实微博账号。

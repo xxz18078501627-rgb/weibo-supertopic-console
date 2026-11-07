@@ -1,5 +1,5 @@
 const escapeHtml = (value = '') => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-const kindName = kind => ({ checkin: '签到', post: '发帖', comment: '评论' })[kind] || kind;
+const kindName = kind => ({ checkin: '签到', post: '发帖', comment: '评论', repost: '转发', like: '外赞', comment_like: '内赞' })[kind] || kind;
 const stateName = state => ({ succeeded: '成功', failed: '失败', uncertain: '待核对', skipped: '跳过', submitted: '已提交', prepared: '准备中', verification_wait: '待验证', cancelled: '已取消' })[state] || state;
 const displayState = action => action.display_state || action.state;
 const statusName = status => ({ running: '运行中', waiting: '等待中', paused: '已暂停', completed: '已完成', stopped: '已中止', failed: '失败' })[status] || status;
@@ -13,7 +13,7 @@ export function duration(milliseconds) {
 }
 
 function countTable(counts = {}) {
-  return `<div class="report-table-wrap"><table class="report-counts"><thead><tr><th>操作</th><th>成功</th><th>失败</th><th>待核对</th><th>跳过</th></tr></thead><tbody>${['checkin', 'post', 'comment'].map(kind => `<tr><th>${kindName(kind)}</th>${['succeeded', 'failed', 'uncertain', 'skipped'].map(state => `<td>${Number(counts[kind]?.[state] || 0)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+  return `<div class="report-table-wrap"><table class="report-counts"><thead><tr><th>操作</th><th>成功</th><th>失败</th><th>待核对</th><th>跳过</th></tr></thead><tbody>${['checkin', 'post', 'comment', ...['repost','comment_like','like'].filter(kind => Object.values(counts[kind] || {}).some(Number))].map(kind => `<tr><th>${kindName(kind)}</th>${['succeeded', 'failed', 'uncertain', 'skipped'].map(state => `<td>${Number(counts[kind]?.[state] || 0)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function anomalies(accounts = []) {
@@ -26,7 +26,7 @@ function accountDetails(accounts = []) {
 }
 
 export function roundHtml(report) {
-  return `<details class="round-report" data-report-key="${escapeHtml(report.jobId)}:${report.round}"><summary><b>第 ${report.round + 1} 轮 · ${statusName(report.status)}</b><span>耗时 ${duration(report.durationMs)}</span><small>${(report.abnormalAccounts || []).length ? `异常账号 ${(report.abnormalAccounts || []).length} 个` : '无异常账号'}</small></summary><div class="round-report-body"><p class="report-period">${localTime(report.startedAt)} — ${localTime(report.completedAt)} · ${report.accountCount} 个账号 / ${report.topicCount} 个超话</p>${report.stopReason ? `<p class="report-stop-reason">${escapeHtml(report.stopReason)}</p>` : ''}${countTable(report.counts)}${anomalies(report.abnormalAccounts)}${report.verification?.accounts ? `<p class="report-period">验证账号 ${report.verification.accounts} 个 · 触发 ${report.verification.triggers} 次 · 补做成功 ${report.verification.succeeded} 项 · 待补 ${report.verification.pending} 项 · 待核对 ${report.verification.uncertain} 项</p>` : ''}${accountDetails(report.accounts)}</div></details>`;
+  return `<details class="round-report" data-report-key="${escapeHtml(report.jobId)}:${report.round}"><summary><b>第 ${report.round + 1} 轮 · ${statusName(report.status)}</b><span>耗时 ${duration(report.durationMs)}</span><small>${(report.abnormalAccounts || []).length ? `异常账号 ${(report.abnormalAccounts || []).length} 个` : '无异常账号'}</small></summary><div class="round-report-body"><p class="report-period">${localTime(report.startedAt)} — ${localTime(report.completedAt)} · ${report.accountCount} 个账号 / ${report.topicCount} 个${report.scope === 'engage' ? '微博链接' : '超话'}</p>${report.stopReason ? `<p class="report-stop-reason">${escapeHtml(report.stopReason)}</p>` : ''}${countTable(report.counts)}${anomalies(report.abnormalAccounts)}${report.verification?.accounts ? `<p class="report-period">验证账号 ${report.verification.accounts} 个 · 触发 ${report.verification.triggers} 次 · 补做成功 ${report.verification.succeeded} 项 · 待补 ${report.verification.pending} 项 · 待核对 ${report.verification.uncertain} 项</p>` : ''}${accountDetails(report.accounts)}</div></details>`;
 }
 
 function jobCounts(records) {

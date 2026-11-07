@@ -13,11 +13,16 @@ const port = Number(process.env.WEIBO_CONSOLE_PORT || 4178);
 const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const require = createRequire(import.meta.url);
 const repoSlug = process.env.WEIBO_CONSOLE_REPO || readRepoSlug();
-const releaseApi = process.env.WEIBO_CONSOLE_RELEASE_API || (repoSlug ? `https://api.github.com/repos/${repoSlug}/releases/latest` : '');
+const releaseApi = process.env.WEIBO_CONSOLE_RELEASE_API || (repoSlug ? `https://api.github.com/repos/${repoSlug}/releases?per_page=30` : '');
 
 const argv = process.argv.slice(2);
 const command = argv[0] || 'install';
 const flags = new Set(argv.filter(item => item.startsWith('--')));
+const flagValue = name => { const index = argv.indexOf(name); return index >= 0 ? argv[index + 1] || '' : ''; };
+const platformKey = flagValue('--platform') || (process.platform === 'darwin'
+  ? `mac-${process.arch === 'arm64' ? 'arm64' : 'x64'}` : process.platform === 'win32' ? 'windows-x64' : '');
+const nativePlatformKey = process.platform === 'darwin'
+  ? `mac-${process.arch === 'arm64' ? 'arm64' : 'x64'}` : process.platform === 'win32' ? 'windows-x64' : '';
 
 function readRepoSlug() {
   try {
@@ -128,6 +133,36 @@ function service(action = 'install') {
   run(process.execPath, [path.join(root, 'scripts', 'service.mjs'), action]);
 }
 
+async function rollback() {
+  const installRoot = process.env.WEIBO_CONSOLE_INSTALL_ROOT || process.env.WEIBO_CONSOLE_DATA_DIR && path.dirname(process.env.WEIBO_CONSOLE_DATA_DIR);
+  if (!installRoot) throw new Error('仅管理版安装支持版本回滚；开发目录请使用 git 或原程序备份恢复');
+  const pointerPath = path.join(installRoot, 'current.json');
+  const current = JSON.parse(fs.readFileSync(pointerPath, 'utf8')).version;
+  const versions = fs.readdirSync(path.join(installRoot, 'versions'), { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(entry.name)
+      && fs.existsSync(path.join(installRoot, 'versions', entry.name, 'src', 'server.js')))
+    .map(entry => entry.name).sort((a, b) => compareVersion(b, a));
+  const target = versions.find(version => compareVersion(version, current) < 0);
+  if (!target) throw new Error(`没有可回滚到 ${current} 之前的已安装版本`);
+  console.log(`当前版本 ${current}，可回滚到 ${target}`);
+  if (flags.has('--check')) return;
+  const backup = pointerPath + '.before-rollback';
+  fs.copyFileSync(pointerPath, backup);
+  const staged = pointerPath + '.staging';
+  fs.writeFileSync(staged, JSON.stringify({ version: target, updatedAt: new Date().toISOString(), rollbackFrom: current }, null, 2), { mode: 0o600 });
+  fs.renameSync(staged, pointerPath);
+  if (flags.has('--no-restart')) { console.log(`已切换到 ${target}；当前服务未重启。`); return; }
+  process.env.WEIBO_CONSOLE_EXPECTED_VERSION = target;
+  try { service('restart'); }
+  catch (error) {
+    fs.copyFileSync(backup, pointerPath);
+    process.env.WEIBO_CONSOLE_EXPECTED_VERSION = current;
+    try { service('restart'); } catch {}
+    throw error;
+  } finally { delete process.env.WEIBO_CONSOLE_EXPECTED_VERSION; }
+  console.log(`已回滚到 ${target}，用户数据未改动。`);
+}
+
 async function install() {
   const nodeMajor = Number(process.versions.node.split('.')[0]);
   if (nodeMajor < 24) throw new Error('需要 Node 24 及以上，请先运行 install.sh / install.ps1');
@@ -140,11 +175,38 @@ async function install() {
   console.log('安装完成。打开页面后粘贴管理员提供的激活码即可。');
 }
 
+function compareVersion(a, b) {
+  const left = String(a || '').replace(/^v/, '').split('.').map(Number);
+  const right = String(b || '').replace(/^v/, '').split('.').map(Number);
+  for (let i = 0; i < 3; i += 1) if ((left[i] || 0) !== (right[i] || 0)) return (left[i] || 0) - (right[i] || 0);
+  return 0;
+}
+
 async function latestRelease() {
+  if (!['mac-arm64', 'mac-x64', 'windows-x64'].includes(platformKey) || platformKey !== nativePlatformKey) {
+    throw new Error(`更新包平台与当前电脑不一致：${platformKey || 'unsupported'} / ${nativePlatformKey || process.platform + '-' + process.arch}`);
+  }
   if (!releaseApi) throw new Error('未配置 GitHub 仓库，无法更新（package.json repository 或 WEIBO_CONSOLE_REPO）');
-  const response = await fetch(releaseApi, { headers: { 'User-Agent': 'weibo-console', Accept: 'application/vnd.github+json' } });
+  const response = await fetch(releaseApi, { headers: { 'User-Agent': 'weibo-console', Accept: 'application/vnd.github+json' }, signal: AbortSignal.timeout(15000) });
   if (!response.ok) throw new Error('获取最新版本失败：HTTP ' + response.status);
-  return response.json();
+  const payload = await response.json();
+  const releases = Array.isArray(payload) ? payload : [payload];
+  const candidates = [];
+  for (const release of releases) {
+    const manifestAsset = (release.assets || []).find(asset => asset.name === `weibo-console-${String(release.tag_name || '').replace(/^v/, '')}-${platformKey}.manifest.json`)
+      || (release.assets || []).find(asset => asset.name.endsWith(`-${platformKey}.manifest.json`));
+    if (!manifestAsset) continue;
+    const manifestResponse = await fetch(manifestAsset.browser_download_url, { headers: { 'User-Agent': 'weibo-console' }, signal: AbortSignal.timeout(15000) });
+    if (!manifestResponse.ok) continue;
+    const manifest = await manifestResponse.json();
+    if (manifest.platformKey !== platformKey) continue;
+    if (manifest.minVersion && compareVersion(JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version, manifest.minVersion) < 0) continue;
+    const asset = (release.assets || []).find(item => item.name === manifest.file);
+    if (asset && /^https:\/\/(github\.com|api\.github\.com|objects\.githubusercontent\.com|release-assets\.githubusercontent\.com)\//.test(String(asset.browser_download_url || ''))
+      && /^[a-f0-9]{64}$/i.test(String(manifest.sha256 || ''))) candidates.push({ release, manifest, asset });
+  }
+  candidates.sort((a, b) => compareVersion(b.manifest.version, a.manifest.version));
+  return candidates[0] || null;
 }
 
 function extract(zipPath, target) {
@@ -168,32 +230,33 @@ function copyTree(from, to) {
 }
 
 async function update() {
-  const release = await latestRelease();
+  const selected = await latestRelease();
   const current = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version;
-  const tag = String(release.tag_name || '').replace(/^v/, '');
-  console.log(`当前版本 ${current}，最新版本 ${tag || release.name}`);
+  if (!selected && flags.has('--check')) { console.log(`当前版本 ${current}：该平台没有兼容的 GitHub 更新`); return; }
+  const tag = selected?.manifest?.version || flagValue('--version');
+  console.log(`当前版本 ${current}，最新版本 ${tag || '未知'}（${platformKey}）`);
   if (flags.has('--check')) return;
   if (tag && tag === current && !flags.has('--force')) { console.log('已经是最新版本。同版本修复包可运行 node bootstrap.mjs update --force 重新安装。'); return; }
-  const asset = (release.assets || []).find(item => /^weibo-console-.*\.zip$/.test(item.name));
-  if (!asset) throw new Error('Release 中没有找到安装包');
+  if (!selected) throw new Error(`Release 中没有 ${platformKey} 的更新包`);
+  if (flagValue('--version') && compareVersion(flagValue('--version'), selected.manifest.version) !== 0) throw new Error('目标版本与最新 Release 不一致，请重新检查更新');
+  const { asset, manifest } = selected;
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'weibo-update-'));
   const zipPath = path.join(temp, asset.name);
-  const download = await fetch(asset.browser_download_url, { headers: { 'User-Agent': 'weibo-console' } });
+  const download = await fetch(asset.browser_download_url, { headers: { 'User-Agent': 'weibo-console' }, signal: AbortSignal.timeout(5 * 60 * 1000) });
   if (!download.ok) throw new Error('下载失败：HTTP ' + download.status);
+  if (download.url && !/^https:\/\/(github\.com|api\.github\.com|objects\.githubusercontent\.com|release-assets\.githubusercontent\.com)\//.test(download.url)) throw new Error('更新下载被重定向到非官方域名');
+  if (Number(download.headers.get('content-length') || manifest.size || 0) > 2 * 1024 * 1024 * 1024) throw new Error('更新包超过允许的大小');
   fs.writeFileSync(zipPath, Buffer.from(await download.arrayBuffer()));
-  if (asset.digest?.startsWith('sha256:')) {
-    const { createHash } = await import('node:crypto');
-    const digest = createHash('sha256').update(fs.readFileSync(zipPath)).digest('hex');
-    if (digest !== asset.digest.slice(7)) throw new Error('安装包校验失败，已中止');
-  }
-  extract(zipPath, temp);
-  const folder = fs.readdirSync(temp, { withFileTypes: true }).find(item => item.isDirectory() && item.name.startsWith('weibo-console'));
-  if (!folder) throw new Error('安装包结构不正确');
-  if (process.platform === 'win32') service('stop');
-  copyTree(path.join(temp, folder.name), root);
-  run(npmBin, ['ci', '--omit=dev']);
-  console.log('程序文件已更新，data 与登录状态保持不变。');
-  service(process.platform === 'win32' ? 'install' : 'restart');
+  const { createHash } = await import('node:crypto');
+  const digest = createHash('sha256').update(fs.readFileSync(zipPath)).digest('hex');
+  if (digest !== String(manifest.sha256 || '').toLowerCase()) throw new Error('安装包校验失败，已中止');
+  const installRoot = process.env.WEIBO_CONSOLE_INSTALL_ROOT || '';
+  const helperArgs = [path.join(root, 'scripts', 'update-helper.mjs'), '--package', zipPath,
+    '--version', tag, '--root', root, '--data', dataDir, '--install-root', installRoot,
+    flags.has('--no-restart') ? '--no-restart' : '--restart'];
+  try { run(process.execPath, helperArgs); }
+  finally { try { fs.rmSync(temp, { recursive: true, force: true }); } catch {} }
+  console.log('程序文件已更新，data 与登录状态保持不变。更新日志：' + path.join(dataDir, 'updates', 'update.log'));
 }
 
 function token() {
@@ -209,5 +272,6 @@ else if (command === 'start') start();
 else if (command === 'install') await install();
 else if (command === 'service') service(argv[1] || 'install');
 else if (command === 'update') await update();
+else if (command === 'rollback') await rollback();
 else if (command === 'token') token();
 else { console.error('用法：node bootstrap.mjs install|start|doctor|service|update|token'); process.exit(1); }

@@ -35,9 +35,9 @@ test('健康检查要求新监听 PID 和 HTTP 成功，不把旧进程当作新
   let requests = 0;
   const pid = await waitHealthy(11, { findPid: () => pids.shift(), interval: 0, attempts: 4,
     request: async (url, options) => {
-      assert.match(url, /^http:\/\/127\.0\.0\.1:/);
+      assert.match(url, /^http:\/\/127\.0\.0\.1:.*\/api\/health/);
       assert.ok(options.signal instanceof AbortSignal);
-      return { ok: ++requests === 2 };
+      return { ok: ++requests === 2, json: async () => ({ version: '1.2.0' }) };
     }
   });
   assert.equal(pid, 22);
@@ -47,6 +47,9 @@ test('健康检查要求新监听 PID 和 HTTP 成功，不把旧进程当作新
   }), /node bootstrap\.mjs start.*service-error\.log/);
   await assert.rejects(waitHealthy(null, { findPid: () => 22, attempts: 1, interval: 0,
     request: async () => { throw new Error('connection refused'); }
+  }), /启动健康检查/);
+  await assert.rejects(waitHealthy(11, { findPid: () => 23, attempts: 1, interval: 0, expectedVersion: '2.0.0',
+    request: async () => ({ ok: true, json: async () => ({ version: '1.0.0' }) })
   }), /启动健康检查/);
 });
 

@@ -9,6 +9,8 @@ export const RETENTION_DAYS = Math.max(1, Number(process.env.WEIBO_CONSOLE_RETEN
 
 db.exec("CREATE TABLE IF NOT EXISTS daily_stats (date TEXT PRIMARY KEY, counts_json TEXT NOT NULL DEFAULT '{}', job_count INTEGER NOT NULL DEFAULT 0, abnormal_accounts INTEGER NOT NULL DEFAULT 0, captured_at TEXT NOT NULL)");
 
+db.exec("CREATE TABLE IF NOT EXISTS daily_scope_stats (date TEXT NOT NULL,scope TEXT NOT NULL,counts_json TEXT NOT NULL DEFAULT '{}',success_json TEXT NOT NULL DEFAULT '{}',job_count INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(date,scope))");
+
 export function shiftDate(date, days) {
   const base = new Date(String(date) + 'T00:00:00Z');
   base.setUTCDate(base.getUTCDate() + days);
@@ -37,6 +39,17 @@ export function isArchivedRecord(date) {
 }
 
 function captureDailyStats(date) {
+  for (const scope of ['workbench', 'engage']) {
+    const counts = {}, success = {};
+    for (const row of db.prepare("SELECT kind,state,COUNT(*) n FROM action_logs WHERE scope=? AND strftime('%Y-%m-%d',started_at,'+8 hours')=? GROUP BY kind,state").all(scope,date)) {
+      const bucket = counts[row.kind] || (counts[row.kind] = { succeeded:0,failed:0,uncertain:0,skipped:0 });
+      if (row.state in bucket) bucket[row.state] = Number(row.n);
+    }
+    for (const row of db.prepare("SELECT kind,COUNT(*) n FROM action_logs WHERE scope=? AND state='succeeded' AND strftime('%Y-%m-%d',COALESCE(completed_at,started_at),'+8 hours')=? GROUP BY kind").all(scope,date)) success[row.kind] = Number(row.n);
+    const n = db.prepare("SELECT COUNT(*) n FROM jobs WHERE scope=? AND strftime('%Y-%m-%d',created_at,'+8 hours')=?").get(scope,date).n;
+    db.prepare('INSERT OR IGNORE INTO daily_scope_stats(date,scope,counts_json,success_json,job_count) VALUES(?,?,?,?,?)').run(date,scope,JSON.stringify(counts),JSON.stringify(success),n);
+  }
+
   if (db.prepare('SELECT 1 FROM daily_stats WHERE date=?').get(date)) return;
   if (!hasDetailedRecords(date)) return;
   const view = recordView(date, {});

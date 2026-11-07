@@ -104,6 +104,21 @@ test('共享探测只计一次；浏览器切换、手动暂停及旧任务结�
   assert.equal(d.getJob(job.id).status, 'paused');
 });
 
+test('登录浏览组内复用 15 秒成功探测，代际变化和强制检查重新探测', async () => {
+  let calls = 0;
+  const manager = { generation: 7, context: {} };
+  const { job, runner } = fixture({ browserManager: manager,
+    probeConnectivity: async () => { calls++; return { state: 'online', contextGeneration: manager.generation }; } });
+  assert.equal(await runner.network.probe(d.getJob(job.id)), true);
+  assert.equal(await runner.network.probe(d.getJob(job.id)), true);
+  assert.equal(calls, 1);
+  manager.generation += 1;
+  assert.equal(await runner.network.probe(d.getJob(job.id)), true);
+  assert.equal(calls, 2);
+  await runner.network.probe(d.getJob(job.id), { force: true });
+  assert.equal(calls, 3);
+});
+
 test('探测硬超时取消底层操作，返回未知而不是断网', async () => {
   let cancelled = false;
   const { job, runner } = fixture({ probeConnectivity: (_account, { signal }) => new Promise(() => { signal.addEventListener('abort', () => { cancelled = true; }); }) });

@@ -11,7 +11,7 @@ const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
 const version = pkg.version;
 const dist = path.join(root, 'dist');
 const staging = path.join(dist, `weibo-console-${version}`);
-const include = ['src', 'public', 'scripts', 'tests', 'bootstrap.mjs', 'install.sh', 'install.ps1', 'package.json', 'package-lock.json', 'README.md', 'INSTALL.md', 'AGENTS.md', 'CHANGELOG.md', 'LICENSE'];
+const include = ['src', 'public', 'scripts', 'tests', 'docs', 'bootstrap.mjs', 'install.sh', 'install.ps1', 'package.json', 'package-lock.json', 'README.md', 'INSTALL.md', 'AGENTS.md', 'CHANGELOG.md', 'LICENSE'];
 
 fs.rmSync(staging, { recursive: true, force: true });
 fs.mkdirSync(path.join(staging, 'data'), { recursive: true });

@@ -13,35 +13,45 @@ db.exec(`CREATE TABLE IF NOT EXISTS task_rounds (
 CREATE INDEX IF NOT EXISTS idx_rounds_completed ON task_rounds(completed_at);
 CREATE INDEX IF NOT EXISTS idx_actions_completed_state ON action_logs(state,completed_at);`);
 
-const emptyCounts = () => Object.fromEntries(['checkin', 'post', 'comment'].map(kind => [kind, { succeeded: 0, failed: 0, uncertain: 0, skipped: 0 }]));
+const emptyCounts = () => Object.fromEntries(['checkin', 'post', 'comment', 'repost', 'like', 'comment_like'].map(kind => [kind, { succeeded: 0, failed: 0, uncertain: 0, skipped: 0 }]));
 
-export function dailySuccess(date = shanghaiDate()) {
+export function dailySuccess(date = shanghaiDate(), scope = null) {
+  let values = {};
   if (isArchivedRecord(date)) {
-    const archivedRow = db.prepare('SELECT counts_json FROM daily_stats WHERE date=?').get(date);
-    const archivedCounts = archivedRow ? JSON.parse(archivedRow.counts_json || '{}') : {};
-    const archivedCheckin = db.prepare("SELECT COUNT(*) total FROM (SELECT COALESCE(NULLIF(a.uid,''),c.account_id),c.topic_id FROM checkins c LEFT JOIN accounts a ON a.id=c.account_id WHERE c.local_date=? AND c.status='succeeded' GROUP BY COALESCE(NULLIF(a.uid,''),c.account_id),c.topic_id)").get(date).total;
-    return { date, checkin: Number(archivedCheckin), post: Number(archivedCounts.post?.succeeded || 0), comment: Number(archivedCounts.comment?.succeeded || 0) };
+    const scoped = scope && db.prepare('SELECT success_json FROM daily_scope_stats WHERE date=? AND scope=?').get(date, scope);
+    if (scoped) values = JSON.parse(scoped.success_json);
+    else if (!scope || scope === 'workbench') {
+      const row = db.prepare('SELECT counts_json FROM daily_stats WHERE date=?').get(date);
+      const counts = row ? JSON.parse(row.counts_json || '{}') : {};
+      values = Object.fromEntries(Object.entries(counts).map(([kind, value]) => [kind, Number(value.succeeded || 0)]));
+    }
+  } else {
+    const rows = db.prepare("SELECT kind,COUNT(*) total FROM action_logs WHERE state='succeeded' AND strftime('%Y-%m-%d',COALESCE(completed_at,started_at),'+8 hours')=?" + (scope ? ' AND scope=?' : '') + ' GROUP BY kind').all(...(scope ? [date, scope] : [date]));
+    values = Object.fromEntries(rows.map(row => [row.kind, Number(row.total)]));
   }
-  const rows = db.prepare(`SELECT kind,COUNT(*) total FROM action_logs WHERE state='succeeded'
-    AND kind IN ('post','comment') AND strftime('%Y-%m-%d',COALESCE(completed_at,started_at),'+8 hours')=? GROUP BY kind`).all(date);
-  const checkin = db.prepare(`SELECT COUNT(*) total FROM (
-    SELECT COALESCE(NULLIF(a.uid,''),c.account_id),c.topic_id FROM checkins c
-    LEFT JOIN accounts a ON a.id=c.account_id WHERE c.local_date=? AND c.status='succeeded'
-    GROUP BY COALESCE(NULLIF(a.uid,''),c.account_id),c.topic_id)`).get(date).total;
-  return { date, checkin: Number(checkin), post: 0, comment: 0, ...Object.fromEntries(rows.map(row => [row.kind, Number(row.total)])) };
+  const checkin = scope === 'engage' ? 0 : Number(db.prepare("SELECT COUNT(*) total FROM (SELECT COALESCE(NULLIF(a.uid,''),c.account_id),c.topic_id FROM checkins c LEFT JOIN accounts a ON a.id=c.account_id WHERE c.local_date=? AND c.status='succeeded' GROUP BY COALESCE(NULLIF(a.uid,''),c.account_id),c.topic_id)").get(date).total);
+  return { date, checkin, post: 0, comment: 0, ...(scope === 'engage' ? { repost: 0, comment_like: 0, like: 0 } : {}), ...values, checkin };
 }
 
-export function dailyStats(date = shanghaiDate()) {
+export function dailyStats(date = shanghaiDate(), scope = null) {
   if (isArchivedRecord(date)) {
-    const row = db.prepare('SELECT * FROM daily_stats WHERE date=?').get(date);
+    const row = scope ? db.prepare('SELECT counts_json,job_count FROM daily_scope_stats WHERE date=? AND scope=?').get(date, scope) : db.prepare('SELECT * FROM daily_stats WHERE date=?').get(date);
     return { date, counts: row ? JSON.parse(row.counts_json || '{}') : emptyCounts(), jobCount: Number(row?.job_count || 0), abnormalAccounts: Number(row?.abnormal_accounts || 0), archived: true };
   }
   const counts = emptyCounts();
-  for (const row of db.prepare(`SELECT l.kind,${displayStateSql(db)} state,COUNT(*) total FROM action_logs l WHERE strftime('%Y-%m-%d',l.started_at,'+8 hours')=? GROUP BY l.kind,(${displayStateSql(db)})`).all(date)) {
+  for (const row of db.prepare('SELECT l.kind,' + displayStateSql(db) + " state,COUNT(*) total FROM action_logs l WHERE strftime('%Y-%m-%d',l.started_at,'+8 hours')=?" + (scope ? ' AND l.scope=?' : '') + ' GROUP BY l.kind,(' + displayStateSql(db) + ')').all(...(scope ? [date, scope] : [date]))) {
     if (counts[row.kind]?.[row.state] != null) counts[row.kind][row.state] = Number(row.total);
   }
-  const jobCount = db.prepare("SELECT COUNT(*) c FROM jobs WHERE strftime('%Y-%m-%d',created_at,'+8 hours')=?").get(date).c;
+  const jobCount = db.prepare("SELECT COUNT(*) c FROM jobs WHERE strftime('%Y-%m-%d',created_at,'+8 hours')=?" + (scope ? ' AND scope=?' : '')).get(...(scope ? [date, scope] : [date])).c;
   return { date, counts, jobCount: Number(jobCount) || 0, abnormalAccounts: null, archived: false };
+}
+
+export function operationCounts(jobId) {
+  const counts = emptyCounts();
+  for (const row of db.prepare('SELECT l.kind,' + displayStateSql(db) + ' state,COUNT(*) n FROM action_logs l WHERE l.job_id=? GROUP BY l.kind,(' + displayStateSql(db) + ')').all(jobId)) {
+    if (counts[row.kind]?.[row.state] != null) counts[row.kind][row.state] = Number(row.n);
+  }
+  return counts;
 }
 
 export function startRound(jobId, round, startedAt = now()) {
@@ -63,7 +73,7 @@ function summaryFor(job, round, { details = false } = {}) {
     if (counts[action.kind]?.[action.display_state] != null) counts[action.kind][action.display_state]++;
     if (!account) continue;
     if (account.counts[action.kind]?.[action.display_state] != null) account.counts[action.kind][action.display_state]++;
-    const topicName = job.config.topicIdentities?.[action.topic_id]?.name || topics.get(action.topic_id) || action.topic_id;
+    const topicName = job.config.kind === 'engage' ? job.config.linkIdentities?.[action.link]?.name || action.link || action.url || '指定微博' : job.config.topicIdentities?.[action.topic_id]?.name || topics.get(action.topic_id) || action.topic_id;
     if (details) account.actions.push({ ...action, topic_name: topicName });
     if (['failed', 'uncertain', 'submitted'].includes(action.state) || (action.state === 'skipped' && /禁言|频繁|登录失效|UID.*不符|UID.*一致/.test(action.error || ''))) account.anomalies.push({ kind: action.kind, topicId: action.topic_id, topicName, reason: action.error || (action.state === 'failed' ? '操作失败' : '结果待核对'), at: action.completed_at || action.started_at });
   }
@@ -84,7 +94,7 @@ function summaryFor(job, round, { details = false } = {}) {
       account.anomalies.push({ reason: `${card.source === 'checkin_unconfirmed' ? '签到结果未确认，' : ''}本轮触发人工验证 ${card.attempts} 次，${card.status === 'resolved' ? '已处理' : card.status === 'ready' ? '已验证，待补做' : '验证队列中'}`, at: card.updated_at });
     }
   }
-  return { resultStateVersion: 1, counts, verification, accountCount: accounts.size, topicCount: job.config.topicIds?.length || 0, accounts: [...accounts.values()], abnormalAccounts: [...accounts.values()].filter(account => account.anomalies.length).map(({ actions, ...account }) => account) };
+  return { resultStateVersion: 1, counts, verification, accountCount: accounts.size, scope: job.scope || 'workbench', topicCount: (job.config.kind === 'engage' ? job.config.links : job.config.topicIds)?.length || 0, accounts: [...accounts.values()], abnormalAccounts: [...accounts.values()].filter(account => account.anomalies.length).map(({ actions, ...account }) => account) };
 }
 
 export function roundReport(row, { details = false } = {}) {
@@ -163,9 +173,10 @@ export function runningRounds(jobId) {
   return db.prepare("SELECT round_index FROM task_rounds WHERE job_id=? AND status='running'").all(jobId).map(row => row.round_index);
 }
 
-export function roundsForDate(date) {
-  return db.prepare(`SELECT * FROM task_rounds WHERE strftime('%Y-%m-%d',started_at,'+8 hours')=?
-    OR strftime('%Y-%m-%d',completed_at,'+8 hours')=? ORDER BY started_at DESC`).all(date, date).map(row => roundReport(row, { details: true }));
+export function roundsForDate(date, scope = null) {
+  const rows = db.prepare(`SELECT r.* FROM task_rounds r JOIN jobs j ON j.id=r.job_id WHERE (strftime('%Y-%m-%d',r.started_at,'+8 hours')=?
+    OR strftime('%Y-%m-%d',r.completed_at,'+8 hours')=?)${scope ? ' AND j.scope=?' : ''} ORDER BY r.started_at DESC`).all(...(scope ? [date, date, scope] : [date, date]));
+  return rows.map(row => roundReport(row, { details: true }));
 }
 
 export function pendingRoundReports() {

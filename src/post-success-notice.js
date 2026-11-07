@@ -45,6 +45,11 @@ export async function createCommentSuccessNoticeObserver(page, { attemptId, onSu
   });
 }
 
+export async function createRepostSuccessNoticeObserver(page, { attemptId, onSuccess }) {
+  return createSuccessNoticeObserver(page, { attemptId, onSuccess, phrases: ['转发成功'],
+    persistenceMessage: '转发成功提示保存异常，禁止重新转发' });
+}
+
 async function createSuccessNoticeObserver(page, { attemptId, onSuccess, phrases, persistenceMessage }) {
   if (typeof onSuccess !== 'function') throw new TypeError('onSuccess must be a function');
   const token = randomUUID();

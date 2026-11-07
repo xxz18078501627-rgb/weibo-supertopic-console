@@ -23,7 +23,10 @@ test.before(async () => {
     stdio: ['ignore', 'pipe', 'pipe']
   });
   await waitForServer();
-  browser = await chromium.launch({ headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
+  const chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  browser = await chromium.launch({ headless: true, ...(process.env.WEIBO_CONSOLE_CHROME
+    ? { executablePath: process.env.WEIBO_CONSOLE_CHROME }
+    : fs.existsSync(chrome) ? { executablePath: chrome } : {}) });
 });
 
 test.after(async () => {
@@ -92,6 +95,35 @@ test('访问口令、配置流程和手机导航可用', async () => {
   await page.close();
 });
 
+test('更新弹窗展示平台版本和只读命令，关闭重启开关可切换命令，手机可进入', async () => {
+  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  await page.route('**/api/update/status*', route => route.fulfill({ json: {
+    currentVersion: '1.1.0', latestVersion: '1.2.0', platformKey: 'mac-arm64', available: true,
+    downloaded: true, checkedAt: new Date().toISOString(), blockedReason: '',
+    command: 'node "/tmp/ZhibingStudio/bootstrap.mjs" update --platform mac-arm64 --version 1.2.0 --restart',
+    commandNoRestart: 'node "/tmp/ZhibingStudio/bootstrap.mjs" update --platform mac-arm64 --version 1.2.0 --no-restart',
+    release: { notes: '新增应用内更新。' }
+  } }));
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: `http://127.0.0.1:${port}` });
+  await page.goto(`http://127.0.0.1:${port}`);
+  await page.locator('#token').fill(token);
+  await page.getByRole('button', { name: '进入工坊' }).click();
+  await page.locator('#update-entry').click();
+  await page.locator('#update-dialog').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#update-latest').textContent(), 'v1.2.0');
+  assert.equal(await page.locator('#update-platform').textContent(), 'mac-arm64');
+  assert.match(await page.locator('#update-command').inputValue(), /--restart$/);
+  await page.locator('#update-restart-toggle').uncheck();
+  assert.match(await page.locator('#update-command').inputValue(), /--no-restart$/);
+  await page.locator('#update-copy').click();
+  assert.match(await page.evaluate(() => navigator.clipboard.readText()), /--no-restart$/);
+  await page.locator('[data-close-update]').click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator('#update-entry-mobile').click();
+  assert.equal(await page.locator('#update-dialog').isVisible(), true);
+  await page.close();
+});
+
 test('发帖拒绝后延迟验证码进入验证，人工完成后原窗口自动回执且只点一次发送', async () => {
   const page = await browser.newPage();
   let sends = 0, posted = null;
@@ -115,7 +147,9 @@ test('发帖拒绝后延迟验证码进入验证，人工完成后原窗口自�
     await assert.rejects(adapter.withChallengeMode('manual', () => adapter.post({ id: 'fixture', uid: '1001' }, { name: '苏新皓', url: 'https://weibo.com/p/100808fixture' }, '本次文案1', { intervalSeconds: 1, onReceipt: result => { posted = result; } })), error => error.code === 'verification_required');
     assert.equal(sends, 1);
     await page.getByRole('button', { name: '验证通过', exact: true }).click();
-    await page.waitForTimeout(100);
+    // Wait for durable asynchronous receipt handling, not an arbitrary 100ms.
+    for (let attempt=0; attempt<100 && !posted; attempt++) await page.waitForTimeout(50);
+    assert.ok(posted, '人工验证后的本次回执应自动保存');
     assert.equal(posted.receiptId, '5359362629435909');
     assert.equal(posted.state, 'succeeded');
     assert.equal(sends, 2, '第二个请求由验证码完成触发，没有再次点击发送');
@@ -757,8 +791,11 @@ test('分组组合选择、批量移动、每日统计、完成提醒确认与�
     if (process.env.WEIBO_CONSOLE_TEST_SCREENSHOTS) {
       await page.waitForTimeout(350);
       await page.screenshot({ path: path.join(process.env.WEIBO_CONSOLE_TEST_SCREENSHOTS, `overview-${width}.png`), animations: 'disabled' });
+      const previousPane = await page.locator('#config-card .config-tabs .tab.on').getAttribute('data-pane');
+      await page.locator('#config-card .config-tabs [data-pane="plan"]').click();
       await page.locator('#action-plan').scrollIntoViewIfNeeded();
       await page.screenshot({ path: path.join(process.env.WEIBO_CONSOLE_TEST_SCREENSHOTS, `configuration-${width}.png`), animations: 'disabled' });
+      await page.locator('#config-card .config-tabs [data-pane="' + previousPane + '"]').click();
       await page.evaluate(() => scrollTo(0,0));
     }
   }
@@ -892,23 +929,23 @@ test('待验证账号卡片、互斥、明确确认与继续运行按钮可用',
     assert.equal(await page.locator('.recent-state.verification_wait').count(), 2);
     assert.equal(await page.locator('.recent-state.uncertain').count(), 0);
     assert.match(await page.locator('#run-metrics').innerText(), /0\s*待核对/);
-    assert.equal(await page.locator('[data-verification-continue]').isDisabled(), true);
+    assert.equal(await page.locator('#verification-panel [data-verification-continue]').isDisabled(), false);
     await page.locator('[data-verify-toggle]').first().click();
     assert.match(await page.locator('.verify-detail').innerText(), /待补做 \d+ 项 · 待验证 \d+ 项/);
     await page.locator('[data-verify-identity]').click();
-    await page.locator('[data-verification-end]').waitFor();
+    await page.locator('#verification-panel [data-verification-end]').waitFor();
     assert.equal(await page.locator('[data-verify-identity]').isDisabled(), true);
-    await page.locator('[data-verification-recheck]').click();
-    await page.waitForFunction(() => !document.querySelector('[data-verification-recheck]').disabled);
-    await page.locator('[data-verification-end]').click();
-    await page.waitForFunction(() => !document.querySelector('[data-verification-continue]').disabled);
+    await page.locator('#verification-panel [data-verification-recheck]').click();
+    await page.waitForFunction(() => !document.querySelector('#verification-panel [data-verification-recheck]').disabled);
+    await page.locator('#verification-panel [data-verification-end]').click();
+    await page.waitForFunction(() => !document.querySelector('#verification-panel [data-verification-continue]').disabled);
     page.once('dialog', dialog => dialog.accept());
     await page.locator('[data-confirm-unpublished]').click();
     await page.waitForTimeout(100);
     assert.equal(requests.find(([action]) => action === 'confirm-unpublished')[1].confirmed, true);
     assert.equal(requests.find(([action]) => action === 'confirm-unpublished')[1].stepKey, keys[1]);
-    await page.locator('[data-verification-continue]').click();
-    await page.waitForFunction(() => document.querySelector('[data-verification-continue]').disabled);
+    await page.locator('#verification-panel [data-verification-continue]').click();
+    await page.waitForFunction(() => document.querySelector('#verification-panel [data-verification-continue]').disabled);
     assert.deepEqual(requests.map(([action]) => action), ['open','recheck','end','confirm-unpublished','continue']);
     for (const width of [1440, 390]) {
       await page.setViewportSize({ width, height: 1000 });
@@ -935,9 +972,9 @@ test('会话状态文案区分手动验证、提交与等待回执', async () =>
   try {
     await page.goto(`http://127.0.0.1:${port}`);
     await page.locator('.verify-session').waitFor();
-    assert.equal(await page.locator('.verify-count').innerText(), '2/3');
+    assert.equal(await page.locator('#verification-panel .verify-count').innerText(), '2/3');
     assert.equal(await page.locator('.verify-session').innerText(), '正在当前窗口手动验证…');
-    assert.equal(await page.locator('[data-verification-recheck]').count(), 1);
+    assert.equal(await page.locator('#verification-panel [data-verification-recheck]').count(), 1);
     for (const [phase, expected] of [
       ['signing_checkin', '正在当前窗口补做签到…'],
       ['submitting_post', '正在当前窗口发帖…'],
@@ -1336,7 +1373,7 @@ test('工作台一屏显示、三标签原位切换与不保存直接运行', as
     const advancedHeight = await heightOf();
     assert.ok(rangeHeight < planHeight && planHeight < advancedHeight, '配置卡应随标签内容自适应：' + [rangeHeight, planHeight, advancedHeight].join('/'));
     assert.ok(rangeHeight <= 200 && advancedHeight >= 300, '范围页应很矮、高级页最高：' + [rangeHeight, advancedHeight].join('/'));
-    assert.equal(await page.locator('.config-head .template-group').count(), 1);
+    assert.equal(await page.locator('#page-overview .config-head .template-group').count(), 1);
     await page.locator('.config-tabs [data-pane="range"]').click();
     assert.equal(await page.locator('#nav [data-page="topics"]').count(), 0);
     assert.match(await page.locator('.brand-sub').innerText(), /信号灯偷懒神器/);
@@ -1427,11 +1464,11 @@ test('验证队列显示完成/总数，按状态排序且点开不跳回顶部'
     await page.route('**/api/events', route => route.fulfill({ contentType: 'text/event-stream', body: '' }));
     await page.goto('http://127.0.0.1:' + port);
     await page.waitForTimeout(900);
-    assert.equal(await page.locator('.verify-count').innerText(), '10/30');
+    assert.equal(await page.locator('#verification-panel .verify-count').innerText(), '10/30');
     const names = await page.locator('.verify-row b').allTextContents();
     assert.equal(names[0], '账号00');
     assert.equal(names[names.length - 1], '账号29');
-    const scroller = page.locator('.verify-rows');
+    const scroller = page.locator('#verification-panel .verify-rows');
     await scroller.evaluate(el => { el.scrollTop = 250; });
     const before = await scroller.evaluate(el => el.scrollTop);
     assert.ok(before > 0);
@@ -1463,7 +1500,7 @@ test('圆点勾选、装饰两行、横卡添加固定与最近运行 20 条', a
     await page.waitForFunction(() => document.querySelector('#login')?.classList.contains('hidden'));
     await page.waitForFunction(() => document.querySelectorAll('.recent-row').length === 20);
     assert.equal(await page.locator('.recent-row').count(), 20);
-    const list = page.locator('.recent-list');
+    const list = page.locator('#page-overview .recent-list');
     assert.equal(await list.evaluate(el => el.scrollHeight > el.clientHeight), true);
     const header = await page.evaluate(() => [document.querySelector('#page-title').getBoundingClientRect().bottom, document.querySelector('.brand-sub').getBoundingClientRect().bottom]);
     assert.ok(Math.abs(header[0] - header[1]) <= 2, '页头两段文字底部应对齐');
@@ -1476,9 +1513,9 @@ test('圆点勾选、装饰两行、横卡添加固定与最近运行 20 条', a
     const addAfter = await page.locator('#add-action').boundingBox();
     assert.ok(Math.abs(addBefore.x - addAfter.x) <= 1 && Math.abs(addBefore.y - addAfter.y) <= 1, '添加一段按钮应固定');
     await page.locator('.config-tabs [data-pane="advanced"]').click();
-    assert.equal(await page.locator('.deco-row').count(), 2);
+    assert.equal(await page.locator('#page-overview .deco-row').count(), 2);
     assert.equal(await page.locator('#toggle-decorations').count(), 0);
-    if (await page.locator('.deco-row label.off').count()) assert.equal(await page.locator('.deco-row label.off').first().evaluate(el => getComputedStyle(el).opacity), '1');
+    if (await page.locator('#page-overview .deco-row label.off').count()) assert.equal(await page.locator('#page-overview .deco-row label.off').first().evaluate(el => getComputedStyle(el).opacity), '1');
     const dot = await page.locator('#sync-to-home').evaluate(el => { el.checked = true; const s = getComputedStyle(el); return { radius: s.borderRadius, bg: s.backgroundColor }; });
     assert.equal(dot.radius, '50%');
     assert.equal(dot.bg, 'rgb(125, 23, 49)');
@@ -1528,11 +1565,17 @@ test('账号拖拽排序、禁言筛选与文案分组全文弹窗可用', async
     const second = await api('POST', '/api/accounts', {});
     await api('PATCH', `/api/accounts/${first.id}`, { name: '拖拽甲', sortOrder: 0 });
     await api('PATCH', `/api/accounts/${second.id}`, { name: '拖拽乙', sortOrder: 1 });
+    const restrictionDb = new DatabaseSync(path.join(tempDir, 'console.sqlite'));
+    restrictionDb.prepare('INSERT INTO account_restrictions(account_id,type,kind,identity,reason,detected_at,expires_at,job_id) VALUES(?,?,?,?,?,?,?,?)')
+      .run(first.id, 'frequent', 'comment', '', '测试频繁', new Date().toISOString(), new Date(Date.now() + 3600000).toISOString(), '');
+    restrictionDb.close();
 
     await page.goto(`http://127.0.0.1:${port}`);
     await page.locator('#nav [data-page="accounts"]').click();
     await page.locator('#account-search').fill('拖拽');
     await page.waitForTimeout(200);
+    assert.equal(await page.locator('#account-list .account-row .result.warning').count(), 1);
+    assert.equal((await page.locator('#account-list .account-row .result.warning').innerText()).trim(), '频繁');
     const rows = page.locator('#account-list .account-row:not(.hidden)');
     assert.equal(await rows.count(), 2);
     const source = await rows.nth(1).locator('[data-drag-account]').boundingBox();
@@ -1557,7 +1600,15 @@ test('账号拖拽排序、禁言筛选与文案分组全文弹窗可用', async
 
     await page.locator('#account-status-chips [data-account-status="muted"]').click();
     assert.equal(await page.locator('#account-list .account-row:not(.hidden)').count(), 0);
+    await page.locator('#account-status-chips [data-account-status="limited"]').click();
+    assert.equal(await page.locator('#account-list .account-row:not(.hidden)').count(), 1);
     await page.locator('#account-status-chips [data-account-status="all"]').click();
+
+    page.once('dialog', dialog => dialog.accept());
+    await page.locator('[data-account-action="clear-restriction"]').click();
+    await page.waitForFunction(() => !document.querySelector('#account-list .result.warning'));
+    const clearedState = await page.request.get(`http://127.0.0.1:${port}/api/state`).then(r => r.json());
+    assert.equal(clearedState.restrictedAccounts.length, 0);
 
     await page.locator('#nav [data-page="materials"]').click();
     page.once('dialog', dialog => dialog.accept('测试组'));
@@ -1655,7 +1706,7 @@ test('登录页头像、文案分段标签与移动分组操作条可用', async
     assert.equal(await page.locator('[data-clear-material-btn]').isDisabled(), true);
     assert.equal(await page.locator('[data-bulk-material-btn]').isDisabled(), true);
 
-    const group = await page.request.post(base + '/api/material-groups', { data: { name: 'v7移动组' } }).then(r => r.json());
+    const group = await page.request.post(base + '/api/material-groups', { data: { name: 'v7移动组', type: 'post' } }).then(r => r.json());
     await page.reload();
     await page.waitForTimeout(700);
     await page.locator('#nav [data-page="materials"]').click();
@@ -1674,8 +1725,10 @@ test('登录页头像、文案分段标签与移动分组操作条可用', async
     assert.equal(await page.locator('#material-move-bar').evaluate(node => node.classList.contains('hidden')), true);
 
     for (let index = 0; index < 12; index++) {
-      const createdGroup = await page.request.post(base + '/api/material-groups', { data: { name: `v7超长分组名称第${index}号` } });
+      const createdGroup = await page.request.post(base + '/api/material-groups', { data: { name: `v7超长分组名称第${index}号`, type: 'post' } });
       assert.equal(createdGroup.status(), 201, await createdGroup.text());
+      const commentGroup = await page.request.post(base + '/api/material-groups', { data: { name: `v7评论独立组第${index}号`, type: 'comment' } });
+      assert.equal(commentGroup.status(), 201);
     }
     await page.reload();
     await page.waitForTimeout(700);
@@ -1683,16 +1736,16 @@ test('登录页头像、文案分段标签与移动分组操作条可用', async
     await page.waitForTimeout(250);
     const groupDebug = await page.evaluate(async () => {
       const data = await fetch('/api/state').then(response => response.json());
-      return { api: (data.materialGroups || []).length, dom: document.querySelectorAll('#material-group-picks .check-inline').length };
+      return { api: (data.materialGroups || []).filter(group => ['post','comment'].includes(group.type)).length, dom: document.querySelectorAll('#material-group-picks .check-inline').length };
     });
-    assert.equal(groupDebug.dom, groupDebug.api * 2, JSON.stringify(groupDebug));
-    const template = await page.evaluate(() => [...document.querySelectorAll('.template-group select, .template-group button')].map(node => {
+    assert.equal(groupDebug.dom, groupDebug.api, JSON.stringify(groupDebug));
+    const template = await page.evaluate(() => [...document.querySelectorAll('#page-overview .template-group select, #page-overview .template-group button')].map(node => {
       const rect = node.getBoundingClientRect();
       return { top: rect.top, bottom: rect.bottom, height: rect.height };
     }));
     assert.ok(Math.max(...template.map(item => item.top)) - Math.min(...template.map(item => item.top)) <= 1);
     assert.ok(Math.max(...template.map(item => item.bottom)) - Math.min(...template.map(item => item.bottom)) <= 1);
-    assert.ok(template.every(item => item.height === 28));
+    assert.ok(template.every(item => item.height === 34));
     const picks = await page.evaluate(() => [...document.querySelectorAll('#material-group-picks .pick-row')].map(row => ({ clientWidth: row.clientWidth, scrollWidth: row.scrollWidth, overflowX: getComputedStyle(row).overflowX, wrap: getComputedStyle(row).flexWrap })));
     assert.ok(picks.every(row => row.scrollWidth > row.clientWidth && row.overflowX === 'auto' && row.wrap === 'nowrap'), JSON.stringify(picks));
 
@@ -1785,9 +1838,9 @@ test('文案不足弹窗拦截开始，补足后可提交', async () => {
     await page.request.post(base + '/api/accounts', { data: {} });
     await page.request.post(base + '/api/topics', { data: { name: '文案弹窗超话' + Date.now(), url: 'https://weibo.com/p/100808v10/super_index' } });
     await page.request.put(base + '/api/settings/task', { data: { actionPlan: [{ type: 'post', count: 1, intervalSeconds: 1 }, { type: 'comment', count: 1, intervalSeconds: 1 }], rounds: 1, roundIntervalSeconds: 0 } });
-    const postOne = await page.request.post(base + '/api/material-groups', { data: { name: 'v10单条发帖' } }).then(r => r.json());
-    const postTwo = await page.request.post(base + '/api/material-groups', { data: { name: 'v10两条发帖' } }).then(r => r.json());
-    const commentGroup = await page.request.post(base + '/api/material-groups', { data: { name: 'v10评论组' } }).then(r => r.json());
+    const postOne = await page.request.post(base + '/api/material-groups', { data: { name: 'v10单条发帖', type: 'post' } }).then(r => r.json());
+    const postTwo = await page.request.post(base + '/api/material-groups', { data: { name: 'v10两条发帖', type: 'post' } }).then(r => r.json());
+    const commentGroup = await page.request.post(base + '/api/material-groups', { data: { name: 'v10评论组', type: 'comment' } }).then(r => r.json());
     await page.request.post(base + '/api/post-materials', { data: { texts: ['v10 单条发帖'], groupId: postOne.id } });
     await page.request.post(base + '/api/post-materials', { data: { texts: ['v10 发帖甲', 'v10 发帖乙'], groupId: postTwo.id } });
     await page.request.post(base + '/api/comment-materials', { data: { texts: ['v10 评论甲', 'v10 评论乙'], groupId: commentGroup.id } });
@@ -1944,7 +1997,7 @@ test('文案组默认不勾选，未勾选仍表示全部', async () => {
   try {
     await page.request.post(base + '/api/login', { data: { token } });
     const groups = [];
-    for (const name of ['v13组一', 'v13组二', 'v13组三']) groups.push(await page.request.post(base + '/api/material-groups', { data: { name } }).then(r => r.json()));
+    for (const name of ['v13组一', 'v13组二', 'v13组三']) groups.push(await page.request.post(base + '/api/material-groups', { data: { name, type: 'post' } }).then(r => r.json()));
     await page.request.put(base + '/api/settings/task', { data: { postGroupIds: [], commentGroupIds: [] } });
     await page.goto(base);
     await page.waitForTimeout(800);

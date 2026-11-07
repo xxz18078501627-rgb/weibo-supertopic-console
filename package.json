@@ -1,6 +1,6 @@
 {
   "name": "weibo-super-topic-console",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "private": true,
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",
@@ -9,14 +9,16 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node --test --test-reporter=spec tests/core.test.js tests/verification.test.js tests/network.test.js tests/topic-policy.test.js tests/license.test.js tests/packaging.test.js tests/navigation-adapter.test.js tests/navigation-recovery.test.js tests/post-results.test.js tests/post-receipts.test.js tests/post-success-notice.test.js tests/service.test.js",
-    "test:e2e": "node --test tests/ui.e2e.test.js",
+    "test": "node --test --test-reporter=spec tests/core.test.js tests/engage.test.js tests/engage-profile-resolver.test.js tests/engage-verification.test.js tests/engage-replies.test.js tests/material-migrations.test.js tests/verification.test.js tests/network.test.js tests/topic-policy.test.js tests/license.test.js tests/packaging.test.js tests/update-manager.test.js tests/update-helper.test.js tests/managed-install.test.js tests/navigation-adapter.test.js tests/navigation-recovery.test.js tests/post-results.test.js tests/post-receipts.test.js tests/post-success-notice.test.js tests/service.test.js",
+    "test:e2e": "node --test tests/ui.e2e.test.js tests/engage-ui.e2e.test.js",
     "token": "node scripts/show-token.mjs",
     "license": "node scripts/make-license.mjs",
     "doctor": "node bootstrap.mjs doctor",
     "bootstrap": "node bootstrap.mjs install",
     "update": "node bootstrap.mjs update",
     "build:release": "node scripts/build-release.mjs",
+    "build:platform": "node scripts/build-platform-package.mjs",
+    "build:installers": "node scripts/build-platform-package.mjs",
     "release": "node scripts/release.mjs",
     "install-service": "node scripts/service.mjs install",
     "uninstall-service": "node scripts/service.mjs uninstall"
