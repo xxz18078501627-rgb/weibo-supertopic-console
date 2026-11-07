@@ -94,5 +94,6 @@ try {
   if (fs.existsSync(uninstaller)) {
     try { run(uninstaller, ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'], { timeout: 120000 }); } catch {}
   }
-  fs.rmSync(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  try { fs.rmSync(temp, { recursive: true, force: true, maxRetries: 20, retryDelay: 500 }); }
+  catch (error) { console.warn('Cleanup left temporary files: ' + error.message); }
 }
