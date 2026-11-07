@@ -79,6 +79,10 @@ function startupPath() {
   return path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', `${taskName}.vbs`);
 }
 
+function startMenuShortcutPath() {
+  return path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', '制饼工坊.url');
+}
+
 function startWindowsRunner() {
   const args = managedLauncher ? [managedLauncher] : [path.join(root, 'scripts', 'service-runner.mjs'), String(port), dataDir];
   const child = spawn(nodeBin, args, { detached: true, stdio: 'ignore', windowsHide: true });
@@ -206,6 +210,7 @@ async function uninstall() {
     await stopWindows();
     try { execFileSync('schtasks.exe', ['/Delete', '/TN', taskName, '/F'], { stdio: 'inherit' }); } catch {}
     if (fs.existsSync(startupPath())) fs.unlinkSync(startupPath());
+    if (fs.existsSync(startMenuShortcutPath())) fs.unlinkSync(startMenuShortcutPath());
     console.log('已移除登录自启任务。');
     return;
   }

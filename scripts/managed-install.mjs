@@ -79,6 +79,12 @@ fs.writeFileSync(servicePath, serviceWrapper, { mode: 0o600 });
 fs.writeFileSync(path.join(installRoot, 'current.json'), JSON.stringify({ version, updatedAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
 console.log(`已安装程序版本 ${version}，数据目录：${dataDir}`);
 
+if (process.platform === 'win32' && process.env.APPDATA) {
+  const shortcut = path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', '制饼工坊.url');
+  fs.mkdirSync(path.dirname(shortcut), { recursive: true });
+  fs.writeFileSync(shortcut, '[InternetShortcut]\r\nURL=http://localhost:4178\r\n', 'utf8');
+}
+
 const service = path.join(packageRoot, 'scripts', 'service.mjs');
 if (process.env.WEIBO_CONSOLE_INSTALL_NO_SERVICE === '1') {
   console.log('已跳过登录自启安装（测试模式）。');
