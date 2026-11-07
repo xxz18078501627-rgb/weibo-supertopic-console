@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // 生成可直接分发的 zip：程序 + 干净种子库（不含账号、登录目录、日志）。
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -26,7 +27,22 @@ for (const entry of include) {
 }
 
 const seed = path.join(dist, 'seed', 'console.sqlite');
-execFileSync(process.execPath, [path.join(root, 'scripts', 'scrub-data.mjs'), seed], { stdio: 'inherit', cwd: root });
+let seedSource = process.env.WEIBO_SEED_SOURCE || path.join(root, 'data', 'console.sqlite');
+let generatedDataDir = '';
+if (!fs.existsSync(seedSource)) {
+  generatedDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'weibo-release-seed-'));
+  execFileSync(process.execPath, ['--input-type=module', '-e', "await import('./src/db.js');"], {
+    cwd: root, stdio: 'inherit', env: { ...process.env, WEIBO_CONSOLE_DATA_DIR: generatedDataDir, WEIBO_CONSOLE_LICENSE: 'off' }
+  });
+  seedSource = path.join(generatedDataDir, 'console.sqlite');
+}
+try {
+  execFileSync(process.execPath, [path.join(root, 'scripts', 'scrub-data.mjs'), seed], {
+    stdio: 'inherit', cwd: root, env: { ...process.env, WEIBO_SEED_SOURCE: seedSource }
+  });
+} finally {
+  if (generatedDataDir) fs.rmSync(generatedDataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+}
 fs.copyFileSync(seed, path.join(staging, 'data', 'console.sqlite'));
 fs.chmodSync(path.join(staging, 'install.sh'), 0o755);
 

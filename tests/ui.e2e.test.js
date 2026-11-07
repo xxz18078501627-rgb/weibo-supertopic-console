@@ -1890,6 +1890,9 @@ test('第一页手机访问按钮打开二维码对话框', async () => {
     assert.equal(await page.locator('#lan-access-button').isVisible(), true);
     await page.locator('#lan-access-button').click();
     await page.locator('#lan-access-dialog[open]').waitFor();
+    await page.waitForFunction(hasQr => hasQr
+      ? document.querySelector('#lan-qr')?.getAttribute('src')?.startsWith('/api/lan-qr.svg?ts=')
+      : document.querySelector('#lan-qr')?.hidden, Boolean(lanState.qrUrl));
     assert.match(await page.locator('#lan-ip-url').innerText(), /^http:\/\/\d+\.\d+\.\d+\.\d+:\d+$/);
     assert.match(await page.locator('#lan-host-url').innerText(), /\.local:\d+$/);
     if (lanState.qrUrl) assert.match(await page.locator('#lan-qr').getAttribute('src'), /^\/api\/lan-qr\.svg\?ts=/);
