@@ -165,4 +165,4 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then TAG="${GITHUB_REF#refs/tags/}"; else TAG="v$VERSION"; fi
           if [[ "$TAG" != "v$VERSION" ]]; then echo "Tag $TAG does not match package version v$VERSION"; exit 1; fi
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "制饼工坊 $TAG" --notes-file CHANGELOG.md
-          gh release upload "$TAG" release-assets/* --clobber
+          find release-assets -type f -print0 | xargs -0 gh release upload "$TAG" --clobber
