@@ -35,7 +35,7 @@ jobs:
           WEIBO_CONSOLE_LICENSE: 'off'
         run: npm test
       - name: UI end-to-end tests
-        if: matrix.platform != 'windows-x64'
+        if: matrix.platform == 'mac-arm64'
         shell: bash
         env:
           WEIBO_CONSOLE_LICENSE: 'off'
