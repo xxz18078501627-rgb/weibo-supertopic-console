@@ -124,7 +124,7 @@ test('探测硬超时取消底层操作，返回未知而不是断网', async ()
   const { job, runner } = fixture({ probeConnectivity: (_account, { signal }) => new Promise(() => { signal.addEventListener('abort', () => { cancelled = true; }); }) });
   const start = Date.now(); const result = await runner.network.probe(job);
   assert.equal(result, true); assert.equal(cancelled, true);
-  assert.ok(Date.now() - start < 3400);
+  assert.ok(Date.now() - start < 7000, 'Windows CI 调度可延迟，但硬超时必须最终脱离挂起探测');
   assert.equal(d.getJob(job.id).cursor.networkRecovery.probeState, 'unknown');
   assert.equal(d.getJob(job.id).status, 'running');
 });

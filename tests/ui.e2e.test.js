@@ -110,6 +110,7 @@ test('更新弹窗展示平台版本和只读命令，关闭重启开关可切�
   await page.getByRole('button', { name: '进入工坊' }).click();
   await page.locator('#update-entry').click();
   await page.locator('#update-dialog').waitFor({ state: 'visible' });
+  await page.waitForFunction(() => document.querySelector('#update-latest')?.textContent === 'v1.2.0');
   assert.equal(await page.locator('#update-latest').textContent(), 'v1.2.0');
   assert.equal(await page.locator('#update-platform').textContent(), 'mac-arm64');
   assert.match(await page.locator('#update-command').inputValue(), /--restart$/);
