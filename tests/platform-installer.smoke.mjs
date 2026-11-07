@@ -104,6 +104,15 @@ try {
   assert.equal(fs.readFileSync(path.join(installRoot, 'data', 'installer-preserve.txt'), 'utf8'), '用户数据必须保留');
   await waitVersion(version);
   console.log('Managed rollback restored the previous version with data intact');
+} catch (error) {
+  for (const file of [
+    path.join(installRoot, 'data', 'updates', 'update.log'),
+    path.join(installRoot, 'data', 'service.log'),
+    path.join(installRoot, 'data', 'service-error.log')
+  ]) {
+    if (fs.existsSync(file)) console.error(`\n===== ${path.basename(file)} =====\n${fs.readFileSync(file, 'utf8')}`);
+  }
+  throw error;
 } finally {
   try { run(path.join(installRoot, 'runtime', 'node', 'node.exe'), [path.join(installRoot, 'service.mjs'), 'uninstall'], { timeout: 60000 }); } catch {}
   const uninstaller = path.join(installRoot, 'unins000.exe');
