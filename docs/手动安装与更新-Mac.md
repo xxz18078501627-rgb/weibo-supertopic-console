@@ -40,6 +40,52 @@ shasum -a 256 weibo-console-1.1.0-mac-arm64.dmg
 
 安装不需要管理员权限，也不会安装 Electron 或独立 App。
 
+## 从 v1.0.1 升级
+
+v1.0.1 是通过 ZIP 解压运行的，和本文前面说明的全新 DMG 安装不是同一套目录。已有账号、文案、任务和激活状态时，优先在原 v1.0.1 目录原地升级，不要直接安装 DMG 后误以为旧数据会自动迁移。
+
+### 方式一：在 v1.0.1 原目录升级
+
+先暂停工作台和转赞评任务，结束扫码与人工验证，然后备份整个 `data/`：
+
+```bash
+cd "<原来的 v1.0.1 安装目录>"
+BACKUP="$HOME/Documents/ZhibingStudio-backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP"
+ditto data "$BACKUP/data"
+```
+
+停止旧服务并检查、执行更新：
+
+```bash
+./.runtime/node/bin/node bootstrap.mjs service stop
+./.runtime/node/bin/node bootstrap.mjs update --check
+./.runtime/node/bin/node bootstrap.mjs update
+```
+
+更新会保留原目录中的 `data/`，完成后仍使用原来的目录形态。首次启动会自动补充数据库结构。确认页面可以打开后，可运行：
+
+```bash
+curl -s http://127.0.0.1:4178/api/health
+```
+
+返回的 `version` 应为升级后的版本。以后可以继续使用页面的“更新”入口，不必每次重新安装 DMG。
+
+### 方式二：迁移到新的 DMG 稳定目录
+
+如果希望改用新的 `~/Library/Application Support/ZhibingStudio` 管理版，必须在**第一次运行新安装包之前**把旧数据复制过去：
+
+```bash
+OLD="<原来的 v1.0.1 安装目录>"
+DEST="$HOME/Library/Application Support/ZhibingStudio/data"
+mkdir -p "$DEST"
+ditto "$OLD/data/" "$DEST/"
+```
+
+然后按本文前面的步骤安装 DMG。安装器检测到 `$DEST/console.sqlite` 已存在时，不会用空白种子库覆盖它。
+
+如果新安装包已经先运行并创建了新数据库，不要直接覆盖：先结束新服务、完整备份 `$DEST`，再停止旧服务，最后将旧 `data/` 完整复制回来并重新启动。不要把两个数据库的零散文件混合复制。
+
 ## 4. 文件和数据位置
 
 程序安装目录：

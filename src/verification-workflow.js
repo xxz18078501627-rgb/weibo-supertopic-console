@@ -46,11 +46,33 @@ export class VerificationWorkflow {
     this.runner = runner;
     this.buildSteps = buildSteps;
     this.session = null;
+    this.normalizeUnsubmittedPostVerifications();
   }
 
   time() { return new Date(this.runner.now()).toISOString(); }
   enabled(job) { return Number(job?.config?.schedulerVersion || 0) >= 2; }
   busy() { return Boolean(this.session || this.runner.current()?.cursor?.manualVerification); }
+
+  normalizeUnsubmittedPostVerifications() {
+    const rows = db.prepare(`SELECT c.job_id,c.round_index,c.identity,a.id action_id
+      FROM verification_cards c JOIN action_logs a ON a.job_id=c.job_id AND a.account_id=c.account_id
+        AND a.kind='post' AND a.step_key IN (
+          SELECT step_key FROM task_step_state WHERE job_id=c.job_id AND round_index=c.round_index
+            AND identity=c.identity AND state IN ('deferred','running','review','network_review'))
+      WHERE c.verification_result='passed'
+        AND a.submitted_at IS NULL AND a.verification_pending=1
+        AND a.state NOT IN ('succeeded','failed','skipped')`).all();
+    if (!rows.length) return;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of rows) {
+        db.prepare("UPDATE action_logs SET state='verification_wait',error='发帖未发送，验证尚未完成，可重新处理当前发帖' WHERE id=?").run(row.action_id);
+        db.prepare("UPDATE verification_cards SET status='pending',verification_result='pending',verified_at=NULL,reason='发帖未发送，本次验证尚未完成；请重新处理当前发帖',updated_at=? WHERE job_id=? AND round_index=? AND identity=?")
+          .run(this.time(), row.job_id, row.round_index, row.identity);
+      }
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
 
   ensureSteps(job) {
     if (db.prepare('SELECT 1 FROM task_step_state WHERE job_id=? LIMIT 1').get(job.id)) return;
@@ -537,7 +559,7 @@ export class VerificationWorkflow {
       if (manual && step.kind === 'post' && error instanceof UnsupportedPageError
         && !getStepAction(jobId, row.step_key)?.submitted_at) {
         const action = getStepAction(jobId, row.step_key);
-        const reason = `人工验证已通过，但发帖未发送，可安全重试：${error.message}`;
+        const reason = `发帖未发送，本次验证尚未完成；可重新处理当前发帖：${error.message}`;
         if (action) updateActionLog(action.id, { state: 'verification_wait', verificationPending: true, error: reason });
         db.prepare("UPDATE task_step_state SET state='deferred',outcome=NULL WHERE job_id=? AND step_key=?").run(jobId, row.step_key);
         this.setCursor(jobId, { notice: reason });
@@ -1043,11 +1065,11 @@ export class VerificationWorkflow {
         await this.assertSession(session);
         const fresh = getStepAction(jobId, row.step_key);
         if (outcome === 'manual_retry_needed') {
-          session.closeReason = fresh?.error || '验证已通过，但发帖未发送，可重新处理当前发帖';
+          session.closeReason = fresh?.error || '发帖未发送，本次验证尚未完成，可重新处理当前发帖';
           this.markReady(jobId, round, identity);
           if (fresh) updateActionLog(fresh.id, { state: 'verification_wait', verificationPending: true, error: fresh.error });
           db.prepare("UPDATE verification_cards SET reason=?,updated_at=? WHERE job_id=? AND round_index=? AND identity=?")
-            .run(fresh?.error || '验证已通过，但发帖未发送，可重新处理当前发帖', this.time(), jobId, round, identity);
+            .run(fresh?.error || '发帖未发送，本次验证尚未完成，可重新处理当前发帖', this.time(), jobId, round, identity);
           this.refreshCard(jobId, round, identity);
           this.updateProgress(jobId);
           return;
@@ -1140,10 +1162,15 @@ export class VerificationWorkflow {
       }
     }
     if (session) session.challengeSeen = false;
-    db.prepare(`UPDATE verification_cards SET status='validating',verification_result='passed',verified_at=?,
+    const selected = session?.stepKey ? getStepAction(jobId, session.stepKey) : null;
+    const operationStarted = session?.step?.kind === 'checkin' || Boolean(session?.submitted || selected?.submitted_at || selected?.state === 'succeeded');
+    db.prepare(`UPDATE verification_cards SET status='validating',verification_result=?,verified_at=?,
       checkin_result=CASE WHEN checkin_result='succeeded' THEN 'succeeded' ELSE 'pending' END,
       reason=?,updated_at=?
-      WHERE job_id=? AND round_index=? AND identity=?`).run(this.time(), '验证已通过，正在确认' + kindLabel(this.session?.step?.kind || 'checkin') + '结果', this.time(), jobId, round, identity);
+      WHERE job_id=? AND round_index=? AND identity=?`).run(operationStarted ? 'passed' : 'pending', operationStarted ? this.time() : null,
+        operationStarted ? '验证已通过，正在确认' + kindLabel(this.session?.step?.kind || 'checkin') + '结果'
+          : '验证码已解除，正在执行' + kindLabel(this.session?.step?.kind || 'checkin') + '；完成前不计验证通过',
+        this.time(), jobId, round, identity);
     if (this.session?.jobId === jobId) {
       const phase = { checkin: 'signing_checkin', post: 'awaiting_post_receipt', comment: 'awaiting_comment_receipt',
         repost: 'awaiting_repost_receipt', like: 'awaiting_like_receipt', comment_like: 'awaiting_comment_like_receipt' }[this.session.step?.kind]
@@ -1340,6 +1367,14 @@ export class VerificationWorkflow {
     const done = checkinResult === 'succeeded' && remaining === 0;
     const selectedKind = this.session?.step?.kind;
     const selected = this.session?.stepKey && getStepAction(jobId, this.session.stepKey);
+    const operationStarted = selectedKind === 'checkin' || Boolean(selected?.submitted_at || selected?.state === 'succeeded');
+    if (selectedKind && !operationStarted) {
+      db.prepare("UPDATE verification_cards SET status='pending',verification_result='pending',verified_at=NULL,reason=?,updated_at=? WHERE job_id=? AND round_index=? AND identity=?")
+        .run(kindLabel(selectedKind) + '未发送，本次验证尚未完成；请重新处理当前' + kindLabel(selectedKind), this.time(), jobId, round, identity);
+      this.refreshCard(jobId, round, identity);
+      this.updateProgress(jobId);
+      return;
+    }
     const label = selectedKind ? kindLabel(selectedKind) : '';
     const reason = label ? `${label}${selected?.state === 'succeeded' ? '已完成' : selected?.state === 'uncertain' ? '结果待核对，不会自动重发' : '验证已通过'}${remaining ? '，其余操作请点击继续运行' : ''}`
       : done ? '验证与签到已完成' : checkinResult === 'pending' ? '安全验证已通过，签到待补做' : '安全验证已通过';

@@ -1215,9 +1215,9 @@ test('人工验证后发帖准备失败保留可重试卡，不重复提交且�
     runner.workflow.requestManual(job.id, account.uid, card.currentStepKey);
     await until(() => opens === 1 && !runner.workflow.session, 10000);
     card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === account.uid);
-    assert.equal(card.verificationResult, 'passed');
+    assert.equal(card.verificationResult, 'pending');
     assert.equal(card.currentActionable, true);
-    assert.match(card.reason, /发帖未发送.*可安全重试/);
+    assert.match(card.reason, /发帖未发送.*验证尚未完成/);
     assert.equal(submits, 0);
     assert.equal(getJob(job.id).metrics.failed, 0);
     const row = db.prepare('SELECT state FROM task_step_state WHERE job_id=? AND step_key=?').get(job.id, card.currentStepKey);

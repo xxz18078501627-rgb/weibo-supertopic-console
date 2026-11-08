@@ -31,6 +31,53 @@ Get-FileHash .\weibo-console-1.1.0-windows-x64.exe -Algorithm SHA256
 4. 安装器会配置当前用户登录自启、开始菜单入口、便携 Node、Playwright Chromium 和本地服务。
 5. 安装完成后会打开 <http://localhost:4178>。首次打开显示激活页；激活、口令和微博登录由你本人完成。
 
+## 从 v1.0.1 升级
+
+v1.0.1 是通过 ZIP 解压运行的，和本文前面说明的全新 EXE 安装不是同一套目录。已有账号、文案、任务和激活状态时，优先在原 v1.0.1 目录原地升级，不要直接安装 EXE 后误以为旧数据会自动迁移。
+
+### 方式一：在 v1.0.1 原目录升级
+
+先暂停工作台和转赞评任务，结束扫码与人工验证，然后备份整个 `data\`：
+
+```powershell
+$Old = "C:\path\to\原来的-weibo-console-v1.0.1"
+$Backup = Join-Path $env:USERPROFILE ("Documents\ZhibingStudio-backup-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
+New-Item -ItemType Directory -Force $Backup | Out-Null
+Copy-Item (Join-Path $Old "data") (Join-Path $Backup "data") -Recurse -Force
+Set-Location $Old
+```
+
+停止旧服务并检查、执行更新：
+
+```powershell
+.\runtime\node\node.exe bootstrap.mjs service stop
+.\runtime\node\node.exe bootstrap.mjs update --check
+.\runtime\node\node.exe bootstrap.mjs update
+```
+
+更新会保留原目录中的 `data\`，完成后仍使用原来的目录形态。首次启动会自动补充数据库结构。确认页面可以打开后，可运行：
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:4178/api/health"
+```
+
+返回的 `version` 应为升级后的版本。以后可以继续使用页面的“更新”入口，不必每次重新安装 EXE。
+
+### 方式二：迁移到新的 EXE 稳定目录
+
+如果希望改用新的 `%LOCALAPPDATA%\ZhibingStudio` 管理版，必须在**第一次运行新安装包之前**把旧数据复制过去：
+
+```powershell
+$Old = "C:\path\to\原来的-weibo-console-v1.0.1"
+$Dest = Join-Path $env:LOCALAPPDATA "ZhibingStudio\data"
+New-Item -ItemType Directory -Force $Dest | Out-Null
+Copy-Item (Join-Path $Old "data\*") $Dest -Recurse -Force
+```
+
+然后按本文前面的步骤安装 EXE。安装器检测到 `console.sqlite` 已存在时，不会用空白种子库覆盖它。
+
+如果新安装包已经先运行并创建了新数据库，不要直接覆盖：先结束新服务、完整备份 `$Dest`，再停止旧服务，最后将旧 `data\` 完整复制回来并重新启动。不要把两个数据库的零散文件混合复制。
+
 ## 3. 目录和数据位置
 
 默认安装目录：
