@@ -1782,7 +1782,8 @@ export class TaskRunner extends EventEmitter {
       if (error instanceof DailyStopError || this.executionStorage.getStore()?.cancelled) throw new DailyStopError();
       if (error instanceof VerificationError && this.workflow.enabled(job)) {
         const submitted = !error.explicitlyUnpublished && ['submitted','uncertain'].includes(getStepAction(job.id, stepKey)?.state);
-        updateActionLog(actionId, { state: submitted ? 'uncertain' : 'verification_wait', error: error.message });
+        updateActionLog(actionId, { state: submitted ? 'uncertain' : 'verification_wait', error: error.message,
+          ...(error.explicitlyUnpublished ? { submittedAt: null } : {}) });
         error.submittedUncertain = submitted;
         throw error;
       }
