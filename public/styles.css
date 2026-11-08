@@ -1087,10 +1087,11 @@ body:not(:has(#page-overview.active)) .lan-access-button{display:none}
 .update-dot.current{background:#2e9b67;box-shadow:0 0 0 3px #e2f5ea}
 .update-dot.busy{background:#4b82bf;box-shadow:0 0 0 3px #e4effa}
 .update-dot.error{background:#b83949;box-shadow:0 0 0 3px #fde8eb}
-.update-dialog{width:min(680px,calc(100% - 28px));max-height:82vh;border-radius:20px;padding:22px;display:none;flex-direction:column;gap:12px}
+.update-dialog{width:min(680px,calc(100% - 28px));max-height:82vh;border-radius:20px;padding:22px;display:none;flex-direction:column;gap:12px;overflow-y:auto;overscroll-behavior:contain}
 .update-dialog[open]{display:flex}
+.update-dialog>*{flex:none}
 .update-intro{margin:0;color:var(--muted);font-size:12px;line-height:1.55}
-.update-versions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.update-versions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border:1px solid var(--line);border-radius:12px;overflow:hidden;flex:none}
 .update-versions>div{padding:9px 12px;border-right:1px solid var(--line);background:#fffafc;min-width:0}
 .update-versions>div:last-child{border-right:0}
 .update-versions span,.update-versions strong{display:block}

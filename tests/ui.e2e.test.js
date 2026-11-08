@@ -111,6 +111,10 @@ test('更新弹窗展示平台版本和只读命令，关闭重启开关可切�
   await page.locator('#update-entry').click();
   await page.locator('#update-dialog').waitFor({ state: 'visible' });
   await page.waitForFunction(() => document.querySelector('#update-latest')?.textContent === 'v1.2.0');
+  const versionBox = await page.locator('.update-versions').boundingBox();
+  assert.ok(versionBox.height >= 40, `版本区不应被压缩，实际高度 ${versionBox.height}`);
+  assert.equal(await page.locator('#update-installed').isVisible(), true);
+  assert.equal(await page.locator('#update-latest').isVisible(), true);
   assert.equal(await page.locator('#update-latest').textContent(), 'v1.2.0');
   assert.equal(await page.locator('#update-platform').textContent(), 'mac-arm64');
   assert.match(await page.locator('#update-command').inputValue(), /--restart$/);
