@@ -304,9 +304,12 @@ test('普通已提交未知步骤只读复核，经明确确认后才能用原�
   }, openVerification: async () => {}, hasTaskChallenge: async () => false, verifyPost: async () => { reads++; return { state: 'uncertain' }; } });
   await runner.run(job.id);
   const card = runner.workflow.status(getJob(job.id)).cards[0], key = card.steps[0].key;
+  const callsAfterRun = calls;
+  assert.equal(callsAfterRun, 2, '账号 A 待核对，账号 B 已成功');
+  assert.ok(getStepAction(job.id, key).submitted_at);
   assert.equal(getJob(job.id).metrics.uncertain, 1, '普通未知结果仍计待核对');
   runner.workflow.requestManual(job.id, card.identity); await until(() => !runner.workflow.session);
-  assert.equal(calls, 2); assert.ok(reads >= 1);
+  assert.equal(calls, callsAfterRun); assert.equal(reads, 0, '可见发帖窗口关闭前不得导航到超话页复核');
   assert.equal(getStepAction(job.id, key).state, 'uncertain');
   const original = getStepAction(job.id, key).content;
   runner.workflow.confirmUnpublished(job.id, key);
@@ -315,7 +318,7 @@ test('普通已提交未知步骤只读复核，经明确确认后才能用原�
   assert.equal(ready.canContinue, true, JSON.stringify(ready));
   runner.workflow.continue(job.id);
   await until(() => getJob(job.id).status === 'completed');
-  assert.equal(calls, 3); assert.equal(getJob(job.id).metrics.success, 2);
+  assert.equal(calls, callsAfterRun + 1); assert.equal(getJob(job.id).metrics.success, 2);
   assert.equal(getStepAction(job.id, key).content, original);
 });
 
@@ -914,7 +917,8 @@ test('验证码解除不能把已提交未知的评论/发帖当作未发布自�
       verifyComment:async()=>{reads++;return{state:'uncertain'};},verifyPost:async()=>{reads++;return{state:'uncertain'};}
     });
     await runner.run(job.id);runner.workflow.requestManual(job.id,'1001');await until(()=>!runner.workflow.session);
-    assert.equal(clicks,2);assert.ok(reads>0);
+    assert.equal(clicks,2);
+    assert.equal(reads,0,'可见验证窗口内不得导航到超话页做只读复核');
     runner.workflow.continue(job.id);await until(()=>getJob(job.id).status==='completed'); await runner.promise;assert.equal(clicks,2);
     assert.equal(runner.workflow.rows(job.id,0).find(r=>r.identity==='1001').outcome,'uncertain');
   }
@@ -1141,7 +1145,7 @@ test('同步到微博被遮挡时安全切换，不等待普通点击超时', as
       }
       return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `
         <script>window.$CONFIG={uid:'2204',user:{screen_name:'fixture'}};</script>
-        <button>更多</button><button>超话</button>
+        <span style="position:relative;display:inline-block"><button>更多</button><div class="woo-modal-mask" style="position:absolute;inset:0;z-index:2"></div></span><button>超话</button>
         <div class="woo-modal-wrap"><button>选择超话</button>
           <input placeholder="搜索超话" oninput="fetch('/ajax/stopic/list')">
           <div class="_h3_fixture" onclick="document.querySelector('textarea').value='测试[超话]'">测试</div>
@@ -1222,10 +1226,6 @@ test('人工验证后发帖准备失败保留可重试卡，不重复提交且�
     assert.equal(getJob(job.id).metrics.failed, 0);
     const row = db.prepare('SELECT state FROM task_step_state WHERE job_id=? AND step_key=?').get(job.id, card.currentStepKey);
     assert.equal(row.state, 'deferred');
-    const action = getStepAction(job.id, card.currentStepKey);
-    assert.equal(action.state, 'verification_wait');
-    assert.equal(action.verification_pending, 1);
-
     mode = 'manual_success';
     runner.workflow.requestManual(job.id, account.uid, card.currentStepKey);
     await until(() => opens === 2 && !runner.workflow.session, 10000);
@@ -1233,6 +1233,35 @@ test('人工验证后发帖准备失败保留可重试卡，不重复提交且�
     assert.equal(getStepAction(job.id, card.currentStepKey).state, 'succeeded');
     assert.equal(getJob(job.id).metrics.success, 1);
   } finally { await runner.workflow.endManual(job.id); }
+});
+
+test('已提交发帖的人工验证复用持久提交状态，不在可见窗口重发或跳转只读核对', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  const account = accounts[0];
+  let writes = 0, opens = 0, rechecks = 0;
+  const runner = new TaskRunner({
+    ensureIdentity: async item => ({ uid: item.uid, status: 'valid' }),
+    browserManager: { closeRunner: async () => {} },
+    post: async (_account, _topic, _content, options) => {
+      writes += 1;
+      throw new VerificationError('需要验证');
+    },
+    openVerification: async () => { opens += 1; return { context: () => ({}), isClosed: () => false, once: () => {} }; },
+    closeManual: async () => {},
+    hasTaskChallenge: async () => false
+  }, { scope: 'workbench', leases: new AccountLeases() });
+  await runner.run(job.id);
+  const writesBeforeManual = writes;
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === account.uid);
+  const action = db.prepare('SELECT * FROM action_logs WHERE job_id=? AND step_key=?').get(job.id, card.currentStepKey);
+  db.prepare('UPDATE action_logs SET submitted_at=? WHERE id=?').run(new Date().toISOString(), action.id);
+  const originalRecheck = runner.workflow.recheckRow.bind(runner.workflow);
+  runner.workflow.recheckRow = async (...args) => { rechecks += 1; return originalRecheck(...args); };
+  runner.workflow.waitForManualSubmission = async () => {};
+  runner.workflow.requestManual(job.id, account.uid, card.currentStepKey);
+  await until(() => opens === 1 && !runner.workflow.session, 10000);
+  assert.equal(writes, writesBeforeManual, '人工验证不得重发已提交的发帖');
+  assert.equal(rechecks, 0, '发帖人工窗口内不得触发会导航到超话页的只读扫描');
 });
 
 test('历史“已验证但发帖未发送”卡片自动恢复为安全重试且幂等', async () => {

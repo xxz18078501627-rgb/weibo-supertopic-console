@@ -276,10 +276,10 @@ export class VerificationWorkflow {
       db.prepare("UPDATE task_step_state SET state='review',outcome='uncertain' WHERE job_id=? AND step_key=?").run(jobId, stepKey(step));
     } else {
       const preserve = this.runner.workbenchVerification(job) && ['post','comment'].includes(step.kind)
-        && action?.submitted_at && action.sequence_number != null;
+        && action?.sequence_number != null && (step.kind === 'post' || action.submitted_at);
       if (!preserve) this.runner.releaseSequence(jobId, step);
       else this.runner.confirmSequence(jobId, step);
-      if (action) updateActionLog(action.id, { state: 'verification_wait', ...(preserve ? {} : { sequenceNumber: null, sequenceConfirmed: false }), error: error.message, verificationPending: true });
+      if (action) updateActionLog(action.id, { state: 'verification_wait', ...(preserve ? {} : { sequenceNumber: null, sequenceConfirmed: false }), submittedAt: null, error: error.message, verificationPending: true });
       db.prepare('UPDATE task_step_state SET outcome=NULL WHERE job_id=? AND step_key=?').run(jobId, stepKey(step));
     }
     const coupling = this.coupling(job, step);
@@ -1024,7 +1024,7 @@ export class VerificationWorkflow {
     });
     await this.assertSession(session);
     const continuation = this.runner.adapter.currentSubmission?.(action);
-    if (continuation && continuation.page === session.page && action?.submitted_at) {
+    if (action?.submitted_at) {
       session.submitted = true; session.attemptId = action.attempt_id;
     }
     // A cleared captcha is not proof that a submitted operation failed.
@@ -1041,7 +1041,7 @@ export class VerificationWorkflow {
     if (row.kind === 'checkin') {
       this.markVerificationPassed(jobId, round, identity);
       await this.completeManualCheckins(session, account, round, identity);
-    } else if (['review','network_review'].includes(row.state) && !session.submitted) {
+    } else if (row.kind !== 'post' && ['review','network_review'].includes(row.state) && !session.submitted) {
       const rechecked = await this.recheckRow(jobId, row);
       if (row.kind === 'comment_like' && rechecked?.notLiked && !session.submitted) {
         const action = getStepAction(jobId, row.step_key);
@@ -1097,10 +1097,16 @@ export class VerificationWorkflow {
 
   async waitForManualSubmission(session, row) {
     const { jobId } = session;
+    let action = getStepAction(jobId, row.step_key);
+    const continuation = this.runner.adapter.currentSubmission?.(action) || this.runner.adapter.manualPostReceipt;
+    const ownsContinuation = continuation && (!continuation.actionId || continuation.actionId === action?.id)
+      && (!continuation.attemptId || continuation.attemptId === action?.attempt_id)
+      && continuation.page === session.page;
+    if (['post','comment','repost'].includes(row.kind) && !ownsContinuation) return;
     let until = this.runner.now() + MANUAL_RECEIPT_TIMEOUT_MS;
     while (this.runner.now() < until) {
       await this.assertSession(session);
-      let action = getStepAction(jobId, row.step_key);
+      action = getStepAction(jobId, row.step_key);
       if (action?.state === 'succeeded') { this.finishStep(jobId, session.step, 'succeeded'); return; }
       const handle = this.runner.adapter.currentSubmission?.(action)
         || (this.runner.workbenchVerification(getJob(jobId)) && this.runner.adapter.currentSubmission ? null : row.kind === 'post' ? this.runner.adapter.manualPostReceipt : row.kind === 'comment' ? this.runner.adapter.manualCommentReceipt : null);
@@ -1122,8 +1128,8 @@ export class VerificationWorkflow {
       session.wake = null; session.timer = null;
     }
     await this.assertSession(session);
-    let action = getStepAction(jobId, row.step_key);
-    if (action?.state !== 'succeeded') {
+    action = getStepAction(jobId, row.step_key);
+    if (action?.state !== 'succeeded' && row.kind !== 'post') {
       try { await this.recheckRow(jobId, row); } catch { /* keep the committed submission uncertain */ }
       action = getStepAction(jobId, row.step_key);
     }

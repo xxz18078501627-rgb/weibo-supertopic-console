@@ -961,7 +961,10 @@ export class WeiboAdapter {
   async openVerification(account, topic, action) {
     // The workflow has already finished the background step before calling
     // this.  Opening a manual context is the only path that may be visible.
-    const pending = this.currentSubmission(action);
+    // A post always restarts from Home. A stale composer can be left on a
+    // topic page after captcha handling; reusing it would visibly navigate the
+    // verification window away from Home.
+    const pending = action?.kind === 'post' ? null : this.currentSubmission(action);
     const page = await this.browserManager.page(account, 'manual');
     if (pending?.page === page && !page.isClosed?.()) {
       await this.browserManager.foreground?.(page);
@@ -1341,7 +1344,13 @@ export class WeiboAdapter {
     await page.getByText('更多', { exact: true }).first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
     const more = await firstVisible([page.getByText('更多', { exact: true })]);
     if (!more) throw new UnsupportedPageError('首页没有识别到发博入口');
-    await more.click();
+    try { await more.click({ timeout: 2500 }); }
+    catch {
+      // A completed verification can leave Weibo's modal toolbar/mask mounted
+      // above the Home “更多” button. Trigger only that exact button through the
+      // DOM instead of waiting 30 seconds for pointer interception to clear.
+      await more.evaluate(button => button.click());
+    }
     const superEntry = await firstVisible([page.getByText('超话', { exact: true })]);
     if (!superEntry) throw new UnsupportedPageError('没有识别到首页发博的超话入口');
     await superEntry.click();

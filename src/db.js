@@ -684,7 +684,7 @@ export function updateActionLog(actionId, patch) {
     patch.sequenceConfirmed == null ? row.sequence_confirmed : Number(Boolean(patch.sequenceConfirmed)),
     patch.receiptId ?? row.receipt_id, patch.receiptUrl ?? row.receipt_url,
     'completedAt' in patch ? patch.completedAt : row.state === 'succeeded' ? row.completed_at : ['succeeded','failed','uncertain','skipped','cancelled'].includes(state) ? now() : row.completed_at,
-    patch.submittedAt ?? row.submitted_at, patch.successSource ?? row.success_source,
+    'submittedAt' in patch ? patch.submittedAt : row.submitted_at, patch.successSource ?? row.success_source,
     state === 'succeeded' ? 0 : patch.verificationPending == null ? row.verification_pending : Number(Boolean(patch.verificationPending)), actionId
   );
   return db.prepare('SELECT * FROM action_logs WHERE id=?').get(actionId);
