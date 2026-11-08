@@ -327,11 +327,12 @@ export class TaskRunner extends EventEmitter {
     } finally { session.release?.(); }
   }
 
-  async ensureStepIdentity(job, account) {
+  async ensureStepIdentity(job, account, step = null) {
     const session = this.engageSession;
     const manager = this.adapter.browserManager;
     if (this.groupedEngage(job) && session?.accountId === account.id && session.identified
       && (!manager || manager.generation == null || (manager.accountId === account.id && manager.generation === session.generation))) return;
+    if (!this.groupedEngage(job) && step?.kind === 'post' && this.adapter.openPostHome) await this.adapter.openPostHome(account);
     await this.adapter.ensureIdentity(account);
     if (this.groupedEngage(job) && this.engageSession === session && session) {
       session.identified = true;
@@ -586,9 +587,9 @@ export class TaskRunner extends EventEmitter {
   }
 
   scheduleAutoReadbacks(jobId = null) {
-    if (this.scope !== 'engage') return;
-    const job = jobId ? getJob(jobId) : listJobs(20, 'engage').find(item => ['completed', 'stopped'].includes(item.status));
-    if (!job || !['completed', 'stopped'].includes(job.status) || job.scope !== 'engage') return;
+    const scope = this.scope || 'workbench';
+    const job = jobId ? getJob(jobId) : listJobs(20, scope).find(item => ['completed', 'stopped'].includes(item.status));
+    if (!job || !['completed', 'stopped'].includes(job.status) || (job.scope || 'workbench') !== scope) return;
     if (this.readbackTimers.has(job.id)) return;
     if (!this.autoReadbackCandidates(job).length) return;
     const timer = setTimeout(() => void this.runAutoReadbacks(job.id), 1000);
@@ -598,15 +599,20 @@ export class TaskRunner extends EventEmitter {
 
   autoReadbackCandidates(job) {
     const ledger = job?.cursor?.autoReadbacks || {};
-    return db.prepare(`SELECT * FROM action_logs WHERE job_id=? AND kind IN ('comment','repost')
-      AND state='uncertain' AND submitted_at IS NOT NULL AND error LIKE '%频繁%'
-      ORDER BY started_at,id`).all(job.id).filter(action => Number(ledger[action.id]?.attempts || 0) < 2);
+    const query = job?.scope === 'engage' || job?.config?.kind === 'engage'
+      ? `SELECT * FROM action_logs WHERE job_id=? AND kind IN ('comment','repost')
+        AND state='uncertain' AND submitted_at IS NOT NULL AND error LIKE '%频繁%'
+        ORDER BY started_at,id`
+      : `SELECT * FROM action_logs WHERE job_id=? AND kind='post'
+        AND state='uncertain' AND submitted_at IS NOT NULL ORDER BY started_at,id`;
+    return db.prepare(query).all(job.id).filter(action => Number(ledger[action.id]?.attempts || 0) < 2);
   }
 
   async runAutoReadbacks(jobId) {
     this.readbackTimers.delete(jobId);
     let job = getJob(jobId);
-    if (!job || job.scope !== 'engage' || !['completed', 'stopped'].includes(job.status)) return;
+    const scope = this.scope || 'workbench';
+    if (!job || (job.scope || 'workbench') !== scope || !['completed', 'stopped'].includes(job.status)) return;
     if (this.promise || this.currentExecution || this.workflow.busy()) {
       const timer = setTimeout(() => void this.runAutoReadbacks(jobId), 15000);
       timer.unref?.();
@@ -718,6 +724,9 @@ export class TaskRunner extends EventEmitter {
         if (settled && (this.scope === 'engage' || settled.config?.kind === 'engage')) {
           this.emitUpdate(settled);
           if (['completed', 'stopped'].includes(settled.status)) this.scheduleAutoReadbacks(jobId);
+        } else if (settled && ['completed', 'stopped'].includes(settled.status)) {
+          this.emitUpdate(settled);
+          this.scheduleAutoReadbacks(jobId);
         }
       }
     });

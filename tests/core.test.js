@@ -32,9 +32,31 @@ const { dailySuccess, startRound, finishRound, listRoundReports, pendingRoundRep
 const { buildLanAccess } = await import('../src/lan-access.js');
 const { notifyRound } = await import('../src/notifications.js');
 const { dailyStopStatus, deadlineFor, DailyStopError } = await import('../src/daily-stop.js');
-const { BODY_READ_TIMEOUT_MS, IdentityMismatchError, RateLimitError, UnsupportedPageError, VerificationError, WeiboAdapter, classifyPostReceipt, commentRowMatches, isRateLimitMessage, normalizeWeiboNickname, normalizeWeiboText, postReadbackMatches, readJsonBounded, settleBounded, visibleCommentMatches, weiboShortIdToNumeric } = await import('../src/weibo-adapter.js');
+const { BODY_READ_TIMEOUT_MS, IdentityMismatchError, RateLimitError, UnsupportedPageError, VerificationError, WeiboAdapter, classifyPostReceipt, commentRowMatches, isRateLimitMessage, normalizeWeiboNickname, normalizeWeiboText, postReadbackMatches, readJsonBounded, settleBounded, verificationPageUrl, visibleCommentMatches, weiboShortIdToNumeric } = await import('../src/weibo-adapter.js');
+
+test('发帖验证卡和身份确认直接从主页打开，其他操作保留目标页', () => {
+  const topic = { url: 'https://weibo.com/p/100808topic' };
+  assert.equal(verificationPageUrl({ kind: 'post' }, topic), 'https://weibo.com/');
+  assert.equal(verificationPageUrl({ kind: 'post', url: 'https://weibo.com/77/abc' }, topic), 'https://weibo.com/77/abc');
+  assert.equal(verificationPageUrl({ kind: 'checkin' }, topic), topic.url);
+});
 
 test.beforeEach(() => { clearAllDataForTests(); db.exec('DELETE FROM account_groups'); setSetting('task_defaults', defaultTaskConfig); setSetting('task_templates', []); });
+test('工作台发帖待核对在任务结束后进入只读复核候选，最多两次', () => {
+  const account = createAccount('核对账号');
+  const topic = createTopic({ name: '核对超话', url: 'https://weibo.com/p/100808verification' });
+  addPostMaterials(['核对文案一', '核对文案二']);
+  const snapshot = createSnapshot({ rounds: 1, accountIds: [account.id], topicIds: [topic.id],
+    actionPlan: [{ type: 'post', count: 1, intervalSeconds: 0 }] }, listAccounts(), listTopics());
+  const job = createJob(snapshot);
+  dbModule.updateJob(job.id, { status: 'completed', cursor: { autoReadbacks: {} } });
+  db.prepare('INSERT INTO action_logs(id,job_id,step_key,kind,account_id,state,error,started_at,submitted_at) VALUES(?,?,?,?,?,?,?,?,?)')
+    .run('uncertain-post', job.id, 'post-step', 'post', account.id, 'uncertain', '提交后结果无法确认', new Date().toISOString(), new Date().toISOString());
+  const runner = new TaskRunner({ browserManager: {} }, { scope: 'workbench' });
+  assert.deepEqual(runner.autoReadbackCandidates(getJob(job.id)).map(item => item.id), ['uncertain-post']);
+  dbModule.updateJob(job.id, { cursor: { autoReadbacks: { 'uncertain-post': { attempts: 2 } } } });
+  assert.deepEqual(runner.autoReadbackCandidates(getJob(job.id)), []);
+});
 test('记录全天聚合、游标分页、异常去重与任务计数', async () => {
   const { recordView } = await import('../src/record-view.js');
   const stamp='2026-10-30T03:00:00.000Z';

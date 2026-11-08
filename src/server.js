@@ -753,6 +753,7 @@ server.listen(config.port, config.host, async () => {
   // check-ins from a completed, verification-capable task.
   const latest = listJobs(1, 'workbench')[0];
   if (latest) runner.workflow.reopenUnconfirmedCheckins(latest.id);
+  runner.scheduleAutoReadbacks();
   engageRunner.scheduleAutoReadbacks();
 });
 

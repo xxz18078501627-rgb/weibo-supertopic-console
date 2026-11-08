@@ -482,7 +482,7 @@ export class VerificationWorkflow {
     try {
       const operation = async () => {
         if (isEngage && !await this.runner.network.probe(getJob(jobId))) { this.runner.network.pause(jobId, step); throw new NetworkOfflineError(); }
-        await this.runner.ensureStepIdentity(job, account);
+        await this.runner.ensureStepIdentity(job, account, step);
         this.runner.assertMaySubmit(jobId);
         return this.runner.execute(getJob(jobId), step, account, topic, { reuseVisiblePage: manual && step.kind === 'checkin' });
       };

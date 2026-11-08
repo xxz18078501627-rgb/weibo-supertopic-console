@@ -305,6 +305,12 @@ export function weiboLinkAuthorUid(link) {
   } catch { return ''; }
 }
 
+export function verificationPageUrl(action, topic) {
+  if (action?.url && /^https:\/\/weibo\.com\//.test(action.url)) return action.url;
+  if (action?.kind === 'post') return 'https://weibo.com/';
+  return topic?.url || 'https://weibo.com/';
+}
+
 function commentLikeState(rows, commentId) {
   const row = (rows || []).find(item => String(item.idstr || item.id) === String(commentId));
   if (!row) return null;
@@ -943,6 +949,15 @@ export class WeiboAdapter {
     if (manager.owner === 'runner') for (const page of manager.context?.pages() || []) await manager.minimize?.(page);
   }
 
+  async openPostHome(account) {
+    const page = await this.browserManager.page(account, this.taskOwner());
+    if (safeNavigationUrl(page.url()) !== safeNavigationUrl('https://weibo.com/')) {
+      await gotoChecked(page, 'https://weibo.com/', { stage: 'post-home' });
+    }
+    await detectChallenge(page, this.browserManager);
+    return page;
+  }
+
   async openVerification(account, topic, action) {
     // The workflow has already finished the background step before calling
     // this.  Opening a manual context is the only path that may be visible.
@@ -952,7 +967,7 @@ export class WeiboAdapter {
       await this.browserManager.foreground?.(page);
       return page;
     }
-    const url = action?.url && /^https:\/\/weibo\.com\//.test(action.url) ? action.url : topic.url;
+    const url = verificationPageUrl(action, topic);
     await gotoChecked(page, url, { stage: 'verification-open' });
     await this.browserManager.foreground?.(page);
     return page;
@@ -1318,11 +1333,9 @@ export class WeiboAdapter {
     const startedAt = Date.now();
     const mark = stage => this.log('info', `发帖准备阶段：${stage}（${Date.now() - startedAt}ms）`, {
       accountId: account.id, topicId: topic.id });
-    await this.ensureIdentity(account);
-    const page = await this.browserManager.page(account, this.taskOwner());
-    await gotoChecked(page, 'https://weibo.com/', { stage: 'post-home' });
+    const page = await this.openPostHome(account);
     mark('首页已加载');
-    await detectChallenge(page, this.browserManager);
+    await this.ensureIdentity(account);
     const target = topic.url.match(/\/p\/(100808\w+)/)?.[1];
     if (!target) throw new UnsupportedPageError('超话链接缺少可核对的目标标识');
     await page.getByText('更多', { exact: true }).first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
