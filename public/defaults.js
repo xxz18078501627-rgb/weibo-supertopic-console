@@ -5,7 +5,7 @@ export const DEFAULT_EMOJIS = [
   '👍', '👏', '🙌', '💪', '✨', '🌟', '🎉', '❤️'
 ];
 export const LEGACY_EMOJIS = ['🙂', '👏', '✨', '🌟'];
-export const DEFAULT_ACTION_INTERVALS = { checkin: 5, post: 10, comment: 3 };
+export const DEFAULT_ACTION_INTERVALS = { checkin: 5, post: 10, original: 10, comment: 3 };
 export const DEFAULT_ENGAGE_INTERVALS = { repost: 3, comment: 3, comment_like: 3 };
 export const DEFAULT_ENGAGE_COUNTS = { repost: 10, comment: 10, comment_like: 20 };
 export const ENGAGE_ACTION_TYPES = ['repost', 'comment', 'comment_like'];

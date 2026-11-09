@@ -16,7 +16,7 @@ function safeHint(payload, submittedText, fallback) {
   return text.trim().slice(0, 160) || fallback;
 }
 
-function inspectBody(raw, submittedText, topicId, commentTarget = null) {
+function inspectBody(raw, submittedText, topicId, commentTarget = null, requireTopic = true) {
   if (typeof raw !== 'string' || !raw.trim()) return { owned: true, trusted: false };
   let fields;
   try {
@@ -41,7 +41,7 @@ function inspectBody(raw, submittedText, topicId, commentTarget = null) {
     const body = new URLSearchParams(raw);
     fields = name => body.getAll(name);
   }
-  const topics = commentTarget === null ? TOPIC_FIELDS.flatMap(fields) : [];
+  const topics = commentTarget === null && requireTopic ? TOPIC_FIELDS.flatMap(fields) : [];
   if (commentTarget !== null) {
     const targets = ['id', 'mid', 'status_id'].flatMap(fields);
     if (!targets.length) return { owned: true, trusted: false };
@@ -68,7 +68,7 @@ function inspectBody(raw, submittedText, topicId, commentTarget = null) {
  */
 export function createPostReceiptCollector({
   page, attemptId, submittedText, topicId, onReceipt, classify, readJson, operation = 'post', targetId = null,
-  log = () => {}, receiptTimeoutMs = 15_000, signal,
+  requireTopic = true, log = () => {}, receiptTimeoutMs = 15_000, signal,
 }) {
   const context = page.context();
   const requests = new Map();
@@ -149,7 +149,7 @@ export function createPostReceiptCollector({
           const sameText = submittedText ? text === submittedText : ['', '转发微博', undefined, null].includes(text);
           const sameTarget = String(fields('id') || '') === String(targetId);
           ownership = { owned: sameTarget && sameText, trusted: sameTarget && sameText };
-        } else ownership = inspectBody(raw, submittedText, topicId, operation === 'comment' ? String(targetId) : null);
+        } else ownership = inspectBody(raw, submittedText, topicId, operation === 'comment' ? String(targetId) : null, requireTopic);
         if (!ownership.trusted) record(path, null, null, 'unknown', ownership.owned ? 'Request fields unavailable' : 'Request body does not match current composer');
         return ownership;
       })
@@ -292,5 +292,6 @@ export function createPostReceiptCollector({
     get saveError() { return saveError; },
     get expired() { return expired; },
     get isOpen() { return open; },
+    get requestObserved() { return sequence > 0; },
   };
 }

@@ -160,9 +160,8 @@ const installerPath = path.join(work, installerName);
 if (!fs.existsSync(installerPath)) throw new Error('安装包未生成：' + installerPath);
 const notes = (() => {
   try {
-    const text = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-    const section = text.split(/\n## /).slice(1).find(item => item.includes('开发中') || item.includes(`v${version}`));
-    return section ? section.replace(/^[^\n]+\n/, '').trim().slice(0, 3000) : `制饼工坊 v${version}`;
+    const text = fs.readFileSync(path.join(root, 'RELEASE_NOTES.md'), 'utf8').trim();
+    return text ? text.slice(0, 6000) : `制饼工坊 v${version}`;
   } catch { return `制饼工坊 v${version}`; }
 })();
 const installerBytes = fs.readFileSync(installerPath);

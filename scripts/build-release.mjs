@@ -12,7 +12,13 @@ const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
 const version = pkg.version;
 const dist = path.join(root, 'dist');
 const staging = path.join(dist, `weibo-console-${version}`);
-const include = ['src', 'public', 'scripts', 'tests', 'docs', 'bootstrap.mjs', 'install.sh', 'install.ps1', 'package.json', 'package-lock.json', 'README.md', 'INSTALL.md', 'AGENTS.md', 'CHANGELOG.md', 'LICENSE'];
+const include = ['src', 'public',
+  'scripts/service.mjs', 'scripts/service-control.mjs', 'scripts/service-runner.mjs',
+  'scripts/managed-install.mjs', 'scripts/update-helper.mjs',
+  'scripts/install-service.mjs', 'scripts/uninstall-service.mjs',
+  'scripts/show-token.mjs', 'scripts/make-license.mjs',
+  'docs', 'bootstrap.mjs', 'install.sh', 'install.ps1', 'package.json', 'package-lock.json',
+  'README.md', 'INSTALL.md', 'CHANGELOG.md', 'RELEASE_NOTES.md', 'LICENSE'];
 
 fs.rmSync(staging, { recursive: true, force: true });
 fs.mkdirSync(path.join(staging, 'data'), { recursive: true });
@@ -23,7 +29,10 @@ for (const entry of include) {
   const destination = path.join(staging, entry);
   const stat = fs.statSync(source);
   if (stat.isDirectory()) fs.cpSync(source, destination, { recursive: true });
-  else fs.copyFileSync(source, destination);
+  else {
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(source, destination);
+  }
 }
 
 const seed = path.join(dist, 'seed', 'console.sqlite');

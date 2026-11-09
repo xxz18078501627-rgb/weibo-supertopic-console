@@ -36,6 +36,13 @@ test('点赞按灰变橙；无评论ID属性也能定位，已赞跳过，不误
  const again=await a.likeComment(account,link,'c1',{onSubmit:()=>gates++});assert.equal(again.state,'skipped');assert.equal(gates,1);
  assert.equal((await a.verifyCommentLike(account,link,'c1')).state,'succeeded');
  assert.equal((await a.likeWeibo(account,link,{onSubmit:()=>gates++})).state,'succeeded');assert.equal((await a.likeWeibo(account,link)).state,'skipped');await p.close();});
+test('外赞接口缺少 liked 字段时，目标微博页面已赞仍记为跳过',async()=>{const p=await fixture();await p.goto(link);
+ await p.locator('.detail .toolbar_main button[title="赞"]').evaluate(button=>button.style.color='rgb(255,130,0)');
+ await p.unroute('https://weibo.com/**');
+ await p.route('https://weibo.com/**',route=>{const url=new URL(route.request().url());if(url.pathname==='/ajax/statuses/show')return route.fulfill({json:{idstr:'12345',user:{idstr:'77'},text:'目标原微博'}});return route.continue();});
+ const a=new WeiboAdapter({page:async()=>p});let submits=0;
+ const result=await a.likeWeibo(account,link,{onSubmit:()=>submits++});
+ assert.equal(result.state,'skipped');assert.equal(result.alreadyDone,true);assert.equal(submits,0);await p.close();});
 test('断网闸门拒绝时不点击转发，旧成功提示不能认领本次',async()=>{const p=await fixture();const a=new WeiboAdapter({page:async()=>p});let submits=0;
  await assert.rejects(a.repostWeibo(account,link,'正文',{beforeSubmit:()=>{throw Error('offline gate');},onSubmit:()=>submits++}),/offline gate/);assert.equal(submits,0);await p.close();});
 test('后台验证码标签只关闭验证页，不关闭账号任务页和浏览器上下文',async()=>{

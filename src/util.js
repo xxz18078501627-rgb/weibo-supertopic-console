@@ -49,5 +49,5 @@ export function serializeError(error) {
 }
 
 export function kindLabel(kind) {
-  return { checkin: '签到', post: '发帖', comment: '评论', repost: '转发', like: '外赞', comment_like: '内赞' }[kind] || String(kind || '');
+  return { checkin: '签到', post: '发帖', original: '原创', comment: '评论', repost: '转发', like: '外赞', comment_like: '内赞' }[kind] || String(kind || '');
 }

@@ -16,7 +16,7 @@ export function problemType(message = '', state = '') {
   return '异常';
 }
 
-const KINDS = ['checkin', 'post', 'comment', 'repost', 'like', 'comment_like'];
+const KINDS = ['checkin', 'post', 'original', 'comment', 'repost', 'like', 'comment_like'];
 const counts = () => Object.fromEntries(KINDS.map(kind => [kind, { succeeded: 0, failed: 0, uncertain: 0, skipped: 0 }]));
 const stamp = row => row.completed_at || row.created_at || row.started_at || '';
 const matchesLevel = (row, level) => level === 'all' || row.level === level;
@@ -121,7 +121,7 @@ export function recordView(date, { query = '', abnormalOnly = false, identity = 
   for (const log of logs) {
     const account = ensure(log.account_id);
     const type = problemType(log.message);
-    const kind = /发帖|\bpost\b/.test(log.message) ? 'post' : /评论|\bcomment\b/.test(log.message) ? 'comment' : /签到/.test(log.message) ? 'checkin' : '';
+    const kind = /原创|\boriginal\b/.test(log.message) ? 'original' : /发帖|\bpost\b/.test(log.message) ? 'post' : /评论|\bcomment\b/.test(log.message) ? 'comment' : /签到/.test(log.message) ? 'checkin' : '';
     const at = stamp(log);
     const row = { ...log, source: 'system', identity: account?.identity || '', account_name: account?.name || '系统', uid: account?.uid || '', type, at };
     row.sortId = detailKey(row, at);

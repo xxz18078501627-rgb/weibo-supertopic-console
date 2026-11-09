@@ -906,11 +906,14 @@ test('待验证账号卡片、互斥、明确确认与继续运行按钮可用',
     db.prepare('INSERT INTO task_step_state(job_id,step_key,ordinal,round_index,account_id,identity,topic_id,kind,action_index,unit_index,state,outcome,ever_verification) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(jobId, keys[index], index, 0, account.id, '10086', topic.id, index ? 'post' : 'comment', index, 0, index ? 'review' : 'deferred', index ? 'uncertain' : null, 1);
     db.prepare('INSERT INTO action_logs(id,job_id,step_key,kind,account_id,topic_id,state,error,started_at,verification_pending) VALUES(?,?,?,?,?,?,?,?,?,1)').run(`verification-action-${index}`, jobId, keys[index], index ? 'post' : 'comment', account.id, topic.id, index ? 'uncertain' : 'verification_wait', '需要验证码', stamp);
   }
-  db.prepare('INSERT INTO verification_cards(job_id,round_index,identity,account_id,status,blocked_kinds_json,reason,triggered_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)').run(jobId, 0, '10086', account.id, 'pending', '["comment","post"]', '需要验证码', stamp, stamp);
+  db.prepare('INSERT INTO verification_cards(job_id,round_index,identity,account_id,status,blocked_kinds_json,reason,source,triggered_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)').run(jobId, 0, '10086', account.id, 'pending', '["comment","post"]', '发帖未确认成功，可再次验证', 'manual_unconfirmed', stamp, stamp);
   const refused = await page.request.post(`http://127.0.0.1:${port}/api/jobs/${jobId}/verification/confirm-unpublished`, { data: { stepKey: keys[1], confirmed: false } });
   assert.equal(refused.status(), 400);
+  // A cursor without a live verification session is stale after a failed open
+  // or service restart. It must not keep the account locked forever.
   db.prepare('UPDATE jobs SET cursor_json=? WHERE id=?').run(JSON.stringify({ ...cursor, manualVerification: { identity: '10086', phase: 'challenge' } }), jobId);
-  assert.equal((await page.request.post(`http://127.0.0.1:${port}/api/accounts/${account.id}/login`)).status(), 409);
+  assert.equal((await page.request.post(`http://127.0.0.1:${port}/api/accounts/${account.id}/login`)).status(), 202);
+  await page.request.post(`http://127.0.0.1:${port}/api/login-session/cancel`);
   db.prepare('UPDATE jobs SET cursor_json=? WHERE id=?').run(JSON.stringify(cursor), jobId);
   let state = await page.request.get(`http://127.0.0.1:${port}/api/state`).then(r => r.json());
   assert.equal(state.activeJob.metrics.uncertain, 0);
@@ -932,6 +935,7 @@ test('待验证账号卡片、互斥、明确确认与继续运行按钮可用',
     await page.waitForFunction(() => document.querySelector('#verification-panel')?.innerText.includes('待验证昵称'));
     assert.match(await page.locator('#verification-panel').innerText(), /待验证昵称/);
     assert.match(await page.locator('#verification-panel').innerText(), /10086/);
+    assert.equal((await page.locator('[data-verify-identity]').innerText()).trim(), '再次验证');
     assert.equal(await page.locator('.recent-state.verification_wait').count(), 2);
     assert.equal(await page.locator('.recent-state.uncertain').count(), 0);
     assert.match(await page.locator('#run-metrics').innerText(), /0\s*待核对/);
@@ -1144,7 +1148,8 @@ test('账号记录搜索、异常筛选、面板与详情游标分页可用', as
   const counts = { checkin: { succeeded: 1, failed: 0, uncertain: 0, skipped: 0 }, post: { succeeded: 0, failed: 0, uncertain: 0, skipped: 0 }, comment: { succeeded: 1, failed: 0, uncertain: 0, skipped: 2 } };
   const account = { identity: '123456', uid: '123456', name: '测试昵称', counts, tags: [{ type: '频繁', kind: 'comment' }] };
   try {
-    await page.request.post('http://127.0.0.1:' + port + '/api/login', { data: { token } });
+    const loginResponse = await page.request.post('http://127.0.0.1:' + port + '/api/login', { data: { token } });
+    assert.equal(loginResponse.status(), 200, await loginResponse.text());
     await page.route(url => url.pathname === '/api/records', route => {
       const p = new URL(route.request().url()).searchParams;
       queries.push(p.toString());
@@ -1176,6 +1181,22 @@ test('账号记录搜索、异常筛选、面板与详情游标分页可用', as
     await page.goto('http://127.0.0.1:' + port);
     await page.locator('#nav [data-page="logs"]').click();
     await page.locator('.record-account-row').waitFor();
+    for (const width of [1440, 1280, 1100, 900]) {
+      await page.setViewportSize({ width, height: 900 });
+      await page.waitForTimeout(80);
+      const summary = await page.evaluate(() => {
+        const grid = document.querySelector('#log-summary .log-summary-grid');
+        const cells = [...grid.children].map(node => node.getBoundingClientRect());
+        return {
+          count: cells.length,
+          rows: new Set(cells.map(rect => Math.round(rect.top))).size,
+          columns: getComputedStyle(grid).gridTemplateColumns.split(' ').length,
+          overflow: document.documentElement.scrollWidth > innerWidth,
+        };
+      });
+      assert.deepEqual(summary, { count: 5, rows: width > 900 ? 1 : 3, columns: width > 900 ? 5 : 2, overflow: false }, `${width}px 汇总栏布局`);
+    }
+    await page.setViewportSize({ width: 1440, height: 900 });
     assert.equal(await page.locator('.record-issue').count(), 6);
     assert.match(await page.locator('#key-events .panel-pager span').innerText(), /^1 \/ 2$/);
     await page.locator('#key-events [data-pager-next]').click();
@@ -1202,6 +1223,43 @@ test('账号记录搜索、异常筛选、面板与详情游标分页可用', as
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
     await page.locator('#record-search').fill('不存在');
     await page.getByText('无匹配账号', { exact: true }).waitFor();
+  } finally { await page.close(); }
+});
+
+test('账号限制按钮不会导致分组与登录状态跨行错位', async () => {
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await page.request.post(base + '/api/login', { data: { token } });
+    const created = [];
+    for (const name of ['布局账号甲', '布局账号乙']) {
+      const response = await page.request.post(base + '/api/accounts', { data: { name } });
+      assert.ok(response.ok(), await response.text());
+      created.push((await response.json()).id);
+    }
+    const state = await page.request.get(base + '/api/state').then(response => response.json());
+    const accounts = state.accounts.filter(account => created.includes(account.id));
+    assert.equal(accounts.length, 2);
+    state.accounts = accounts.map(account => ({ ...account, auth_status: 'valid', enabled: true }));
+    state.restrictedAccounts = [{ accountId: accounts[0].id, identity: accounts[0].uid || accounts[0].id, type: '频繁', kind: 'repost', reason: '布局夹具', expiresAt: new Date(Date.now() + 3600000).toISOString() }];
+    await page.route('**/api/events', route => route.fulfill({ contentType: 'text/event-stream', body: ': layout fixture\n\n' }));
+    await page.route('**/api/state', route => route.fulfill({ json: state }));
+    await page.goto(base);
+    await page.locator('#nav [data-page="accounts"]').click();
+    await page.waitForFunction(() => document.querySelectorAll('.account-row').length === 2);
+    for (const width of [1440, 1280, 1100]) {
+      await page.setViewportSize({ width, height: 900 });
+      const alignment = await page.evaluate(() => ({
+        groups: [...new Set([...document.querySelectorAll('.account-row .group-cell')].map(node => Math.round(node.getBoundingClientRect().x)))],
+        statuses: [...new Set([...document.querySelectorAll('.account-row .status-pill')].map(node => Math.round(node.getBoundingClientRect().x)))],
+        actionWidths: [...new Set([...document.querySelectorAll('.account-row .row-actions')].map(node => Math.round(node.getBoundingClientRect().width)))],
+        reserves: document.querySelectorAll('.row-action-reserve').length,
+      }));
+      assert.equal(alignment.groups.length, 1, width + 'px 分组列应一致');
+      assert.equal(alignment.statuses.length, 1, width + 'px 登录状态列应一致');
+      assert.equal(alignment.actionWidths.length, 1, width + 'px 操作列应一致');
+      assert.equal(alignment.reserves, 1);
+    }
   } finally { await page.close(); }
 });
 
@@ -1753,7 +1811,9 @@ test('登录页头像、文案分段标签与移动分组操作条可用', async
     assert.ok(Math.max(...template.map(item => item.bottom)) - Math.min(...template.map(item => item.bottom)) <= 1);
     assert.ok(template.every(item => item.height === 34));
     const picks = await page.evaluate(() => [...document.querySelectorAll('#material-group-picks .pick-row')].map(row => ({ clientWidth: row.clientWidth, scrollWidth: row.scrollWidth, overflowX: getComputedStyle(row).overflowX, wrap: getComputedStyle(row).flexWrap })));
-    assert.ok(picks.every(row => row.scrollWidth > row.clientWidth && row.overflowX === 'auto' && row.wrap === 'nowrap'), JSON.stringify(picks));
+    assert.ok(picks[0].scrollWidth > picks[0].clientWidth && picks[0].overflowX === 'auto' && picks[0].wrap === 'nowrap', JSON.stringify(picks[0]));
+    assert.equal(picks[1].scrollWidth, picks[1].clientWidth, '原创没有测试分组时不应出现无意义横向滚动');
+    assert.ok(picks[2].scrollWidth > picks[2].clientWidth && picks[2].overflowX === 'auto' && picks[2].wrap === 'nowrap', JSON.stringify(picks[2]));
 
     await page.setViewportSize({ width: 375, height: 844 });
     await page.locator('#mobile-nav [data-page="materials"]').click();
@@ -1813,14 +1873,14 @@ test('桌面四页页头统一紧凑，后三页填满可用高度', async () =>
     assert.equal(pages.materials.page.height, 734);
     assert.ok(Math.abs(pages.logs.page.bottom - 890) <= 12, `记录页底部应约 890px，实际 ${pages.logs.page.bottom}`);
     assert.equal(pages.logs.grid.bottom, pages.logs.page.bottom);
-    assert.ok(Math.abs(pages.logs.grid.height - 654) <= 4);
-    assert.ok(pages.logs.panels.every(height => Math.abs(height - 321) <= 3));
+    assert.ok(Math.abs(pages.logs.grid.height - 654) <= 4, `记录网格应约 654px，实际 ${pages.logs.grid.height}`);
+    assert.ok(pages.logs.panels.every(height => Math.abs(height - 321) <= 3), `记录面板应约 321px，实际 ${JSON.stringify(pages.logs.panels)}`);
     assert.ok(pages.logs.doc <= 904);
 
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.waitForTimeout(250);
     const compact = await measure();
-    assert.equal(compact.grid.height, 554);
+    assert.equal(compact.grid.height, 554, `记录网格应约 554px，实际 ${compact.grid.height}`);
     assert.ok(compact.panels.every(height => Math.abs(height - 271) <= 1));
     assert.ok(compact.doc <= 804);
 

@@ -150,6 +150,7 @@ export class NavigationRecovery {
         try {
           await this.runner.adapter.ensureIdentity?.(account);
           if (step.kind === 'post') verified = await this.runner.adapter.verifyPost?.(account, action, { topicName: topic?.name }) || verified;
+          if (step.kind === 'original') verified = await this.runner.adapter.verifyOriginal?.(account, action) || verified;
           if (step.kind === 'checkin') verified = await this.runner.adapter.verifyCheckin?.(account, topic) || verified;
           if (step.kind === 'comment' && action?.target_id && action?.url) verified = await this.runner.adapter.verifyComment?.(account, { id: action.target_id, url: action.url.split('?')[0] }, action.content, { delays: [0] }) || verified;
         } catch (error) {

@@ -13,7 +13,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS task_rounds (
 CREATE INDEX IF NOT EXISTS idx_rounds_completed ON task_rounds(completed_at);
 CREATE INDEX IF NOT EXISTS idx_actions_completed_state ON action_logs(state,completed_at);`);
 
-const emptyCounts = () => Object.fromEntries(['checkin', 'post', 'comment', 'repost', 'like', 'comment_like'].map(kind => [kind, { succeeded: 0, failed: 0, uncertain: 0, skipped: 0 }]));
+const emptyCounts = () => Object.fromEntries(['checkin', 'post', 'original', 'comment', 'repost', 'like', 'comment_like'].map(kind => [kind, { succeeded: 0, failed: 0, uncertain: 0, skipped: 0 }]));
 
 export function dailySuccess(date = shanghaiDate(), scope = null) {
   let values = {};
@@ -30,7 +30,7 @@ export function dailySuccess(date = shanghaiDate(), scope = null) {
     values = Object.fromEntries(rows.map(row => [row.kind, Number(row.total)]));
   }
   const checkin = scope === 'engage' ? 0 : Number(db.prepare("SELECT COUNT(*) total FROM (SELECT COALESCE(NULLIF(a.uid,''),c.account_id),c.topic_id FROM checkins c LEFT JOIN accounts a ON a.id=c.account_id WHERE c.local_date=? AND c.status='succeeded' GROUP BY COALESCE(NULLIF(a.uid,''),c.account_id),c.topic_id)").get(date).total);
-  return { date, checkin, post: 0, comment: 0, ...(scope === 'engage' ? { repost: 0, comment_like: 0, like: 0 } : {}), ...values, checkin };
+  return { date, checkin, post: 0, original: 0, comment: 0, ...(scope === 'engage' ? { repost: 0, comment_like: 0, like: 0 } : {}), ...values, checkin };
 }
 
 export function dailyStats(date = shanghaiDate(), scope = null) {
@@ -77,7 +77,7 @@ function summaryFor(job, round, { details = false } = {}) {
     if (details) account.actions.push({ ...action, topic_name: topicName });
     if (['failed', 'uncertain', 'submitted'].includes(action.state) || (action.state === 'skipped' && /禁言|频繁|登录失效|UID.*不符|UID.*一致/.test(action.error || ''))) account.anomalies.push({ kind: action.kind, topicId: action.topic_id, topicName, reason: action.error || (action.state === 'failed' ? '操作失败' : '结果待核对'), at: action.completed_at || action.started_at });
   }
-  for (const restriction of [...(job.cursor.muteLimits || []).map(x => ({ ...x, label: '禁言' })), ...(job.cursor.rateLimits || []).map(x => ({ ...x, label: x.kind === 'post' ? '发帖频繁' : '评论频繁' }))]) {
+  for (const restriction of [...(job.cursor.muteLimits || []).map(x => ({ ...x, label: '禁言' })), ...(job.cursor.rateLimits || []).map(x => ({ ...x, label: x.kind === 'post' ? '发帖频繁' : x.kind === 'original' ? '原创频繁' : '评论频繁' }))]) {
     if (restriction.round !== round) continue;
     for (const account of accounts.values()) if (String(account.uid || `account:${account.id}`) === restriction.identity) {
       account.anomalies.push({ kind: restriction.kind, reason: `${restriction.label}：${restriction.reason}`, at: restriction.at });
@@ -155,7 +155,7 @@ export function refreshRoundSummary(jobId, round, { action = null, nextState = n
       if (account.id !== action.account_id) continue;
       adjust(account.counts?.post);
       if (nextState === 'succeeded') account.anomalies = (account.anomalies || []).filter(item =>
-        !(item.kind === 'post' && item.reason === action.error && item.at === (action.completed_at || action.started_at)));
+        !(['post','original'].includes(item.kind) && item.reason === action.error && item.at === (action.completed_at || action.started_at)));
     }
     summary.abnormalAccounts = (summary.accounts || []).filter(account => account.anomalies?.length).map(({ actions, ...account }) => account);
     db.prepare('UPDATE task_rounds SET summary_json=? WHERE job_id=? AND round_index=?').run(JSON.stringify(summary), jobId, round);

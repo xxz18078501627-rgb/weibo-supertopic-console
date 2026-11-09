@@ -3,7 +3,7 @@ import { roundHtml, duration } from "./report-ui.js";
 const localTime = value => (value ? new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value)) : "");
 
 const esc = (x = "") => String(x ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-const kind = x => ({ checkin: "签到", post: "发帖", comment: "评论", repost: "转发", like: "外赞", comment_like: "内赞" })[x] || "";
+const kind = x => ({ checkin: "签到", post: "发帖", original: "原创", comment: "评论", repost: "转发", like: "外赞", comment_like: "内赞" })[x] || "";
 const stateName = x => ({ succeeded: "成功", failed: "失败", uncertain: "待核对", submitted: "待核对", skipped: "跳过", verification_wait: "待验证", prepared: "准备中", cancelled: "取消" })[x] || x || "";
 const displayState = action => action.display_state || action.state;
 const jobStatus = x => ({ running: "运行中", waiting: "等待中", paused: "已暂停", completed: "已完成", stopped: "已中止", failed: "失败" })[x] || x || "";
@@ -71,14 +71,14 @@ export function createRecordUI({ request, reload, date, filter, scope = () => 'w
   function accountRow(account) {
     const shown = account.tags.slice(0, 2);
     const tags = shown.map(tag => "<span class='result warning'>" + esc(kind(tag.kind)) + " " + esc(tag.type) + "</span>").join(" ") + (account.tags.length > 2 ? "<span class='result'>+" + (account.tags.length - 2) + "</span>" : "");
-    const counts = ["checkin", "post", "comment", ...["repost", "comment_like", "like"].filter(k => Object.values(account.counts[k] || {}).some(Number))].map(k => "<span>" + kind(k) + " " + account.counts[k].succeeded + "/" + account.counts[k].failed + "/" + account.counts[k].uncertain + "</span>").join("");
+    const counts = ["checkin", "post", "original", "comment", ...["repost", "comment_like", "like"].filter(k => Object.values(account.counts[k] || {}).some(Number))].map(k => "<span>" + kind(k) + " " + Number(account.counts[k]?.succeeded || 0) + "/" + Number(account.counts[k]?.failed || 0) + "/" + Number(account.counts[k]?.uncertain || 0) + "</span>").join("");
     return "<article class='record-account-row'><div class='record-account-main'><strong title='UID " + esc(account.uid || "—") + "'>" + esc(account.name) + "</strong>" + tags + "</div><div class='record-account-counts'>" + counts + "</div><button type='button' class='quiet' data-record-account='" + esc(account.identity) + "'>详情</button></article>";
   }
   function uncertainRow(action) {
     const target = action.target_id ? '目标 ' + action.target_id : (action.content ? String(action.content).slice(0, 42) : '');
     const reason = action.error || action.reason || '提交结果未确认';
     const shownState = displayState(action);
-    return "<article class='record-uncertain-row'><div class='record-uncertain-main'><strong>" + esc(action.account_name || '账号') + "</strong><span class='result " + shownState + "'>" + esc(kind(action.kind) + ' · ' + stateName(shownState)) + "</span><small>" + esc(timeOf(action.started_at)) + " · " + esc(reason) + "</small>" + (target ? "<small class='record-uncertain-target'>" + esc(target) + "</small>" : '') + "</div>" + (['post','comment','repost','like','comment_like'].includes(action.kind) ? "<button type='button' class='quiet' data-recheck-action='" + esc(action.id) + "' data-recheck-job='" + esc(action.job_id) + "'>复核</button>" : '') + "</article>";
+    return "<article class='record-uncertain-row'><div class='record-uncertain-main'><strong>" + esc(action.account_name || '账号') + "</strong><span class='result " + shownState + "'>" + esc(kind(action.kind) + ' · ' + stateName(shownState)) + "</span><small>" + esc(timeOf(action.started_at)) + " · " + esc(reason) + "</small>" + (target ? "<small class='record-uncertain-target'>" + esc(target) + "</small>" : '') + "</div>" + (['post','original','comment','repost','like','comment_like'].includes(action.kind) ? "<button type='button' class='quiet' data-recheck-action='" + esc(action.id) + "' data-recheck-job='" + esc(action.job_id) + "'>复核</button>" : '') + "</article>";
   }
   function jobRow(job, counts) {
     const c = counts?.[job.id];
@@ -185,7 +185,7 @@ export function createRecordUI({ request, reload, date, filter, scope = () => 'w
     const stats = latest?.dailyStats || {};
     const counts = stats.counts || {};
     const row = k => "<div><span>" + kind(k) + "</span><strong>" + Number(counts[k]?.succeeded || 0) + "</strong><small>失败 " + Number(counts[k]?.failed || 0) + " · 待核对 " + Number(counts[k]?.uncertain || 0) + " · 跳过 " + Number(counts[k]?.skipped || 0) + "</small></div>";
-    archivedBox.innerHTML = "<p>该日期详细记录已按 10 天保留清理，以下是当天归档的任务计数。</p><div class='log-summary-grid' data-columns='4' style='grid-template-columns:repeat(4,minmax(0,1fr))'>" + ["checkin", "post", "comment"].map(row).join("") + "<div class='log-summary-meta'><span>任务</span><strong>" + Number(stats.jobCount || 0) + "</strong><small>异常账号 " + Number(stats.abnormalAccounts || 0) + " 个</small></div></div>";
+    archivedBox.innerHTML = "<p>该日期详细记录已按 10 天保留清理，以下是当天归档的任务计数。</p><div class='log-summary-grid' data-columns='5'>" + ["checkin", "post", "original", "comment"].map(row).join("") + "<div class='log-summary-meta'><span>任务</span><strong>" + Number(stats.jobCount || 0) + "</strong><small>异常账号 " + Number(stats.abnormalAccounts || 0) + " 个</small></div></div>";
   }
 
   function detailRow(row) {

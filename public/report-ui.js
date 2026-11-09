@@ -1,5 +1,5 @@
 const escapeHtml = (value = '') => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-const kindName = kind => ({ checkin: '签到', post: '发帖', comment: '评论', repost: '转发', like: '外赞', comment_like: '内赞' })[kind] || kind;
+const kindName = kind => ({ checkin: '签到', post: '发帖', original: '原创', comment: '评论', repost: '转发', like: '外赞', comment_like: '内赞' })[kind] || kind;
 const stateName = state => ({ succeeded: '成功', failed: '失败', uncertain: '待核对', skipped: '跳过', submitted: '已提交', prepared: '准备中', verification_wait: '待验证', cancelled: '已取消' })[state] || state;
 const displayState = action => action.display_state || action.state;
 const statusName = status => ({ running: '运行中', waiting: '等待中', paused: '已暂停', completed: '已完成', stopped: '已中止', failed: '失败' })[status] || status;
@@ -13,7 +13,7 @@ export function duration(milliseconds) {
 }
 
 function countTable(counts = {}) {
-  return `<div class="report-table-wrap"><table class="report-counts"><thead><tr><th>操作</th><th>成功</th><th>失败</th><th>待核对</th><th>跳过</th></tr></thead><tbody>${['checkin', 'post', 'comment', ...['repost','comment_like','like'].filter(kind => Object.values(counts[kind] || {}).some(Number))].map(kind => `<tr><th>${kindName(kind)}</th>${['succeeded', 'failed', 'uncertain', 'skipped'].map(state => `<td>${Number(counts[kind]?.[state] || 0)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+  return `<div class="report-table-wrap"><table class="report-counts"><thead><tr><th>操作</th><th>成功</th><th>失败</th><th>待核对</th><th>跳过</th></tr></thead><tbody>${['checkin', 'post', 'original', 'comment', ...['repost','comment_like','like'].filter(kind => Object.values(counts[kind] || {}).some(Number))].map(kind => `<tr><th>${kindName(kind)}</th>${['succeeded', 'failed', 'uncertain', 'skipped'].map(state => `<td>${Number(counts[kind]?.[state] || 0)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function anomalies(accounts = []) {
@@ -113,7 +113,7 @@ export function createReportUI({ request, getState, toast, viewReport, loadDaily
     if (dateButton) dateButton.textContent = historical ? date.slice(5).replace('-', '/') : '今日';
     if (dateInput) { dateInput.value = date; dateInput.max = today; }
     const statsNode = daily.querySelector('#daily-stats');
-    const statsHtml = ['checkin', 'post', 'comment'].map(kind => '<span class="strip-item">' + kindName(kind) + '<b data-daily-kind="' + kind + '">' + Number(stats[kind] || 0) + '</b></span>').join('');
+    const statsHtml = ['checkin', 'post', 'original', 'comment'].map(kind => '<span class="strip-item">' + kindName(kind) + '<b data-daily-kind="' + kind + '">' + Number(stats[kind] || 0) + '</b></span>').join('');
     if (statsNode) statsNode.innerHTML = statsHtml; else daily.innerHTML = statsHtml;
     const pending = state.pendingRoundReports || [];
     if (current && !pending.some(item => reportKey(item) === reportKey(current))) { current = null; dialog.close(); }

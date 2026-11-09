@@ -1,17 +1,18 @@
 const esc = (value = '') => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-const kind = value => ({ checkin: '签到', post: '发帖', comment: '评论', repost: '转发', like: '外赞', comment_like: '内赞' })[value] || value;
+const kind = value => ({ checkin: '签到', post: '发帖', original: '原创', comment: '评论', repost: '转发', like: '外赞', comment_like: '内赞' })[value] || value;
 const labels = { pending: '需要验证', requested: '等待打开', validating: '正在验证', ready: '已验证，待补做', retrying: '正在补做', resolved: '已处理' };
 
 export function createVerificationUI({ getState, request, refresh, toast, panelId = 'verification-panel', anchor = '#run-card', verificationKey = 'verification' }) {
   const panel = document.getElementById(panelId) || document.createElement('article'); panel.id = panelId; panel.className = 'panel verification-panel';
   if (!panel.isConnected) document.querySelector(anchor).after(panel);
   let sending = false;
+  let opening = null;
   panel.addEventListener('click', async event => {
     const button = event.target.closest('button'); if (!button || sending) return;
     const state = getState(), verification = state[verificationKey]; if (!verification) return;
     let action, body = {};
     if (button.dataset.verifyToggle != null) { const id = button.dataset.verifyToggle; if (openRows.has(id)) openRows.delete(id); else openRows.add(id); render(); return; }
-    if (button.dataset.verifyIdentity) { action = 'open'; body.identity = button.dataset.verifyIdentity; if (button.dataset.verifyStep) body.stepKey = button.dataset.verifyStep; }
+    if (button.dataset.verifyIdentity) { action = 'open'; opening = button.dataset.verifyIdentity; body.identity = button.dataset.verifyIdentity; if (button.dataset.verifyStep) body.stepKey = button.dataset.verifyStep; }
     if (button.dataset.verificationEnd != null) action = 'end';
     if (button.dataset.verificationContinue != null) action = 'continue';
     if (button.dataset.verificationRecheck != null) action = 'recheck';
@@ -20,10 +21,10 @@ export function createVerificationUI({ getState, request, refresh, toast, panelI
       action = 'confirm-unpublished'; body = { stepKey: button.dataset.confirmUnpublished, confirmed: true };
     }
     if (!action) return;
-    sending = true; button.disabled = true;
+    sending = true; button.disabled = true; if (opening) render();
     try { await request(`/api/jobs/${verification.jobId}/verification/${action}`, { method: 'POST', body }); await refresh(); }
-    catch (error) { toast(error.message); }
-    finally { sending = false; render(); }
+    catch (error) { toast(error.message || '验证窗口没有成功打开，请重试'); await refresh().catch(() => {}); }
+    finally { sending = false; opening = null; render(); }
   });
 
   let openRows = new Set();
@@ -38,7 +39,7 @@ export function createVerificationUI({ getState, request, refresh, toast, panelI
     const blocked = state.dailyStop?.blocked || closed || offline;
     const pendingCards = verification.cards.some(card => card.visible !== false && (card.status === 'pending' || card.verificationResult !== 'passed'));
     const continueReason = closed ? '任务已结束' : state.dailyStop?.blocked ? '已到每日截止时间' : offline ? '网络断开，等待恢复' : verification.session ? '请先结束当前验证会话' : !verification.canContinue ? '请等待当前浏览器操作结束' : pendingCards ? '先执行已验证账号和未受阻操作，其余账号继续等待验证' : '';
-    const busy = Boolean(verification.session);
+    const busy = Boolean(verification.session || opening);
     const scroller = panel.querySelector('.verify-rows');
     const previousScroll = scroller ? scroller.scrollTop : 0;
     // 分子分母必须用同一个集合：已完成的卡 visible=false 会被隐藏，若分母
@@ -72,7 +73,8 @@ export function createVerificationUI({ getState, request, refresh, toast, panelI
     const totalCards = allCards.length;
     const pendingCheckins = cards.reduce((n, card) => n + card.steps.filter(step => step.kind === 'checkin' && ['deferred', 'review', 'running', 'pending'].includes(step.state)).length, 0);
     const session = verification.session;
-    const sessionText = session ? (session.phase === 'requested' ? '等待打开验证窗口…' : session.phase === 'signing_checkin' || session.phase === 'submitting_checkin' ? '正在当前窗口补做签到…' : session.phase === 'challenge' ? '正在当前窗口手动验证…' : session.phase === 'awaiting_post_receipt' ? '正在等待本次发帖成功提示…' : session.phase === 'awaiting_comment_receipt' ? '正在等待本次评论成功提示…' : session.phase === 'submitting_post' ? '正在当前窗口发帖…' : session.phase === 'submitting_comment' ? '正在当前窗口评论…' : session.phase === 'submitting_repost' ? '正在当前窗口转发…' : session.phase === 'submitting_like' || session.phase === 'submitting_comment_like' ? '正在当前窗口点赞…' : session.phase === 'awaiting_repost_receipt' ? '正在只读核对转发回执…' : session.phase === 'awaiting_like_receipt' || session.phase === 'awaiting_comment_like_receipt' ? '正在只读核对已赞状态…' : '正在打开账号…') : '';
+    const sessionAttemptLimit = session?.kind === 'checkin' ? 2 : 1;
+    const sessionText = opening ? '正在打开验证窗口…' : session ? (session.phase === 'opening' || session.phase === 'requested' ? '正在打开验证窗口…' : session.phase === 'checking_previous_result' ? '正在核对上次操作结果…' : session.phase === 'retryable' ? '当前动作未触发，准备第 ' + Math.min(Number(session.attempt || 0) + 1, sessionAttemptLimit) + '/' + sessionAttemptLimit + ' 次重试…' : String(session.phase || '').startsWith('triggering_') ? '正在触发当前操作，第 ' + Math.min(Number(session.attempt || 1), sessionAttemptLimit) + '/' + sessionAttemptLimit + ' 次…' : session.phase === 'waiting_challenge' || session.phase === 'challenge' ? '正在当前窗口手动验证…' : session.phase === 'action_triggered' ? '当前动作已触发，正在确认结果…' : session.phase === 'signing_checkin' || session.phase === 'submitting_checkin' ? '正在当前窗口补做签到…' : session.phase === 'awaiting_post_receipt' ? '正在等待本次发帖成功提示…' : session.phase === 'awaiting_comment_receipt' ? '正在等待本次评论成功提示…' : session.phase === 'submitting_post' ? '正在当前窗口发帖…' : session.phase === 'submitting_comment' ? '正在当前窗口评论…' : session.phase === 'submitting_repost' ? '正在当前窗口转发…' : session.phase === 'submitting_like' || session.phase === 'submitting_comment_like' ? '正在当前窗口点赞…' : session.phase === 'awaiting_repost_receipt' ? '正在只读核对转发回执…' : session.phase === 'awaiting_like_receipt' || session.phase === 'awaiting_comment_like_receipt' ? '正在只读核对已赞状态…' : session.phase === 'opened' || String(session.phase || '').startsWith('processing_') ? '验证窗口已打开，正在处理当前操作…' : '正在打开账号…') : '';
     let html = '<header class="verify-head"><h2>待验证账号</h2><span class="verify-count" title="已验证 ' + completed + ' / 本轮共 ' + totalCards + ' 个待验证账号">' + completed + '/' + totalCards + '</span>' + (pendingCheckins ? '<span class="verify-hint" title="待补做 ' + pendingCheckins + ' 项">待补做 ' + pendingCheckins + '</span>' : '');
     if (sessionText) html += '<span class="verify-session" role="status">' + sessionText + '</span>';
     html += '<div class="verify-actions">';
@@ -93,9 +95,11 @@ export function createVerificationUI({ getState, request, refresh, toast, panelI
       html += '<span class="why" title="' + esc(card.reason || '') + '">' + esc(hint) + '</span>';
       html += '<button class="text-button" data-verify-toggle="' + esc(card.identity) + '" type="button">' + (open ? '收起' : '详情') + '</button>';
       const handled = card.status === 'resolved' || (card.status === 'ready' && card.verificationResult === 'passed' && !card.currentActionable);
+      const cardOpening = opening === card.identity;
+      const retryLabel = card.source === 'manual_unconfirmed' ? '再次验证' : '验证';
       const canOpen = !engageMode || card.canOpen !== false;
       const openTitle = !canOpen ? 'title="当前操作结束后可打开验证"' : engageMode ? 'title="打开验证时会先安全暂停主线任务"' : '';
-      html += '<button class="quiet" data-verify-identity="' + esc(card.identity) + '" data-verify-step="' + esc(card.currentStepKey || '') + '" type="button" ' + openTitle + (blocked || busy || handled || sending || !canOpen ? ' disabled' : '') + '>' + (handled ? '已验证' : (card.verificationResult === 'passed' || (verificationKey !== 'engageVerification' && card.checkinResult === 'succeeded')) && card.currentKind ? '处理当前' + kind(card.currentKind) : '验证') + '</button>';
+      html += '<button class="quiet" data-verify-identity="' + esc(card.identity) + '" data-verify-step="' + esc(card.currentStepKey || '') + '" type="button" ' + openTitle + (blocked || busy || handled || sending || !canOpen ? ' disabled' : '') + '>' + (cardOpening ? '正在打开…' : handled ? '已验证' : (card.verificationResult === 'passed' || (verificationKey !== 'engageVerification' && card.checkinResult === 'succeeded')) && card.currentKind ? '处理当前' + kind(card.currentKind) : retryLabel) + '</button>';
       if (open) {
         const needsValidation = step => card.verificationResult !== 'passed' && (step.verificationPending ?? card.source !== 'checkin_unconfirmed');
         const validating = reviews.filter(needsValidation).length;

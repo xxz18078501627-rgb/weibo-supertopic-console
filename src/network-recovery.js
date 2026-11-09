@@ -30,7 +30,11 @@ export class NetworkRecovery {
       let timer, release;
       const groupOwnsAccount = this.runner.engageSession?.jobId === job.id
         && this.runner.engageSession.accountId === account?.id;
-      const needsLease = this.runner.leases && !this.runner.currentExecution && !this.runner.workflow.session && !groupOwnsAccount;
+      const commentSession = this.runner.workbenchCommentSession;
+      const workbenchCommentOwnsAccount = commentSession?.jobId === job.id
+        && commentSession.accountId === account?.id;
+      const needsLease = this.runner.leases && !this.runner.currentExecution && !this.runner.workflow.session
+        && !groupOwnsAccount && !workbenchCommentOwnsAccount;
       try {
         if (needsLease && account) release = this.runner.leases.acquire(account, this.runner.scope || job.id);
         const raw = !account || !this.runner.adapter.probeConnectivity ? { state: 'unknown', code: 'PROBE_NOT_READY' } : await Promise.race([
@@ -84,7 +88,8 @@ export class NetworkRecovery {
     return result.stale || !info || (info.state !== 'offline' && (result.state !== 'offline' || (!result.definitive && info.failures < 2)));
   }
   async monitor(job) {
-    if (this.runner.leases && (this.runner.currentExecution || this.runner.workflow.busy())) return;
+    if (this.runner.leases && (this.runner.currentExecution || this.runner.workflow.busy()
+      || this.runner.workbenchCommentSession)) return;
     if (this.runner.navigation?.waiting(job)) return;
     if (!job || !['running','waiting'].includes(job.status) || this.checking || job.cursor.networkRecovery?.state === 'offline') return;
     this.checking = true;
@@ -174,6 +179,7 @@ export class NetworkRecovery {
             if (step.kind === 'like') result = await this.runner.adapter.verifyLike?.(account, action.link || action.url) || result;
             if (step.kind === 'comment_like') result = await this.runner.adapter.verifyCommentLike?.(account, action.link || action.url, action.target_id) || result;
             if (step.kind === 'post') result = await this.runner.adapter.verifyPost?.(account, action, { topicName: topic?.name }) || result;
+            if (step.kind === 'original') result = await this.runner.adapter.verifyOriginal?.(account, action) || result;
             if (step.kind === 'checkin') result = await this.runner.adapter.verifyCheckin?.(account, topic) || result;
             if (step.kind === 'comment' && action.target_id && action.url) result = await this.runner.adapter.verifyComment?.(account, { id: action.target_id, url: action.url.split('?')[0] }, action.content, { delays: [0] }) || result;
             });

@@ -7,6 +7,12 @@ import { createPostReceiptCollector } from './post-receipts.js';
 import { createPostSuccessNoticeObserver, createCommentSuccessNoticeObserver, createRepostSuccessNoticeObserver } from './post-success-notice.js';
 import { markEngagePost, engageControl, visibleLikeState, markEngageComments, readStreamingComments, scrollStreamingComments, waitForStreamingCommentSettle } from './engage-dom.js';
 const challengeMode = new AsyncLocalStorage();
+const challengeModeState = () => {
+  const state = challengeMode.getStore();
+  return typeof state === 'object' && state ? state : { mode: state };
+};
+const isManualChallengeMode = () => challengeModeState().mode === 'manual';
+const challengeWindowOptions = () => ({ windowState: challengeModeState().maximizeWindow ? 'maximized' : 'normal' });
 
 async function submitBeforeDeadline(button, onSubmit, deadlineAt) {
   const deadline = Number(deadlineAt);
@@ -97,6 +103,10 @@ async function firstVisible(locators) {
     }
   }
   return null;
+}
+
+async function editableText(locator) {
+  return await locator.inputValue().catch(async () => await locator.textContent() || '');
 }
 
 async function setVisibleCheckboxState(checkbox, desired, page) {
@@ -194,7 +204,7 @@ async function detectChallenge(page, browserManager) {
   if (challengePage) {
     // Background work records the challenge and yields to the verification
     // queue.  It must never flash a native Chrome window in front of the user.
-    if (challengeMode.getStore() === 'manual') await browserManager?.foreground?.(challengePage);
+    if (isManualChallengeMode()) await browserManager?.foreground?.(challengePage, challengeWindowOptions());
     const error = new VerificationError('微博要求进行安全验证，请在打开的 Chrome 窗口中完成验证');
     error.challengePage = challengePage;
     throw error;
@@ -306,8 +316,11 @@ export function weiboLinkAuthorUid(link) {
 }
 
 export function verificationPageUrl(action, topic) {
+  // A post verification may never reuse a stale topic/composer URL. The
+  // visible manual window starts on Home for every post attempt.
+  if (['post','original'].includes(action?.kind)) return 'https://weibo.com/';
+  if (action?.forceTopic) return topic?.url || 'https://weibo.com/';
   if (action?.url && /^https:\/\/weibo\.com\//.test(action.url)) return action.url;
-  if (action?.kind === 'post') return 'https://weibo.com/';
   return topic?.url || 'https://weibo.com/';
 }
 
@@ -365,11 +378,11 @@ export function visibleCommentMatches(html, { nickname, content }) {
 // page id.  The publish receipt gives us the status to read back, so verify the
 // returned status, author, and complete text instead of depending on that
 // optional metadata field.
-export function postReadbackMatches(post, { receiptId, uid, content, topicName }) {
+export function postReadbackMatches(post, { receiptId, uid, content, topicName, requireTopic = true }) {
   const receipt = String(receiptId || '');
   const postIds = [post?.idstr, post?.id].filter(value => value !== undefined && value !== null).map(String);
   if (!receipt || !postIds.includes(receipt)) return false;
-  return postContentTopicMatches(post, { uid, content, topicName });
+  return postContentTopicMatches(post, { uid, content, topicName, requireTopic });
 }
 
 function postTextForComparison(post, content) {
@@ -396,10 +409,11 @@ function postTextForComparison(post, content) {
   return normalizeWeiboText(raw.replace(urls, restore));
 }
 
-function postContentTopicMatches(post, { uid, content, topicName }) {
+function postContentTopicMatches(post, { uid, content, topicName, requireTopic = true }) {
   if (String(post?.user?.idstr || post?.user?.id || '') !== String(uid || '')) return false;
   const raw = postTextForComparison(post, content);
   const expectedContent = normalizeWeiboText(content);
+  if (!requireTopic) return Boolean(expectedContent && raw === expectedContent);
   const topicTitle = String(topicName || '').replace(/超话$/, '').trim();
   const marker = normalizeWeiboText(`${topicTitle}超话`);
   const bracketMarker = normalizeWeiboText(`${topicTitle}[超话]`);
@@ -511,7 +525,7 @@ async function readPost(page, id, { signal } = {}) {
   return payload?.data || payload || null;
 }
 
-export async function verifyPublishedPost(page, browserManager, values, { attempts = 1, intervalMs = 0, background = false } = {}) {
+export async function verifyPublishedPost(page, browserManager, values, { attempts = 1, intervalMs = 0, background = false, requireTopic = true } = {}) {
   let found = false;
   const context = page.context?.();
   for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -523,7 +537,7 @@ export async function verifyPublishedPost(page, browserManager, values, { attemp
     }).catch(() => null) : await readPost(page, values.receiptId);
     if (post) {
       found = true;
-      if (postReadbackMatches(post, values)) return { state: 'succeeded', post };
+      if (postReadbackMatches(post, { ...values, requireTopic })) return { state: 'succeeded', post };
     }
     if (attempt + 1 < attempts) await page.waitForTimeout(intervalMs);
   }
@@ -917,10 +931,13 @@ export class WeiboAdapter {
       if (tempPage && !tempPage.isClosed?.()) await tempPage.close?.().catch(() => {});
     }
   }
-  withChallengeMode(mode, callback) { return challengeMode.run(mode, callback); }
-  taskOwner() { return challengeMode.getStore() === 'manual' ? 'manual' : 'runner'; }
+  withChallengeMode(mode, callback, { maximizeWindow = false } = {}) {
+    const state = maximizeWindow ? { mode, maximizeWindow: true } : mode;
+    return challengeMode.run(state, callback);
+  }
+  taskOwner() { return isManualChallengeMode() ? 'manual' : 'runner'; }
   async dismissBackgroundChallenge(challengePage) {
-    if (challengeMode.getStore() === 'manual' || !challengePage || challengePage.isClosed?.()) return false;
+    if (isManualChallengeMode() || !challengePage || challengePage.isClosed?.()) return false;
     const context = this.browserManager?.context;
     if (!context) return false;
     const pages = context.pages().filter(page => page && !page.isClosed?.());
@@ -954,25 +971,31 @@ export class WeiboAdapter {
     if (safeNavigationUrl(page.url()) !== safeNavigationUrl('https://weibo.com/')) {
       await gotoChecked(page, 'https://weibo.com/', { stage: 'post-home' });
     }
-    await detectChallenge(page, this.browserManager);
+    // The manual verification click is the action trigger. Do not spend seconds
+    // pre-scanning an untouched Home page for a challenge before clicking More.
+    if (!isManualChallengeMode()) await detectChallenge(page, this.browserManager);
     return page;
   }
 
-  async openVerification(account, topic, action) {
+  async openVerification(account, topic, action, { maximizeWindow = false } = {}) {
     // The workflow has already finished the background step before calling
     // this.  Opening a manual context is the only path that may be visible.
     // A post always restarts from Home. A stale composer can be left on a
     // topic page after captcha handling; reusing it would visibly navigate the
     // verification window away from Home.
-    const pending = action?.kind === 'post' ? null : this.currentSubmission(action);
+    const pending = ['post','original'].includes(action?.kind) ? null : this.currentSubmission(action);
     const page = await this.browserManager.page(account, 'manual');
     if (pending?.page === page && !page.isClosed?.()) {
-      await this.browserManager.foreground?.(page);
+      await this.browserManager.foreground?.(page, { windowState: maximizeWindow ? 'maximized' : 'normal' });
       return page;
     }
     const url = verificationPageUrl(action, topic);
-    await gotoChecked(page, url, { stage: 'verification-open' });
-    await this.browserManager.foreground?.(page);
+    // Show the visible window and start the challenge action as soon as the
+    // main document commits. The operation-specific code below has its own
+    // control waits; waiting for every homepage resource here added 10–15s to
+    // each manually opened verification.
+    await gotoChecked(page, url, { stage: 'verification-open', waitUntil: 'commit', timeout: 15000 });
+    await this.browserManager.foreground?.(page, { windowState: maximizeWindow ? 'maximized' : 'normal' });
     return page;
   }
 
@@ -995,7 +1018,23 @@ export class WeiboAdapter {
     return result.state === 'succeeded' ? { state: 'succeeded', url: action.receipt_url || receiptUrl(receiptId) } : { state: 'uncertain', reason: result.reason };
   }
 
-  async findUniqueRecentPost(account, { content, topicName, pages = 3, startedAt, submittedAt, completedAt, signal, assertRunning = () => {} } = {}) {
+  async verifyOriginal(account, action) {
+    const raw = action.receipt_id || action.receipt_url || action.url || '';
+    if (!raw) return { state: 'uncertain', reason: '未取得原创微博回执编号，请人工核对后确认是否需要补发' };
+    const path = /^https?:/.test(raw) ? new URL(raw).pathname : '';
+    const match = path.match(/^\/detail\/(\d+)$/) || path.match(/^\/\d+\/([A-Za-z0-9]+)$/);
+    const receiptId = /^\d{10,}$/.test(String(raw)) ? String(raw)
+      : match ? (/^\d+$/.test(match[1]) ? match[1] : weiboShortIdToNumeric(match[1]))
+        : String(action.receipt_id || '');
+    if (!receiptId) return { state: 'uncertain', reason: '原创回执编号不可识别' };
+    const page = await this.browserManager.page(account, this.browserManager.owner === 'manual' ? 'manual' : 'runner');
+    const result = await verifyPublishedPost(page, this.browserManager,
+      { receiptId, uid: account.uid, content: action.content, requireTopic: false });
+    return result.state === 'succeeded' ? { state: 'succeeded', url: action.receipt_url || receiptUrl(receiptId) }
+      : { state: 'uncertain', reason: result.reason };
+  }
+
+  async findUniqueRecentPost(account, { content, topicName, pages = 3, startedAt, submittedAt, completedAt, signal, assertRunning = () => {}, requireTopic = true } = {}) {
     assertRunning();
     await this.ensureIdentity(account);
     const page = await this.browserManager.page(account, this.taskOwner());
@@ -1013,7 +1052,7 @@ export class WeiboAdapter {
       const data = payload?.data || payload || {};
       const posts = data.list || data.statuses || data.data || [];
       for (const post of posts) {
-        if (!withinPostWindow(post, window) || !postContentTopicMatches(post, { uid: account.uid, content, topicName })) continue;
+        if (!withinPostWindow(post, window) || !postContentTopicMatches(post, { uid: account.uid, content, topicName, requireTopic })) continue;
         const id = String(post.idstr || post.id || '');
         if (id) matches.set(id, post);
       }
@@ -1022,6 +1061,11 @@ export class WeiboAdapter {
     const [receiptId, post] = matches.entries().next().value;
     assertRunning();
     return { state: 'succeeded', receiptId, receiptUrl: receiptUrl(receiptId), createdAt: post.created_at, url: post.mblogid ? `https://weibo.com/${account.uid}/${post.mblogid}` : receiptUrl(receiptId) };
+  }
+
+  async findPublishedOriginal(account, { content, startedAt, submittedAt, completedAt, signal, assertRunning = () => {}, maxBatches = 20 } = {}) {
+    return this.findUniqueRecentPost(account, { content, startedAt, submittedAt, completedAt, signal, assertRunning,
+      requireTopic: false, pages: Math.min(20, maxBatches) });
   }
 
   async findPublishedPost(account, { content, topic, startedAt, submittedAt, completedAt, syncToHome = false, signal,
@@ -1287,7 +1331,8 @@ export class WeiboAdapter {
   }
 
   currentSubmission(action) {
-    const handle = action?.kind === 'comment' ? this.manualCommentReceipt : action?.kind === 'repost' ? this.manualRepostReceipt : action?.kind === 'post' ? this.manualPostReceipt : null;
+    const handle = action?.kind === 'comment' ? this.manualCommentReceipt : action?.kind === 'repost' ? this.manualRepostReceipt
+      : ['post','original'].includes(action?.kind) ? this.manualPostReceipt : null;
     return handle && handle.actionId === action?.id && handle.attemptId === action?.attempt_id
       && !handle.page?.isClosed?.() ? handle : null;
   }
@@ -1332,11 +1377,31 @@ export class WeiboAdapter {
     return { state: 'uncertain', url: page.url(), reason: '点击签到后未验收到“已签到”状态' };
   }
 
-  async preparePostComposer(account, topic, text, syncToHome) {
+  async resetPostComposerForRetry(session) {
+    const page = session?.page;
+    if (!page || page.isClosed?.()) return;
+    // A failed setup has not submitted anything, so its composer may be closed
+    // safely. Never dismiss a verification challenge as a stale composer.
+    await detectChallenge(page, this.browserManager);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (!session.dialog || !await session.dialog.isVisible().catch(() => false)) break;
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForTimeout(100);
+    }
+    // No submit has happened at this point. Reload Home to discard every
+    // mounted composer and mask, including overlays that are visually hidden
+    // but still intercept pointer events during the next retry.
+    await gotoChecked(page, 'https://weibo.com/', { stage: 'post-setup-reset', timeout: 15000 });
+    await detectChallenge(page, this.browserManager);
+    session.dialog = null;
+  }
+
+  async preparePostComposer(account, topic, text, syncToHome, session = null) {
     const startedAt = Date.now();
     const mark = stage => this.log('info', `发帖准备阶段：${stage}（${Date.now() - startedAt}ms）`, {
       accountId: account.id, topicId: topic.id });
     const page = await this.openPostHome(account);
+    if (session) session.page = page;
     mark('首页已加载');
     await this.ensureIdentity(account);
     const target = topic.url.match(/\/p\/(100808\w+)/)?.[1];
@@ -1357,6 +1422,7 @@ export class WeiboAdapter {
     const dialog = page.locator('.woo-modal-wrap').filter({ has: page.locator('textarea[placeholder="掐指一算，此贴必火"]') }).first();
     await dialog.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
     if (!await dialog.isVisible().catch(() => false)) throw new UnsupportedPageError('没有识别到超话发博窗口');
+    if (session) session.dialog = dialog;
     mark('发博窗口已打开');
     await dialog.getByText('选择超话', { exact: true }).click();
     const search = dialog.getByPlaceholder('搜索超话');
@@ -1397,20 +1463,92 @@ export class WeiboAdapter {
   async post(account, topic, text, { onSubmit = () => {}, onReceipt = () => {}, syncToHome = false, deadlineAt,
     attemptId = randomUUID(), actionId = null, receiptTimeoutMs = 30000, signal, workbenchVerification = false } = {}) {
     await this.manualPostReceipt?.stop();
+    const setupState = { page: null, dialog: null };
     let prepared = null, lastSetupError = null;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
-        prepared = await this.preparePostComposer(account, topic, text, syncToHome);
+        prepared = await this.preparePostComposer(account, topic, text, syncToHome, setupState);
         this.log('info', `发帖准备完成（第 ${attempt}/3 次）`, { accountId: account.id, topicId: topic.id });
         break;
       } catch (error) {
         if (!(error instanceof UnsupportedPageError) || signal?.aborted) throw error;
         lastSetupError = error;
         this.log('warning', `发帖准备失败（第 ${attempt}/3 次）：${error.message}`, { accountId: account.id, topicId: topic.id });
+        await this.resetPostComposerForRetry(setupState);
         if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 800 * attempt));
       }
     }
     if (!prepared) throw lastSetupError || new UnsupportedPageError('发帖准备失败，未发送');
+    return this.publishPreparedPost(account, prepared, { kind: 'post', topicId: prepared.target,
+      onSubmit, onReceipt, deadlineAt, attemptId, actionId, receiptTimeoutMs, signal, workbenchVerification });
+  }
+
+  async prepareOriginalComposer(account, text, session = null) {
+    const page = await this.openPostHome(account);
+    if (session) session.page = page;
+    await this.ensureIdentity(account);
+    const editor = page.locator('#homeWrap textarea[placeholder="有什么新鲜事想分享给大家？"]');
+    if (await editor.count() !== 1 || !await editor.first().isVisible().catch(() => false)) {
+      const fallback = await firstVisible([
+        page.locator('#homeWrap textarea[placeholder*="新鲜事"]'),
+        page.locator('#homeWrap [contenteditable="true"][role="textbox"]'),
+        page.locator('#homeWrap [contenteditable="true"]')
+      ]);
+      if (!fallback) throw new UnsupportedPageError('主页没有识别到原创输入框');
+      return this.prepareOriginalWithEditor(account, page, fallback, text, session);
+    }
+    return this.prepareOriginalWithEditor(account, page, editor.first(), text, session);
+  }
+
+  async prepareOriginalWithEditor(account, page, editor, text, session = null) {
+    const region = editor.locator('xpath=ancestor::div[.//button[normalize-space()="发送"]][1]');
+    if (await region.count() !== 1) throw new UnsupportedPageError('原创发布区域不唯一，未发送');
+    const publish = region.getByRole('button', { name: '发送', exact: true });
+    if (await publish.count() !== 1) throw new UnsupportedPageError('没有识别到原创发送按钮，未发送');
+    const existing = await editableText(editor);
+    const normalized = normalizeWeiboText(existing);
+    if (normalized && normalized !== normalizeWeiboText(text)) {
+      const error = new UnsupportedPageError('主页已有其他原创草稿，已保留原内容，未发送');
+      error.retryable = false;
+      throw error;
+    }
+    if (!normalized) await editor.fill(text);
+    for (let attempt = 0; attempt < 20 && !await publish.isEnabled().catch(() => false); attempt += 1) {
+      await page.waitForTimeout(50);
+    }
+    if (!await publish.isEnabled().catch(() => false)) throw new UnsupportedPageError('原创发送按钮未启用，未发送');
+    if (session) session.dialog = region;
+    this.log('info', '原创准备完成', { accountId: account.id });
+    return { page, dialog: region, editor, publish, target: null };
+  }
+
+  async originalPost(account, text, { onSubmit = () => {}, onReceipt = () => {}, deadlineAt,
+    attemptId = randomUUID(), actionId = null, receiptTimeoutMs = 30000, signal, workbenchVerification = false } = {}) {
+    await this.manualPostReceipt?.stop();
+    const setupState = { page: null, dialog: null };
+    let prepared = null, lastSetupError = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        prepared = await this.prepareOriginalComposer(account, text, setupState);
+        break;
+      } catch (error) {
+        if (!(error instanceof UnsupportedPageError) || error.retryable === false || signal?.aborted) throw error;
+        lastSetupError = error;
+        this.log('warning', `原创准备失败（第 ${attempt}/3 次）：${error.message}`, { accountId: account.id });
+        if (setupState.dialog) {
+          await setupState.page?.keyboard?.press?.('Escape').catch(() => {});
+          await gotoChecked(setupState.page, 'https://weibo.com/', { stage: 'original-setup-reset', timeout: 15000 });
+        }
+        if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 800 * attempt));
+      }
+    }
+    if (!prepared) throw lastSetupError || new UnsupportedPageError('原创准备失败，未发送');
+    return this.publishPreparedPost(account, prepared, { kind: 'original', topicId: null,
+      onSubmit, onReceipt, deadlineAt, attemptId, actionId, receiptTimeoutMs, signal, workbenchVerification });
+  }
+
+  async publishPreparedPost(account, prepared, { kind = 'post', topicId = null, onSubmit = () => {}, onReceipt = () => {},
+    deadlineAt, attemptId = randomUUID(), actionId = null, receiptTimeoutMs = 30000, signal, workbenchVerification = false } = {}) {
     const { page, editor, publish, target } = prepared;
     let savedSuccess = null, savingSuccess = null;
     const saveSuccess = receipt => {
@@ -1423,11 +1561,12 @@ export class WeiboAdapter {
     };
     const notice = await createPostSuccessNoticeObserver(page, { attemptId, onSuccess: saveSuccess });
     const collector = createPostReceiptCollector({
-      page, attemptId, submittedText: await editor.inputValue(), topicId: target,
-      onReceipt: saveSuccess, classify: classifyPostReceipt, readJson: readJsonBounded, receiptTimeoutMs, signal,
-      log: event => this.log('info', `发帖回执：${JSON.stringify({ actionId, ...event })}`, { accountId: account.id, topicId: topic.id })
+      page, attemptId, submittedText: await editableText(editor), topicId: topicId ?? target,
+      requireTopic: kind !== 'original', onReceipt: saveSuccess, classify: classifyPostReceipt,
+      readJson: readJsonBounded, receiptTimeoutMs, signal,
+      log: event => this.log('info', `${kind === 'original' ? '原创' : '发帖'}回执：${JSON.stringify({ actionId, ...event })}`, { accountId: account.id, topicId: topicId || '' })
     });
-    this.manualPostReceipt = { kind: 'post', actionId, page, attemptId, stop: async () => { collector.stop(); await notice.stop(); },
+    this.manualPostReceipt = { kind, actionId, page, attemptId, stop: async () => { collector.stop(); await notice.stop(); },
       read: async () => { await acceptedResult(); return collector.read(); }, events: collector.events };
     let handedOff = false;
     const acceptedResult = async () => {
@@ -1441,10 +1580,53 @@ export class WeiboAdapter {
         successSource: savedSuccess?.successSource || 'api_receipt' };
     };
     try {
+      const clickStartedAt = Date.now();
       await submitBeforeDeadline(publish, async () => {
         await notice.begin(); await onSubmit(); collector.begin();
-        this.log('info', '发帖已点击提交', { accountId: account.id, topicId: topic.id });
+        this.log('info', `${kind === 'original' ? '原创' : '发帖'}已点击提交`, { accountId: account.id, topicId: topicId || '' });
       }, deadlineAt);
+      // Playwright can report a successful click after the component has been
+      // replaced, leaving the click on a detached handler. In that case there
+      // is no publish request at all. Only this zero-request case is safe to
+      // replay: no request means the first click could not have published.
+      for (let attempt = 0; attempt < 8 && !collector.requestObserved && !collector.accepted; attempt += 1) {
+        await page.waitForTimeout(100);
+      }
+      if (!collector.requestObserved && !collector.accepted) {
+        // A captcha or navigation change after the first click must take over.
+        await detectChallenge(page, this.browserManager);
+        const freshPublish = prepared.dialog.getByRole('button', { name: /^(发送|发布)$/ });
+        if (await freshPublish.count().catch(() => 0) === 1
+          && await freshPublish.first().isVisible().catch(() => false)
+          && await freshPublish.first().isEnabled().catch(() => false)) {
+          await freshPublish.first().scrollIntoViewIfNeeded().catch(() => {});
+          const target = await freshPublish.first().evaluate(button => {
+            const rect = button.getBoundingClientRect();
+            const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2,
+              hit: Boolean(hit && (hit === button || button.contains(hit))) };
+          }).catch(() => null);
+          if (target?.hit) {
+            this.log('info', `${kind === 'original' ? '原创' : '发帖'}首次点击未产生发布请求，重新命中原发送按钮`, {
+              accountId: account.id, topicId: topicId || ''
+            });
+            await page.mouse.click(target.x, target.y);
+          } else {
+            this.log('warning', `${kind === 'original' ? '原创' : '发帖'}首次点击未产生发布请求，发送按钮当前被其他页面元素遮挡`, {
+              accountId: account.id, topicId: topicId || ''
+            });
+          }
+        }
+      }
+      for (let attempt = 0; attempt < 8 && !collector.requestObserved && !collector.accepted; attempt += 1) {
+        await page.waitForTimeout(100);
+      }
+      this.log('info', `${kind === 'original' ? '原创' : '发帖'}提交动作完成（${Date.now() - clickStartedAt}ms，发布请求${collector.requestObserved ? '已' : '未'}出现）`, {
+        accountId: account.id, topicId: topicId || ''
+      });
+      if (!collector.requestObserved && !collector.accepted) {
+        return { state: 'uncertain', url: null, reason: '点击发送后未观察到发布请求，结果未确认且未重复发送' };
+      }
       while (!collector.expired && !signal?.aborted) {
         if (await acceptedResult()) break;
         try { await detectChallenge(page, this.browserManager); }
@@ -1462,13 +1644,13 @@ export class WeiboAdapter {
       const latest = collector.read(), classification = latest?.result;
       const denied = latest?.payload?.success === false || latest?.payload?.ok === false || latest?.payload?.ok === 0 || latest?.payload?.data?.ok === 0;
       if (classification?.kind === 'verification') throw new VerificationError(classification.reason);
-      if (classification?.kind === 'muted') throw new MutedError(classification.reason, 'post', denied);
-      if (classification?.kind === 'frequent') throw new RateLimitError(classification.reason, 'post', denied);
+      if (classification?.kind === 'muted') throw new MutedError(classification.reason, kind, denied);
+      if (classification?.kind === 'frequent') throw new RateLimitError(classification.reason, kind, true);
       if (classification?.kind === 'failed') return { state: 'failed', url: null, reason: classification.reason || '微博明确拒绝发布' };
       const muted = await visibleMutedMessage(page);
-      if (muted) throw new MutedError(muted, 'post', false);
+      if (muted) throw new MutedError(muted, kind, false);
       const frequent = await visibleRateMessage(page);
-      if (frequent) throw new RateLimitError(frequent, 'post', false);
+      if (frequent) throw new RateLimitError(frequent, kind, true);
       return { state: 'uncertain', url: null,
         reason: '已提交，但未收到明确成功或失败提示，请人工核对' };
     } catch (error) {
@@ -1490,9 +1672,25 @@ export class WeiboAdapter {
     }
   }
 
-  async collectCandidates(account, topic, { section = '最新', limit = 50, onBatch = null, assertRunning = () => {} } = {}) {
+  async collectCandidates(account, topic, { section = '最新', limit = 50, onBatch = null, assertRunning = () => {}, refreshTopicPage = false } = {}) {
     assertRunning();
-    const page = await this.pageFor(account, topic);
+    let page;
+    if (refreshTopicPage) {
+      page = await this.browserManager.page(account, this.taskOwner());
+      if (safeNavigationUrl(page.url()) === safeNavigationUrl(topic.url)) {
+        try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }); }
+        catch (error) {
+          if (isNavigationError(error)) throw error;
+          await gotoChecked(page, topic.url, { stage: 'topic-refresh-fallback', timeout: 15000 });
+        }
+        await detectChallenge(page, this.browserManager);
+      } else {
+        await gotoChecked(page, topic.url, { stage: 'topic-page', timeout: 10000 });
+        await detectChallenge(page, this.browserManager);
+      }
+    } else {
+      page = await this.pageFor(account, topic);
+    }
     if (section) {
       const tabs = page.locator('.chaohua-tab-wrap').first();
       if (/^https:\/\/weibo\.com\/p\//.test(page.url())) await tabs.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
@@ -1596,8 +1794,15 @@ export class WeiboAdapter {
       stagnant = collected.size === before ? stagnant + 1 : 0;
       if (collected.size >= limit) break;
       assertRunning();
+      const beforeCandidateCount = await page.evaluate(targetId =>
+        [...document.querySelectorAll(`a[href*="${targetId}"]`)].filter(anchor =>
+          /^\/\d+\/[A-Za-z0-9]+$/.test(new URL(anchor.href, location.href).pathname)).length,
+      target).catch(() => 0);
       await page.mouse.wheel(0, 1400);
-      await page.waitForTimeout(500);
+      await page.waitForFunction(({ targetId, minimum }) =>
+        [...document.querySelectorAll(`a[href*="${targetId}"]`)].filter(anchor =>
+          /^\/\d+\/[A-Za-z0-9]+$/.test(new URL(anchor.href, location.href).pathname)).length > minimum,
+      { targetId: target, minimum: beforeCandidateCount }, { timeout: 500, polling: 50 }).catch(() => {});
     }
     return [...collected.values()].filter(item => !account.uid || item.authorUid !== String(account.uid)).slice(0, limit);
   }
@@ -1732,7 +1937,7 @@ export class WeiboAdapter {
     const outcome = await Promise.race([waitForReceiptOrRateLimit(page, receipt), noticeSignal]);
     if (await acceptedResult()) return acceptedResult();
     if (outcome.restrictionMessage && isMutedMessage(outcome.restrictionMessage)) throw new MutedError(outcome.restrictionMessage, 'comment', Boolean(outcome.response));
-    if (outcome.restrictionMessage && isRateLimitMessage(outcome.restrictionMessage)) throw new RateLimitError(outcome.restrictionMessage, 'comment', Boolean(outcome.response));
+    if (outcome.restrictionMessage && isRateLimitMessage(outcome.restrictionMessage)) throw new RateLimitError(outcome.restrictionMessage, 'comment', true);
     const response = outcome.response;
     const payload = await readJsonBounded(response);
     if (await acceptedResult()) return acceptedResult();
@@ -1752,7 +1957,7 @@ export class WeiboAdapter {
     const mutedMessage = mutedMessageFromReceipt(payload) || await visibleMutedMessage(page);
     if (mutedMessage) throw new MutedError(mutedMessage, 'comment', Boolean(response));
     const rateMessage = rateMessageFromReceipt(payload) || await visibleRateMessage(page);
-    if (isRateLimitMessage(rateMessage)) throw new RateLimitError(rateMessage, 'comment', Boolean(response));
+    if (isRateLimitMessage(rateMessage)) throw new RateLimitError(rateMessage, 'comment', true);
     const created = payload?.data || payload;
     const commentId = created?.idstr || created?.id;
     const rejected = classification.kind === 'failed';
@@ -1798,7 +2003,7 @@ export class WeiboAdapter {
     if (['repost','comment'].includes(kind)) {
       const muted=await visibleMutedMessage(page); if(muted) throw new MutedError(muted,kind);
     }
-    const rate=await visibleRateMessage(page); if(rate) throw new RateLimitError(rate,kind);
+    const rate=await visibleRateMessage(page); if(rate) throw new RateLimitError(rate,kind,true);
   }
 
   async engageComposer(page, link, kind, { coupled = false } = {}) {
@@ -1989,14 +2194,26 @@ export class WeiboAdapter {
     const {blacklistUids=[],blacklistKeywords=[]}=options;
     const page=await this.openWeibo(account,link),id=weiboLinkStatusId(link);
     const post=await this.readEngagePost(page,id);
-    if(!post || typeof post.liked !== 'boolean') throw new UnsupportedPageError('外赞的已赞状态无法确认，未点击');
+    if(!post) throw new UnsupportedPageError('外赞目标微博状态无法确认，未点击');
+    // An already-liked post may no longer expose an actionable like button.
+    // Decide this from the authoritative status response before inspecting UI controls.
+    if(post.liked === true) return {state:'skipped',alreadyDone:true,url:link,reason:'已经点过赞，跳过'};
+    let card = null, button = null;
+    if(typeof post.liked !== 'boolean') {
+      card=await this.engagePostCard(page,id);
+      button=card && await engageControl(page,card.locator('[data-engage-toolbar]').first(),'like');
+      if(!button) throw new UnsupportedPageError('没有唯一识别到目标微博的点赞入口，未点击');
+      // When the status API omits its liked field, a persistent liked marker on
+      // the exact target card decides the state. A visible neutral button is the
+      // normal unliked state and remains actionable.
+      if(button && await visibleLikeState(button)) return {state:'skipped',alreadyDone:true,url:link,reason:'页面显示已经点过赞，跳过'};
+    }
     if ((blacklistUids.length && !post?.user?.idstr && !post?.user?.id) || (blacklistKeywords.length && post?.text_raw == null && post?.text == null)) return {state:'skipped',url:link,reason:'无法完整核对点赞黑名单，未执行点击'};
     if(blacklistUids.map(String).includes(String(post?.user?.idstr || post?.user?.id || '')) || blacklistKeywords.some(word=>normalizeWeiboText(post?.text_raw || post?.text).includes(normalizeWeiboText(word)))) return {state:'skipped',url:link,reason:'命中点赞黑名单'};
-    const card=await this.engagePostCard(page,id);
+    card=card || await this.engagePostCard(page,id);
     if(!card) throw new UnsupportedPageError('无法唯一识别目标微博卡片');
-    const button=await engageControl(page,card.locator('[data-engage-toolbar]').first(),'like');
+    button=button || await engageControl(page,card.locator('[data-engage-toolbar]').first(),'like');
     if(!button) throw new UnsupportedPageError('没有识别到点赞入口');
-    if(post?.liked === true) return {state:'skipped',alreadyDone:true,url:link,reason:'已经点过赞，跳过'};
     return this.engageLikeButton(page,button,'like',link,options);
   }
 

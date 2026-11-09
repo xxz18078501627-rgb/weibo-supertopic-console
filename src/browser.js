@@ -27,7 +27,7 @@ function activateChrome(pid) {
 
 export class BrowserManager {
   constructor(launch = options => chromium.launchPersistentContext(options.profile, options.options), {
-    activate = activateChrome, headless = false, name = 'browser', visibleRunner = false
+    activate = activateChrome, headless = false, name = 'browser', visibleRunner = false, fastStart = false
   } = {}) {
     this.context = null;
     this.accountId = null;
@@ -36,6 +36,7 @@ export class BrowserManager {
     this.activate = activate;
     this.headless = headless;
     this.visibleRunner = visibleRunner;
+    this.fastStart = fastStart;
     this.name = name;
     this.queue = Promise.resolve();
     this.windowActionOnNextPage = null;
@@ -77,11 +78,12 @@ export class BrowserManager {
     if (occupied && occupied !== this) throw new BrowserBusyError('该账号正在被任务或扫码登录使用，请稍后再试');
     await this.closeLocked();
     fs.mkdirSync(account.profile_dir, { recursive: true, mode: 0o700 });
+    const headlessRunner = this.headless && owner === 'runner' && !this.visibleRunner;
     const options = {
       headless: this.headless && owner === 'runner' && !this.visibleRunner,
       executablePath: fs.existsSync(config.chromePath) ? config.chromePath : undefined,
       viewport: null,
-      args: [this.visibleRunner ? '--start-maximized' : this.headless && owner === 'runner' ? '--disable-blink-features=AutomationControlled' : (owner === 'runner' ? '--start-minimized' : '--start-maximized'), '--disable-blink-features=AutomationControlled'].filter((value, index, list) => list.indexOf(value) === index),
+      args: [this.visibleRunner ? '--start-maximized' : headlessRunner ? '--disable-blink-features=AutomationControlled' : (owner === 'runner' ? '--start-minimized' : '--start-maximized'), '--disable-blink-features=AutomationControlled', ...(this.fastStart && headlessRunner ? ['--disable-extensions'] : [])].filter((value, index, list) => list.indexOf(value) === index),
       locale: 'zh-CN',
       timezoneId: config.timezone
     };
@@ -164,18 +166,30 @@ export class BrowserManager {
     await this.setWindowState(page, 'minimized');
   }
 
-  async foreground(page) {
+  async foreground(page, { windowState = 'normal' } = {}) {
     if (this.contextHeadless ?? this.headless) return false;
     // Each operation is best effort: losing the ability to control a native
     // window must never change a task's verification or submission outcome.
-    await this.setWindowState(page, 'normal');
+    await this.setWindowState(page, windowState);
     await page?.bringToFront?.().catch(() => {});
     let session, pid;
+    const readPid = async current => {
+      const result = await current?.send('SystemInfo.getProcessInfo');
+      return Number(result?.processInfo?.find(item => item.type === 'browser')?.id);
+    };
     try {
       session = await page.context().browser()?.newBrowserCDPSession();
-      const result = await session?.send('SystemInfo.getProcessInfo');
-      pid = Number(result?.processInfo?.find(item => item.type === 'browser')?.id);
+      pid = await readPid(session);
     } catch {} finally { await session?.detach?.().catch(() => {}); }
+    // launchPersistentContext does not expose browser() on every Playwright
+    // version. The page CDP session can still report the owning Chrome process.
+    if (!Number.isSafeInteger(pid)) {
+      session = null;
+      try {
+        session = await page.context().newCDPSession(page);
+        pid = await readPid(session);
+      } catch {} finally { await session?.detach?.().catch(() => {}); }
+    }
     if (Number.isSafeInteger(pid)) this.processId = pid;
     this.activated = await this.activate(pid).catch(() => false);
   }
@@ -202,4 +216,4 @@ export class BrowserManager {
 
 // Normal automation is deliberately invisible.  Visible Chromium is reserved
 // for an explicitly opened verification card or the independent login manager.
-export const browserManager = new BrowserManager(undefined, { headless: true, name: 'task' });
+export const browserManager = new BrowserManager(undefined, { headless: true, name: 'task', fastStart: true });

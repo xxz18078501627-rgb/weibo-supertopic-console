@@ -66,7 +66,7 @@ function adapterFor(kind, control) {
     probeConnectivity: async () => true,
     ensureIdentity: async item => ({ uid: item.uid, status: 'valid' }),
     browserManager: { closeRunner: async () => {} },
-    openVerification: async () => { control.opens += 1; return page(); },
+    openVerification: async (_account, _topic, _action, options) => { control.openOptions = options; control.opens += 1; return page(); },
     closeManual: async () => { control.closes += 1; },
     hasTaskChallenge: async () => control.challenge,
     isVerificationResolved: async () => !control.challenge
@@ -90,15 +90,13 @@ for (const kind of ['repost', 'comment', 'comment_like', 'like']) {
     assert.equal(verification.barrier, true);
     assert.equal(verification.cards[0].canOpen, true);
 
-    control.manual = true;
+    control.manual = true; control.challenge = false;
     runner.workflow.requestManual(job.id, target.uid);
-    await until(() => runner.workflow.session?.wake);
-    control.challenge = false;
-    runner.workflow.session.wake();
     await until(() => !runner.workflow.session);
 
     assert.deepEqual(control.actions, [kind]);
     assert.equal(control.opens, 1);
+    assert.equal(control.openOptions?.maximizeWindow, true, '转赞评人工验证窗口应最大化并可见');
     assert.equal(control.closes, 1);
     assert.equal(leases.owners.size, 0);
     assert.equal(db.getJob(job.id).metrics.success, 1);
@@ -107,6 +105,73 @@ for (const kind of ['repost', 'comment', 'comment_like', 'like']) {
     assert.ok(verification.cards[0].verifiedAt);
   });
 }
+
+test('已提交转发收到明确频繁提示时记为跳过而不是待核对', async () => {
+  const { job } = jobFor('repost');
+  let writes = 0;
+  const runner = new TaskRunner({
+    probeConnectivity: async () => true,
+    ensureIdentity: async item => ({ uid: item.uid, status: 'valid' }),
+    browserManager: { closeRunner: async () => {} },
+    repostWeibo: async (_account, _link, _text, options) => {
+      writes += 1;
+      options.onSubmit?.();
+      throw new RateLimitError('操作频繁，请您稍后再试', 'repost', true);
+    }
+  }, { scope: 'engage', leases: new AccountLeases() });
+  await runner.run(job.id);
+  const action = db.listActionLogs(job.id).find(item => item.kind === 'repost');
+  assert.equal(writes, 1);
+  assert.equal(action.state, 'skipped');
+  assert.equal(db.getJob(job.id).metrics.success, 0);
+  assert.equal(db.getJob(job.id).metrics.uncertain, 0);
+  assert.equal(db.getJob(job.id).metrics.skipped, 1);
+});
+
+test('转发验证首次点击直接重发，未成功保持待验证，再次验证成功后才通过', async () => {
+  const { target, job } = jobFor('repost');
+  let manual = false, writes = 0, reads = 0, opens = 0;
+  const runner = new TaskRunner({
+    probeConnectivity: async () => true,
+    ensureIdentity: async item => ({ uid: item.uid, status: 'valid' }),
+    browserManager: { closeRunner: async () => {} },
+    openVerification: async () => { opens += 1; return page(); },
+    closeManual: async () => {},
+    hasTaskChallenge: async () => false,
+    isVerificationResolved: async () => true,
+    repostWeibo: async (_account, _link, _text, options) => {
+      writes += 1;
+      options.onSubmit?.();
+      if (!manual) throw new VerificationError('转发验证');
+      if (writes === 2) return { state: 'failed', url: link, reason: '本次转发未成功' };
+      return { state: 'succeeded', url: link, successSource: 'page_notice' };
+    },
+    verifyRepost: async () => {
+      reads += 1;
+      return { state: 'uncertain', reason: '不应在首次验证前只读复核' };
+    }
+  }, { scope: 'engage', leases: new AccountLeases() });
+  await runner.run(job.id);
+  manual = true;
+  await runner.workflow.requestManual(job.id, target.uid);
+  await until(() => !runner.workflow.session);
+  assert.equal(opens, 1);
+  assert.equal(writes, 2, '首次点验证必须直接重新触发转发');
+  assert.equal(reads, 0, '不得先执行只读复核');
+  let card = runner.workflow.status(db.getJob(job.id)).cards[0];
+  assert.equal(card.verificationResult, 'pending');
+  assert.equal(card.source, 'manual_unconfirmed');
+  assert.equal(card.verifiedAt, null);
+
+  await runner.workflow.requestManual(job.id, target.uid, card.currentStepKey);
+  await until(() => !runner.workflow.session);
+  assert.equal(writes, 3, '再次验证应重新触发一次转发');
+  assert.equal(reads, 0);
+  card = runner.workflow.status(db.getJob(job.id)).cards[0];
+  assert.equal(card.verificationResult, 'passed');
+  assert.ok(card.verifiedAt);
+  assert.equal(db.getJob(job.id).metrics.success, 1);
+});
 
 test('主线任务进行中请求验证会安全暂停，验证结束后等待手动继续', async () => {
   db.addCommentMaterials(['评论文案甲', '评论文案乙']);
@@ -143,7 +208,7 @@ test('主线任务进行中请求验证会安全暂停，验证结束后等待�
   runner.workflow.requestManual(job.id, target.uid);
   assert.equal(db.getJob(job.id).status, 'paused');
   assert.equal(db.getJob(job.id).cursor.verificationAutoPaused, true);
-  assert.equal(db.getJob(job.id).cursor.manualVerification.phase, 'requested');
+  assert.equal(db.getJob(job.id).cursor.manualVerification.phase, 'opening');
   assert.equal(opens, 0);
   manual = true;
   releaseRepost();
@@ -405,8 +470,8 @@ test('内赞验证只新增一条，继续运行后按扫描顺序补足', async
     }
   }, { scope: 'engage', leases });
   await runner.run(job.id);
-  manual = true; runner.workflow.requestManual(job.id, target.uid);
-  await until(() => runner.workflow.session?.wake); challenge = false; runner.workflow.session.wake();
+  manual = true; challenge = false;
+  await runner.workflow.requestManual(job.id, target.uid);
   await until(() => !runner.workflow.session);
   assert.equal(runner.workflow.status(db.getJob(job.id)).canContinue, true);
   runner.workflow.continue(job.id);
@@ -419,9 +484,46 @@ test('内赞验证只新增一条，继续运行后按扫描顺序补足', async
   assert.equal(leases.owners.size, 0);
 });
 
-test('已提交的外赞验证只读核对，不再次点击', async () => {
+test('内赞未触发时每次验证只扫描一次，再次点击才重新扫描', async () => {
+  const { target, job } = jobFor('comment_like');
+  let manual = false, calls = 0, opens = 0;
+  const seenTargets = [];
+  const runner = new TaskRunner({
+    probeConnectivity: async () => true,
+    ensureIdentity: async item => ({ uid: item.uid, status: 'valid' }),
+    browserManager: { closeRunner: async () => {} },
+    openVerification: async () => { opens += 1; return page(); }, closeManual: async () => {},
+    hasTaskChallenge: async () => false,
+    likeNextComment: async (_a, _l, options) => {
+      if (!manual) throw new VerificationError('内赞验证');
+      calls += 1;
+      seenTargets.push(options.target?.id || null);
+      if (calls < 2) return { state: 'skipped', missing: true, reason: '目标评论重绘，未提交点击' };
+      options.onTarget?.({ id: 'c-final', key: 'c-final', authorUid: '9001', text: '最终目标' });
+      options.onSubmit();
+      return { state: 'succeeded', targetId: 'c-final', url: link, successSource: 'page_color' };
+    }
+  }, { scope: 'engage', leases: new AccountLeases() });
+  await runner.run(job.id);
+  manual = true;
+  let card = runner.workflow.status(db.getJob(job.id)).cards[0];
+  await assert.rejects(runner.workflow.requestManual(job.id, target.uid, card.currentStepKey), /已尝试 1\/1 次/);
+  await until(() => !runner.workflow.session);
+  assert.equal(opens, 1);
+  assert.equal(calls, 1);
+  card = runner.workflow.status(db.getJob(job.id)).cards[0];
+  assert.equal(card.verificationResult, 'pending');
+  await runner.workflow.requestManual(job.id, target.uid, card.currentStepKey);
+  await until(() => !runner.workflow.session);
+  assert.equal(opens, 2);
+  assert.equal(calls, 2);
+  assert.deepEqual(seenTargets, [null, null], '每次验证重新扫描，不沿用旧目标');
+  assert.equal(db.getJob(job.id).metrics.success, 1);
+});
+
+test('已提交的外赞验证首次点击重新触发点赞', async () => {
   const { target, job } = jobFor('like');
-  let clicks = 0, reads = 0, challenge = true;
+  let manual = false, clicks = 0, reads = 0, challenge = true;
   const leases = new AccountLeases();
   const runner = new TaskRunner({
     probeConnectivity: async () => true,
@@ -429,19 +531,23 @@ test('已提交的外赞验证只读核对，不再次点击', async () => {
     browserManager: { closeRunner: async () => {} },
     openVerification: async () => page(), closeManual: async () => {},
     hasTaskChallenge: async () => challenge, isVerificationResolved: async () => !challenge,
-    likeWeibo: async (_a, _l, options) => { clicks += 1; options.onSubmit(); throw new VerificationError('外赞验证'); },
-    verifyLike: async () => { reads += 1; return { state: 'succeeded', url: link }; }
+    likeWeibo: async (_a, _l, options) => {
+      clicks += 1; options.onSubmit();
+      if (!manual) throw new VerificationError('外赞验证');
+      return { state: 'succeeded', url: link, successSource: 'page_color' };
+    },
+    verifyLike: async () => { reads += 1; return { state: 'uncertain', url: link }; }
   }, { scope: 'engage', leases });
   await runner.run(job.id);
-  runner.workflow.requestManual(job.id, target.uid);
-  await until(() => runner.workflow.session?.wake); challenge = false; runner.workflow.session.wake();
+  manual = true; challenge = false;
+  await runner.workflow.requestManual(job.id, target.uid);
   await until(() => !runner.workflow.session);
-  assert.equal(clicks, 1); assert.ok(reads >= 1);
+  assert.equal(clicks, 2); assert.equal(reads, 0);
   assert.equal(db.getJob(job.id).metrics.success, 1);
   assert.equal(leases.owners.size, 0);
 });
 
-test('已提交内赞经人工验证确认未赞时只补点原目标一次', async () => {
+test('已提交内赞首次验证即重新扫描，未成功可再次验证', async () => {
   const { target, job } = jobFor('comment_like');
   let manual = false, calls = 0, reads = 0;
   const runner = new TaskRunner({
@@ -456,24 +562,33 @@ test('已提交内赞经人工验证确认未赞时只补点原目标一次', as
         options.onSubmit?.();
         throw new VerificationError('内赞验证');
       }
-      options.onTarget?.({ id: 'c1', key: 'c1', authorUid: '9001', text: '评论一' });
+      const next = { id: 'c' + calls, key: 'c' + calls, authorUid: '9001', text: '重新扫描评论' + calls };
+      options.onTarget?.(next);
       options.onSubmit?.();
-      return { state: 'succeeded', targetId: 'c1', url: link, successSource: 'page_color' };
+      return calls === 2
+        ? { state: 'failed', url: link, reason: '本次内赞未确认成功' }
+        : { state: 'succeeded', targetId: next.id, url: link, successSource: 'page_color' };
     },
     verifyCommentLike: async () => {
       reads += 1;
-      return { state: 'uncertain', found: true, notLiked: true, reason: '原评论明确未赞' };
+      throw new Error('首次验证不得先做只读核对');
     }
   }, { scope: 'engage', leases: new AccountLeases() });
   await runner.run(job.id);
   manual = true;
-  runner.workflow.requestManual(job.id, target.uid);
+  await runner.workflow.requestManual(job.id, target.uid);
   await until(() => !runner.workflow.session);
-  assert.equal(reads, 1);
-  assert.equal(calls, 2, '后台提交一次，人工验证确认未赞后补点一次');
+  assert.equal(reads, 0);
+  assert.equal(calls, 2, '首次验证应直接重新扫描并点赞一次');
+  let card = runner.workflow.status(db.getJob(job.id)).cards[0];
+  assert.equal(card.source, 'manual_unconfirmed');
+  assert.equal(card.verificationResult, 'pending');
+  await runner.workflow.requestManual(job.id, target.uid, card.currentStepKey);
+  await until(() => !runner.workflow.session);
+  assert.equal(calls, 3, '再次验证应重新扫描并点击');
   const action = db.listActionLogs(job.id).find(item => item.kind === 'comment_like');
   assert.equal(action.state, 'succeeded');
-  assert.equal(action.target_id, 'c1');
+  assert.equal(action.target_id, 'c3');
   assert.equal(db.getJob(job.id).metrics.success, 1);
 });
 

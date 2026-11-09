@@ -56,7 +56,9 @@ test('subscribes synchronously, but only a new request after begin belongs to th
   f.context.emit('response', f.response(f.request()));
   await f.collector.drain();
   assert.equal(f.collector.read(), null);
+  assert.equal(f.collector.requestObserved, false);
   const res = f.send();
+  assert.equal(f.collector.requestObserved, true);
   const entry = await f.collector.finish();
   assert.equal(entry.response, res);
   assert.equal(entry.payload, success);

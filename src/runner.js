@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   db, beginPostAttempt, createActionLog, createJob, findIncompleteAction, getAccount, getActionLog, getActiveJob, getCheckin, getJob,
-  getSetting, getStepAction, hasCommented, listAccounts, listCommentedTargetIdsForIdentity, listCommentMaterials, listJobs, listPostMaterials, listTopics, nextSequence,
+  getSetting, getStepAction, hasCommented, listAccounts, listCommentedTargetIdsForIdentity, listCommentMaterials, listJobs, listOriginalMaterials, listPostMaterials, listTopics, nextSequence,
   listActiveAccountRestrictions, recordAccountRestriction, recordCheckin, recordComment, setSetting, updateActionLog, updateJob, log
 } from './db.js';
 import { config as appConfig, defaultTaskConfig } from './config.js';
@@ -35,22 +35,36 @@ function commentScanSummary(stats) {
 export function buildSteps(snapshot) {
   if (snapshot.kind === 'engage') return buildEngageSteps(snapshot);
   const steps = [];
+  const topicIds = snapshot.topicIds || [];
   for (let round = 0; round < snapshot.rounds; round += 1) {
-    for (const topicId of snapshot.topicIds) {
+    if (!topicIds.length) {
+      snapshot.actionPlan.filter(group => group.type === 'original').forEach((group, actionIndex) => {
+        for (const accountId of snapshot.accountIds) {
+          for (let unitIndex = 0; unitIndex < group.count; unitIndex++) steps.push({ round, topicId: '', accountId,
+            kind: 'original', actionIndex, segmentId: group.segmentId || snapshot.segmentIds?.[actionIndex] || null, unitIndex });
+        }
+      });
+      continue;
+    }
+    for (const topicId of topicIds) {
       if (Number(snapshot.schedulerVersion || 0) >= 2) {
         snapshot.actionPlan.forEach((group, actionIndex) => {
+          if (group.type === 'original' && topicId !== topicIds[0]) return;
           for (const accountId of snapshot.accountIds) {
             const count = group.type === 'checkin' ? Math.min(1, group.count) : group.count;
-            for (let unitIndex = 0; unitIndex < count; unitIndex++) steps.push({ round, topicId, accountId, kind: group.type, actionIndex, segmentId: group.segmentId || snapshot.segmentIds?.[actionIndex] || null, unitIndex });
+            for (let unitIndex = 0; unitIndex < count; unitIndex++) steps.push({ round,
+              topicId: group.type === 'original' ? '' : topicId, accountId, kind: group.type, actionIndex,
+              segmentId: group.segmentId || snapshot.segmentIds?.[actionIndex] || null, unitIndex });
           }
         });
         continue;
       }
       for (const accountId of snapshot.accountIds) {
         snapshot.actionPlan.forEach((group, actionIndex) => {
+          if (group.type === 'original' && topicId !== topicIds[0]) return;
           const count = group.type === 'checkin' ? Math.min(1, group.count) : group.count;
           for (let unitIndex = 0; unitIndex < count; unitIndex += 1) {
-            steps.push({ round, topicId, accountId, kind: group.type, actionIndex, unitIndex });
+            steps.push({ round, topicId: group.type === 'original' ? '' : topicId, accountId, kind: group.type, actionIndex, unitIndex });
           }
         });
       }
@@ -62,15 +76,16 @@ export function buildSteps(snapshot) {
 export function validateSnapshot(snapshot) {
   if (snapshot.kind === 'engage') return validateEngageSnapshot(snapshot);
   const errors = [];
+  const needsTopic = (snapshot.actionPlan || []).some(item => ['checkin', 'post', 'comment'].includes(item.type) && item.count > 0);
   if (appConfig.topicMode === 'fixed') {
     const topics = listTopics();
-    if (snapshot.topicIds?.length !== 1 || !snapshot.topicIds.every(id => isFixedTopic(topics.find(t => t.id === id)))) errors.push('当前仅支持苏新皓超话，请重新选择任务参数');
-    if (!COMMENT_SECTIONS.includes(snapshot.commentSection)) errors.push('指定分区无法识别，请从下拉列表重新选择');
+    if (needsTopic && (snapshot.topicIds?.length !== 1 || !snapshot.topicIds.every(id => isFixedTopic(topics.find(t => t.id === id))))) errors.push('当前仅支持苏新皓超话，请重新选择任务参数');
+    if ((snapshot.actionPlan || []).some(item => item.type === 'comment') && !COMMENT_SECTIONS.includes(snapshot.commentSection)) errors.push('指定分区无法识别，请从下拉列表重新选择');
   }
   if (!snapshot.accountIds?.length) errors.push('至少选择一个启用账号');
-  if (!snapshot.topicIds?.length) errors.push('至少选择一个启用超话');
+  if (needsTopic && !snapshot.topicIds?.length) errors.push('至少选择一个启用超话');
   if (!snapshot.actionPlan?.length || !snapshot.actionPlan.some(item => item.count > 0)) errors.push('至少配置一个操作');
-  if (snapshot.actionPlan?.some(item => !['checkin', 'post', 'comment'].includes(item.type) || item.count < 1)) errors.push('操作计划包含无效项目');
+  if (snapshot.actionPlan?.some(item => !['checkin', 'post', 'original', 'comment'].includes(item.type) || item.count < 1)) errors.push('操作计划包含无效项目');
   if (snapshot.actionPlan?.some(item => item.type === 'comment') && new Set((snapshot.materials?.comments || []).map(item => item.text.trim())).size < 2) {
     errors.push('评论任务需要至少两条共享评论文案');
   }
@@ -84,15 +99,21 @@ export function validateSnapshot(snapshot) {
       if (new Set(texts).size < 2) errors.push(`账号 ${accountId} 至少需要两条发帖文案`);
     }
   }
+  if (snapshot.actionPlan?.some(item => item.type === 'original')) {
+    const texts = (snapshot.materials?.originals || []).map(item => String(item.text || '').trim()).filter(Boolean);
+    if (new Set(texts).size < 2) errors.push('原创任务需要至少两条共享原创文案');
+  }
   return errors;
 }
 
 export function createSnapshot(input, accounts, topics) {
   if (input?.kind === 'engage') return createEngageSnapshot(input, accounts);
+  const proposedPlan = Array.isArray(input?.actionPlan) ? input.actionPlan : null;
+  const proposedNeedsTopic = proposedPlan?.some(item => ['checkin', 'post', 'comment'].includes(item.type) && Number(item.count) > 0);
   if (appConfig.topicMode === 'fixed') {
     topics = topics.filter(isFixedTopic).slice(0, 1);
-    if (input?.topicIds && (input.topicIds.length !== 1 || input.topicIds[0] !== topics[0]?.id)) throw Object.assign(new Error('当前仅支持苏新皓超话'), { statusCode: 400 });
-    input = { ...input, topicIds: topics.map(t => t.id) };
+    if (input?.topicIds && proposedNeedsTopic !== false && (input.topicIds.length !== 1 || input.topicIds[0] !== topics[0]?.id)) throw Object.assign(new Error('当前仅支持苏新皓超话'), { statusCode: 400 });
+    input = { ...input, topicIds: proposedNeedsTopic === false ? [] : topics.map(t => t.id) };
   }
   const saved = getSetting('task_defaults', {}) || {};
   const defaults = normalizeTaskSettings({ ...defaultTaskConfig, ...normalizeTaskSettings(saved), ...(input || {}), ...(input?.decoration && !input.commentDecoration ? { commentDecoration: input.decoration } : {}) });
@@ -117,7 +138,8 @@ export function createSnapshot(input, accounts, topics) {
     actionPlan: defaults.actionPlan.map(item => ({ type: item.type, count: Math.max(1, Math.min(100, Number(item.count) || 1)), intervalSeconds: item.intervalSeconds })),
     materials: {
       comments: listCommentMaterials().filter(item => item.enabled && inGroup(item, defaults.commentGroupIds)).map(({ id, text }) => ({ id, text })),
-      posts: listPostMaterials().filter(item => item.enabled && inGroup(item, defaults.postGroupIds)).map(({ id, text }) => ({ id, text }))
+      posts: listPostMaterials().filter(item => item.enabled && inGroup(item, defaults.postGroupIds)).map(({ id, text }) => ({ id, text })),
+      originals: listOriginalMaterials().filter(item => item.enabled && inGroup(item, defaults.originalGroupIds)).map(({ id, text }) => ({ id, text }))
     }
   };
 }
@@ -150,6 +172,7 @@ export class TaskRunner extends EventEmitter {
     this.executionStorage = new AsyncLocalStorage();
     this.currentExecution = null;
     this.engageSession = null;
+    this.workbenchCommentSession = null;
     this.accountRestrictions = [];
     this.accountRestrictionsAt = 0;
     this.workflow = new VerificationWorkflow(this, buildSteps);
@@ -166,7 +189,7 @@ export class TaskRunner extends EventEmitter {
   }
 
   restrictionFor(accountId, kind, identity = '') {
-    return listActiveAccountRestrictions(new Date(this.now()).toISOString()).find(item => (item.accountId === accountId || (identity && item.identity === identity)) && ((item.type === 'mute' && ['post','comment','repost'].includes(kind)) || (item.type === 'frequent' && item.kind === kind))) || null;
+    return listActiveAccountRestrictions(new Date(this.now()).toISOString()).find(item => (item.accountId === accountId || (identity && item.identity === identity)) && ((item.type === 'mute' && ['post','original','comment','repost'].includes(kind)) || (item.type === 'frequent' && item.kind === kind))) || null;
   }
 
   dailyStopStatus() { return dailyStopStatus(this.now()); }
@@ -223,6 +246,9 @@ export class TaskRunner extends EventEmitter {
     }
     if (context) context.submitted = true;
     updateActionLog(actionId, { state: 'submitted', attemptId, submittedAt: new Date(this.now()).toISOString() });
+    this.workflow.noteActionTriggered?.(jobId, stepKeyFor(step), {
+      kind: step.kind, targetId: getActionLog(actionId)?.target_id || null
+    });
     if (manual?.jobId === jobId && manual.stepKey === stepKeyFor(step)) {
       manual.submitted = true;
       manual.attemptId = getActionLog(actionId)?.attempt_id;
@@ -327,17 +353,60 @@ export class TaskRunner extends EventEmitter {
     } finally { session.release?.(); }
   }
 
+  workbenchCommentKey(job, step, manual = false) {
+    if (manual || !job || !step || step.kind !== 'comment' || !this.workbenchVerification(job)) return '';
+    return JSON.stringify([job.id, step.round, step.accountId, step.topicId, step.actionIndex,
+      step.segmentId || '']);
+  }
+
+  workbenchCommentUsesCurrentContext(job, step) {
+    const key = this.workbenchCommentKey(job, step);
+    return Boolean(key && this.workbenchCommentSession?.key === key);
+  }
+
+  async releaseWorkbenchCommentSession(reason = '') {
+    const session = this.workbenchCommentSession;
+    if (!session) return;
+    this.workbenchCommentSession = null;
+    try {
+      await this.adapter.browserManager?.closeRunner?.();
+    } finally {
+      session.release?.();
+      if (reason) log('info', `工作台评论复用会话已释放：${reason}`, {
+        jobId: session.jobId, accountId: session.accountId, topicId: session.topicId,
+        reused: Math.max(0, Number(session.uses || 0) - 1)
+      });
+    }
+  }
+
+  async maybeReleaseWorkbenchCommentSession(jobId, row, outcome) {
+    const session = this.workbenchCommentSession;
+    if (!session || session.jobId !== jobId) return;
+    const job = getJob(jobId), step = stepFromRow(row);
+    const terminalOutcome = ['verification', 'network', 'navigation', 'postponed', 'manual_retry_needed'].includes(outcome);
+    if (!job || terminalOutcome || job.stopRequested || job.status === 'paused') {
+      await this.releaseWorkbenchCommentSession(terminalOutcome ? `本轮状态 ${outcome}` : '任务暂停或停止');
+      return;
+    }
+    const key = this.workbenchCommentKey(job, step);
+    const next = key && this.workflow.rows(jobId, row.round_index).find(item =>
+      ['pending', 'deferred'].includes(item.state)
+      && this.workbenchCommentKey(job, stepFromRow(item)) === key);
+    if (!next) await this.releaseWorkbenchCommentSession('当前连续评论段结束');
+  }
+
   async ensureStepIdentity(job, account, step = null) {
     const session = this.engageSession;
     const manager = this.adapter.browserManager;
     if (this.groupedEngage(job) && session?.accountId === account.id && session.identified
       && (!manager || manager.generation == null || (manager.accountId === account.id && manager.generation === session.generation))) return;
-    if (!this.groupedEngage(job) && step?.kind === 'post' && this.adapter.openPostHome) await this.adapter.openPostHome(account);
+    if (!this.groupedEngage(job) && ['post','original'].includes(step?.kind) && this.adapter.openPostHome) await this.adapter.openPostHome(account);
     await this.adapter.ensureIdentity(account);
     if (this.groupedEngage(job) && this.engageSession === session && session) {
       session.identified = true;
       session.generation = manager?.generation;
     }
+    return null;
   }
 
   async withAccountLease(job, account, callback, { step, manual = false } = {}) {
@@ -355,6 +424,28 @@ export class TaskRunner extends EventEmitter {
       return callback();
     }
     if (!this.leases) return callback();
+    const commentKey = this.workbenchCommentKey(job, step, manual);
+    if (commentKey) {
+      if (this.workbenchCommentSession && this.workbenchCommentSession.key !== commentKey) {
+        await this.releaseWorkbenchCommentSession('账号、超话、轮次或评论段已变化');
+      }
+      if (!this.workbenchCommentSession) {
+        const release = this.leases.acquire(account, this.scope || job.scope || job.id);
+        this.workbenchCommentSession = { key: commentKey, jobId: job.id, accountId: account.id,
+          topicId: step.topicId, release, uses: 0, generation: null };
+        log('info', '工作台评论复用会话已建立', { jobId: job.id, accountId: account.id, topicId: step.topicId });
+      }
+      const session = this.workbenchCommentSession;
+      session.uses = Number(session.uses || 0) + 1;
+      if (session.uses > 1) log('info', '复用工作台评论浏览器上下文', {
+        jobId: job.id, accountId: account.id, topicId: step.topicId, reuseCount: session.uses - 1 });
+      try {
+        return await callback();
+      } finally {
+        session.generation = this.adapter.browserManager?.generation ?? session.generation;
+      }
+    }
+    await this.releaseWorkbenchCommentSession('切换到其他工作台操作');
     const release = this.leases.acquire(account, this.scope || job.scope || job.id);
     try { return await callback(); }
     finally { try { await this.adapter.browserManager?.closeRunner?.(); } finally { release(); } }
@@ -401,6 +492,8 @@ export class TaskRunner extends EventEmitter {
           kind: action.kind, segmentId: row.segment_id, actionIndex: row.action_index, unitIndex: row.unit_index });
         if (row && ['done', 'review', 'network_review'].includes(row.state)) {
           db.prepare("UPDATE task_step_state SET state='done',outcome='succeeded' WHERE job_id=? AND step_key=?").run(action.job_id, action.step_key);
+          this.workflow.markActionVerificationPassed(action.job_id, action.step_key);
+          this.workflow.noteActionSucceeded(action.job_id, action.step_key);
           this.workflow.refreshCard(action.job_id, row.round_index, row.identity);
           this.workflow.updateProgress(action.job_id, { emit: false }); emit = true;
           refreshRoundSummary(action.job_id, row.round_index);
@@ -449,28 +542,29 @@ export class TaskRunner extends EventEmitter {
           result.receiptUrl || result.url || null, result.reason || '', new Date(this.now()).toISOString());
       }
       if (current.state !== state) {
+        const metricKind = current.kind === 'original' ? 'original' : 'post';
         const date = shanghaiDate(new Date(current.started_at));
         const archived = db.prepare('SELECT counts_json FROM daily_stats WHERE date=?').get(date);
         if (archived) {
           const counts = JSON.parse(archived.counts_json);
-          const post = counts.post || (counts.post = {});
-          post[current.state] = Math.max(0, Number(post[current.state] || 0) - 1);
-          post[state] = Number(post[state] || 0) + 1;
+          const item = counts[metricKind] || (counts[metricKind] = {});
+          item[current.state] = Math.max(0, Number(item[current.state] || 0) - 1);
+          item[state] = Number(item[state] || 0) + 1;
           db.prepare('UPDATE daily_stats SET counts_json=? WHERE date=?').run(JSON.stringify(counts), date);
         }
         const scope = current.scope || getJob(current.job_id)?.scope || 'workbench';
         const scoped = db.prepare('SELECT counts_json FROM daily_scope_stats WHERE date=? AND scope=?').get(date, scope);
         if (scoped) {
-          const counts = JSON.parse(scoped.counts_json || '{}'), post = counts.post || (counts.post = {});
-          post[current.state] = Math.max(0, Number(post[current.state] || 0) - 1);
-          post[state] = Number(post[state] || 0) + 1;
+          const counts = JSON.parse(scoped.counts_json || '{}'), item = counts[metricKind] || (counts[metricKind] = {});
+          item[current.state] = Math.max(0, Number(item[current.state] || 0) - 1);
+          item[state] = Number(item[state] || 0) + 1;
           db.prepare('UPDATE daily_scope_stats SET counts_json=? WHERE date=? AND scope=?').run(JSON.stringify(counts), date, scope);
         }
         const completedDate = shanghaiDate(new Date(current.completed_at || current.started_at));
         const successful = db.prepare('SELECT success_json FROM daily_scope_stats WHERE date=? AND scope=?').get(completedDate, scope);
         if (successful && (current.state === 'succeeded' || state === 'succeeded')) {
           const values = JSON.parse(successful.success_json || '{}');
-          values.post = Math.max(0, Number(values.post || 0) + (state === 'succeeded' ? 1 : -1));
+          values[metricKind] = Math.max(0, Number(values[metricKind] || 0) + (state === 'succeeded' ? 1 : -1));
           db.prepare('UPDATE daily_scope_stats SET success_json=? WHERE date=? AND scope=?').run(JSON.stringify(values), completedDate, scope);
         }
       }
@@ -483,12 +577,13 @@ export class TaskRunner extends EventEmitter {
   postClaimIsUnique(action, found) {
     const receiptId = found.receiptId || found.matchedPostId;
     if (!receiptId) return false;
-    if (db.prepare("SELECT 1 FROM action_logs WHERE kind='post' AND id<>? AND receipt_id=? LIMIT 1").get(action.id, receiptId)) return false;
+    if (db.prepare("SELECT 1 FROM action_logs WHERE kind IN ('post','original') AND id<>? AND receipt_id=? LIMIT 1").get(action.id, receiptId)) return false;
     const created = Date.parse(found.createdAt);
     const related = db.prepare(`SELECT l.* FROM action_logs l LEFT JOIN accounts a ON a.id=l.account_id
-      WHERE l.kind='post' AND l.id<>? AND l.topic_id=? AND l.content=?
+      WHERE l.kind=? AND l.id<>? AND l.topic_id IS ? AND l.content=?
       AND (l.account_id=? OR (a.uid<>'' AND a.uid=(SELECT uid FROM accounts WHERE id=?)))
-      AND l.state NOT IN ('prepared','cancelled','verification_wait')`).all(action.id, action.topic_id, action.content, action.account_id, action.account_id);
+      AND l.state NOT IN ('prepared','cancelled','verification_wait')`).all(action.kind, action.id,
+      action.topic_id || null, action.content, action.account_id, action.account_id);
     return !related.some(other => {
       if (/未发送/.test(other.error || '')) return false;
       const start = Date.parse(other.submitted_at || other.started_at) - 30000;
@@ -506,8 +601,8 @@ export class TaskRunner extends EventEmitter {
       (active && !(active.status === 'paused' && active.pausedByUser))) throw conflict('请等待所有发布操作和验证会话结束');
     const count = Math.max(1, Math.min(2000, Number(limit) || 4));
     // Freeze IDs before the first await; later requests cannot expand this batch.
-    const actions = db.prepare(`SELECT * FROM action_logs WHERE job_id=? AND kind='post'
-      AND (state='uncertain' OR (?=1 AND state='failed' AND error='微博回执明确表示发帖未被接受'))
+    const actions = db.prepare(`SELECT * FROM action_logs WHERE job_id=? AND kind IN ('post','original')
+      AND (state='uncertain' OR (?=1 AND state='failed' AND error LIKE '微博回执明确表示%'))
       ORDER BY account_id,started_at,id`).all(jobId, Number(includeReceiptFailures))
       .filter(action => !actionIds || actionIds.includes(action.id)).slice(0, count);
     this.repairing = true;
@@ -516,14 +611,21 @@ export class TaskRunner extends EventEmitter {
       for (const action of actions) {
         const current = this.current();
         if (current && !(current.status === 'paused' && current.pausedByUser)) throw conflict('有任务开始运行，已停止历史核对');
-        const account = getAccount(action.account_id), topic = listTopics().find(item => item.id === action.topic_id);
+        const account = getAccount(action.account_id), topic = action.kind === 'original' ? null : listTopics().find(item => item.id === action.topic_id);
         let result = { state: 'uncertain', reason: '原账号或超话不可用，无法核对' };
-        if (account && topic) {
+        if (account && (topic || action.kind === 'original')) {
           const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 30000);
           try {
-            result = await this.adapter.findPublishedPost(account, { content: action.content, topic, startedAt: action.started_at,
-              submittedAt: action.submitted_at, completedAt: action.completed_at, syncToHome: job.config.syncToHome === true,
-              maxBatches: 20, signal: controller.signal, assertRunning: () => {
+            result = action.kind === 'original'
+              ? await this.adapter.findPublishedOriginal(account, { content: action.content, startedAt: action.started_at,
+                submittedAt: action.submitted_at, completedAt: action.completed_at, maxBatches: 20, signal: controller.signal,
+                assertRunning: () => {
+                  const running = this.current();
+                  if (controller.signal.aborted || (running && !(running.status === 'paused' && running.pausedByUser))) throw conflict('只读核对已超时或被中断');
+                } })
+              : await this.adapter.findPublishedPost(account, { content: action.content, topic, startedAt: action.started_at,
+                submittedAt: action.submitted_at, completedAt: action.completed_at, syncToHome: job.config.syncToHome === true,
+                maxBatches: 20, signal: controller.signal, assertRunning: () => {
                 const running = this.current();
                 if (controller.signal.aborted || (running && !(running.status === 'paused' && running.pausedByUser))) throw conflict('只读核对已超时或被中断');
               } });
@@ -572,13 +674,16 @@ export class TaskRunner extends EventEmitter {
       if (result.state === 'succeeded' && this.workflow.enabled(job)) this.workflow.updateProgress(jobId);
       return result;
     }
-    if (action.kind !== 'post') throw Object.assign(new Error('当前操作类型不支持复核'), { statusCode: 400 });
-    const account = getAccount(action.account_id), topic = listTopics().find(item => item.id === action.topic_id);
-    if (!account || !topic) throw Object.assign(new Error('原账号或超话不可用，无法复核'), { statusCode: 400 });
+    if (!['post','original'].includes(action.kind)) throw Object.assign(new Error('当前操作类型不支持复核'), { statusCode: 400 });
+    const account = getAccount(action.account_id), topic = action.kind === 'original' ? null : listTopics().find(item => item.id === action.topic_id);
+    if (!account || (action.kind === 'post' && !topic)) throw Object.assign(new Error('原账号或超话不可用，无法复核'), { statusCode: 400 });
     this.repairing = true;
     try {
-      const found = await this.adapter.findPublishedPost(account, { content: action.content, topic, startedAt: action.started_at,
-        submittedAt: action.submitted_at, completedAt: action.completed_at, syncToHome: job.config.syncToHome === true });
+      const found = action.kind === 'original'
+        ? await this.adapter.findPublishedOriginal(account, { content: action.content, startedAt: action.started_at,
+          submittedAt: action.submitted_at, completedAt: action.completed_at })
+        : await this.adapter.findPublishedPost(account, { content: action.content, topic, startedAt: action.started_at,
+          submittedAt: action.submitted_at, completedAt: action.completed_at, syncToHome: job.config.syncToHome === true });
       if (found.state !== 'succeeded') return { state: 'uncertain', reason: found.reason || '仍未找到唯一匹配内容' };
       if (!this.postClaimIsUnique(action, found)) return { state: 'uncertain', reason: '帖子可能属于另一条操作，不能唯一归属' };
       const result = this.repairPostResult(action, found);
@@ -603,7 +708,7 @@ export class TaskRunner extends EventEmitter {
       ? `SELECT * FROM action_logs WHERE job_id=? AND kind IN ('comment','repost')
         AND state='uncertain' AND submitted_at IS NOT NULL AND error LIKE '%频繁%'
         ORDER BY started_at,id`
-      : `SELECT * FROM action_logs WHERE job_id=? AND kind='post'
+      : `SELECT * FROM action_logs WHERE job_id=? AND kind IN ('post','original')
         AND state='uncertain' AND submitted_at IS NOT NULL ORDER BY started_at,id`;
     return db.prepare(query).all(job.id).filter(action => Number(ledger[action.id]?.attempts || 0) < 2);
   }
@@ -716,17 +821,20 @@ export class TaskRunner extends EventEmitter {
     })().finally(async () => {
       try { await this.releaseEngageSession(); }
       finally {
-        this.promise = null; this.runningJobId = null;
-        // Pause and edit availability are derived from both the persisted job
-        // and live runner state. Publish one final snapshot after the current
-        // browser operation has actually released its safe point.
-        const settled = getJob(jobId);
-        if (settled && (this.scope === 'engage' || settled.config?.kind === 'engage')) {
-          this.emitUpdate(settled);
-          if (['completed', 'stopped'].includes(settled.status)) this.scheduleAutoReadbacks(jobId);
-        } else if (settled && ['completed', 'stopped'].includes(settled.status)) {
-          this.emitUpdate(settled);
-          this.scheduleAutoReadbacks(jobId);
+        try { await this.releaseWorkbenchCommentSession('任务运行结束'); }
+        finally {
+          this.promise = null; this.runningJobId = null;
+          // Pause and edit availability are derived from both the persisted job
+          // and live runner state. Publish one final snapshot after the current
+          // browser operation has actually released its safe point.
+          const settled = getJob(jobId);
+          if (settled && (this.scope === 'engage' || settled.config?.kind === 'engage')) {
+            this.emitUpdate(settled);
+            if (['completed', 'stopped'].includes(settled.status)) this.scheduleAutoReadbacks(jobId);
+          } else if (settled && ['completed', 'stopped'].includes(settled.status)) {
+            this.emitUpdate(settled);
+            this.scheduleAutoReadbacks(jobId);
+          }
         }
       }
     });
@@ -961,15 +1069,16 @@ export class TaskRunner extends EventEmitter {
       }
       const account = getAccount(step.accountId);
       const isEngage = job.config.kind === 'engage';
-      const topic = isEngage ? { id: null, url: linkForStep(job, step), name: '指定微博' } : listTopics().find(item => item.id === step.topicId);
+      const topic = isEngage ? { id: null, url: linkForStep(job, step), name: '指定微博' }
+        : step.kind === 'original' ? null : listTopics().find(item => item.id === step.topicId);
       const link = isEngage ? String(step.topicId || '') : null;
-      if (!account || (!isEngage && !topic)) {
+      if (!account || (!isEngage && step.kind !== 'original' && !topic)) {
         await this.finishStep(job, step, 'failed', isEngage ? '账号或链接已不存在' : '账号或超话已不存在');
         continue;
       }
       const identity = String(account.uid || `account:${account.id}`);
       const muted = (job.cursor?.muteLimits || []).find(item => item.round === step.round && item.identity === identity);
-      if (muted && ['post', 'comment', 'repost'].includes(step.kind)) {
+      if (muted && ['post', 'original', 'comment', 'repost'].includes(step.kind)) {
         await this.finishStep(job, step, 'skipped', `本轮账号已禁言，跳过${kindLabel(step.kind)}；${muted.reason}`);
         continue;
       }
@@ -1026,7 +1135,7 @@ export class TaskRunner extends EventEmitter {
             await this.interruptibleWait(jobId, 1000, `本轮${label}频繁，继续执行${kindLabel(step.kind)}`);
             continue;
           }
-          await this.advance(jobId, step, submitted ? 'uncertain' : state, `本轮${label}频繁，跳过后续${label}`);
+          await this.advance(jobId, step, error.rejected ? 'skipped' : submitted ? 'uncertain' : state, `本轮${label}频繁，跳过后续${label}`);
           continue;
         }
         if (error instanceof MutedError) {
@@ -1086,7 +1195,7 @@ export class TaskRunner extends EventEmitter {
         const isRoundBoundary = nextStep && nextStep.round !== step.round;
         const seconds = !nextStep || isRoundBoundary ? 0 : skipped ? 0 : this.intervalFor(job.config, step);
         const submitted = this.lastSubmitted;
-        const elapsed = step.kind === 'post' && submitted?.jobId === jobId && submitted.stepKey === stepKeyFor(step) ? Math.max(0, this.now() - submitted.at) : 0;
+        const elapsed = ['post','original'].includes(step.kind) && submitted?.jobId === jobId && submitted.stepKey === stepKeyFor(step) ? Math.max(0, this.now() - submitted.at) : 0;
         if (seconds * 1000 > elapsed && !(await this.interruptibleWait(jobId, seconds * 1000 - elapsed, isRoundBoundary ? '等待下一轮' : '等待下一项操作'))) return;
       }
     }
@@ -1113,6 +1222,31 @@ export class TaskRunner extends EventEmitter {
     }
     const manual = this.workbenchVerification(job) && this.workflow.session?.jobId === job.id
       && this.workflow.session.stepKey === stepKeyFor(step);
+    if (step.kind === 'original') {
+      const existing = getStepAction(job.id, stepKeyFor(step));
+      if (existing?.sequence_number != null) this.restoreSequence(job.id, step, 'original', existing.sequence_number, Boolean(existing.sequence_confirmed));
+      const materials = Array.isArray(job.config.materials?.originals) ? job.config.materials.originals : [];
+      const material = pickRandom(materials);
+      if (!material) throw new UnsupportedPageError(`账号“${account.name}”没有可用原创文案`);
+      const content = (manual && existing?.submitted_at && existing.content)
+        || this.actionContent(job, step, 'original', job.config.postDecoration, () => material.text);
+      return this.loggedAction(job, step, account, null, null, content, async actionId => {
+        const attemptId = getActionLog(actionId).attempt_id;
+        const result = await this.adapter.originalPost(account, content, {
+          attemptId, actionId, workbenchVerification: this.workbenchVerification(job),
+          deadlineAt: this.taskDeadline(getJob(job.id)),
+          onReceipt: receipt => this.settlePostAction(actionId, { ...receipt, state: 'succeeded', attemptId }),
+          onSubmit: () => this.markSubmitted(job.id, step, actionId, attemptId)
+        });
+        const accepted = this.acceptedPost(actionId);
+        if (accepted) return accepted;
+        this.assertExecutionAlive();
+        if (result.state === 'uncertain' && !await this.network.probe(getJob(job.id))) throw new NetworkOfflineError('原创提交后网络不可用，等待只读核验');
+        this.settlePostAction(actionId, { state: result.state, url: result.url, receiptId: result.receiptId,
+          receiptUrl: result.receiptUrl, successSource: result.successSource, error: result.reason, attemptId });
+        return this.acceptedPost(actionId) || result;
+      });
+    }
     if (step.kind === 'post') {
       const existing = getStepAction(job.id, stepKeyFor(step));
       if (existing?.sequence_number != null) this.restoreSequence(job.id, step, 'post', existing.sequence_number, Boolean(existing.sequence_confirmed));
@@ -1137,21 +1271,10 @@ export class TaskRunner extends EventEmitter {
     }
     if (manual) {
       const original = getStepAction(job.id, stepKeyFor(step));
-      if (original?.target_id && original.url && original.content) {
-        const candidate = { id: original.target_id, url: original.url.split('?')[0] };
-        if (original.sequence_number != null) this.restoreSequence(job.id, step, 'comment', original.sequence_number, Boolean(original.sequence_confirmed));
-        const content = original.submitted_at ? original.content : this.actionContent(job, step, 'comment',
-          job.config.commentDecoration || job.config.decoration, () => original.content);
-        return this.loggedAction(job, step, account, topic, candidate.id, content, async actionId => {
-          const options = this.commentSubmitOptions(job, step, actionId);
-          const result = await this.adapter.comment(account, candidate, content, options);
-          this.assertExecutionAlive();
-          const state = result.retryElsewhere ? 'failed' : result.state;
-          this.settlePostAction(actionId, { state, url: result.url, error: result.reason, attemptId: options.attemptId });
-          return { ...result, state, retryElsewhere: false };
-        });
-      }
-      if (original?.submitted_at) return { state: 'uncertain', reason: '原评论缺少目标或文案，不能在验证窗口更换目标' };
+      // A submitted comment is immutable and may only be read back. An
+      // unsubmitted workbench comment returns to its topic and re-runs the
+      // normal scan/selection flow instead of reusing a stale target URL.
+      if (original?.submitted_at) return { state: 'uncertain', reason: '原评论已经提交，验证窗口只读核对，不更换目标或重复发送' };
     }
     return this.executeComment(job, step, account, topic);
   }
@@ -1351,7 +1474,9 @@ export class TaskRunner extends EventEmitter {
     if (existing?.sequence_number != null) this.restoreSequence(job.id, step, 'comment', existing.sequence_number, Boolean(existing.sequence_confirmed));
     const zeroRefreshes = Number(job.cursor?.zeroOnlyRefreshes?.[stepKeyFor(step)] || 0);
     const zeroFallback = job.config.commentStrategy === 'zero-only' && zeroRefreshes >= 3;
-    const options = { section: job.config.commentSection || '最新', limit: job.config.scanLimit, assertRunning: () => this.assertMaySubmit(job.id) };
+    const options = { section: job.config.commentSection || '最新', limit: job.config.scanLimit,
+      assertRunning: () => this.assertMaySubmit(job.id),
+      refreshTopicPage: this.workbenchCommentUsesCurrentContext(job, step) };
     let candidates;
     try {
       candidates = await this.readWithRetry(() => this.adapter.collectCandidates(account, topic, options), job.config.readRetryCount);
@@ -1492,6 +1617,7 @@ export class TaskRunner extends EventEmitter {
     const rows = await this.readWithRetry(() => this.adapter.collectCandidates(account, topic, {
       section: job.config.commentSection || '最新', limit: job.config.scanLimit,
       assertRunning: () => this.assertMaySubmit(job.id),
+      refreshTopicPage: this.workbenchCommentUsesCurrentContext(job, step),
       onBatch: async batch => {
         streamed = true;
         for (const item of batch) {
@@ -1594,6 +1720,7 @@ export class TaskRunner extends EventEmitter {
       const rows = await this.readWithRetry(() => this.adapter.collectCandidates(account, topic, {
         section: job.config.commentSection, limit: job.config.scanLimit,
         assertRunning: () => this.assertMaySubmit(job.id),
+        refreshTopicPage: this.workbenchCommentUsesCurrentContext(job, step),
         onBatch: async batch => { this.assertMaySubmit(job.id); streamed = true; return eligible(batch); }
       }), job.config.readRetryCount);
       if (!streamed) await eligible(rows);
@@ -1720,7 +1847,7 @@ export class TaskRunner extends EventEmitter {
   releaseSequence(jobId, step) {
     const job = getJob(jobId); if (!job) return;
     const stepKey = stepKeyFor(step);
-    if (['post','comment','repost','like','comment_like'].includes(step.kind) && getStepAction(jobId, stepKey)?.state === 'succeeded') return;
+    if (['post','original','comment','repost','like','comment_like'].includes(step.kind) && getStepAction(jobId, stepKey)?.state === 'succeeded') return;
     const reservation = job.cursor?.sequenceReservations?.[stepKey];
     if (!reservation) return;
     const reservations = { ...(job.cursor?.sequenceReservations || {}) };
@@ -1746,7 +1873,7 @@ export class TaskRunner extends EventEmitter {
     const reservation = getJob(job.id)?.cursor?.sequenceReservations?.[stepKey];
     const actionId = existing?.id || createActionLog({ jobId: job.id, stepKey, kind: step.kind, accountId: account.id, topicId: topic?.id, link: job.config.kind === 'engage' ? linkForStep(job, step) : null, targetId, content, state: 'prepared', sequenceNumber: reservation?.number, sequenceConfirmed: reservation?.confirmed });
     if (job.config.kind === 'engage') updateActionLog(actionId, { url: linkForStep(job, step) });
-    if (['post','comment','repost','like','comment_like'].includes(step.kind)) beginPostAttempt(actionId, id('attempt_'));
+    if (['post','original','comment','repost','like','comment_like'].includes(step.kind)) beginPostAttempt(actionId, id('attempt_'));
     if (existing && this.workflow.enabled(job)) updateActionLog(actionId, { content, sequenceNumber: reservation?.number ?? existing.sequence_number, sequenceConfirmed: reservation?.confirmed ?? Boolean(existing.sequence_confirmed) });
     try {
       const result = await callback(actionId);
@@ -1756,11 +1883,11 @@ export class TaskRunner extends EventEmitter {
       return result;
     } catch (error) {
       const accepted = getActionLog(actionId);
-      if (['post','comment','repost','like','comment_like'].includes(step.kind) && accepted?.state === 'succeeded') {
+      if (['post','original','comment','repost','like','comment_like'].includes(step.kind) && accepted?.state === 'succeeded') {
         this.confirmSequence(job.id, step);
         return { state: 'succeeded', url: accepted.receipt_url || accepted.url, receiptId: accepted.receipt_id, receiptUrl: accepted.receipt_url };
       }
-      if (['post','comment','repost','like','comment_like'].includes(step.kind) && error.code === 'receipt_persistence_failed') {
+      if (['post','original','comment','repost','like','comment_like'].includes(step.kind) && error.code === 'receipt_persistence_failed') {
         updateActionLog(actionId, { state: 'uncertain', error: error.message, verificationPending: false });
         this.confirmSequence(job.id, step);
         this.emitUpdate(updateJob(job.id, { status: 'paused', pausedByUser: true, waitReason: error.message }));
@@ -1919,4 +2046,9 @@ function linkForStep(job, step) { return step.link || job.config.linkIdentities?
 
 function stepKeyFor(step) {
   return `${step.round}:${step.topicId}:${step.accountId}:${step.segmentId || step.actionIndex}:${step.unitIndex}`;
+}
+
+function stepFromRow(row) {
+  return { round: row.round_index, topicId: row.topic_id, accountId: row.account_id, kind: row.kind,
+    actionIndex: row.action_index, segmentId: row.segment_id || null, unitIndex: row.unit_index };
 }

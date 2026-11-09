@@ -176,10 +176,13 @@ button:disabled{cursor:not-allowed;opacity:.55}
 #page-logs .log-summary header{margin-bottom:6px}
 #page-logs .log-summary header h2{font-size:15px}
 #page-logs .log-summary-grid{gap:8px}
+#page-logs .log-summary-grid{grid-template-columns:repeat(5,minmax(0,1fr));grid-auto-flow:column;grid-auto-columns:minmax(0,1fr)}
 #page-logs .log-summary-grid[data-columns="5"]{gap:5px}
 #page-logs .log-summary-kind,#page-logs .log-summary-meta{padding:7px 11px}
 #page-logs .log-summary-grid[data-columns="5"] .log-summary-kind,
-#page-logs .log-summary-grid[data-columns="5"] .log-summary-meta{padding:6px 8px}
+#page-logs .log-summary-grid[data-columns="5"] .log-summary-meta{padding:6px 6px}
+#page-logs .log-summary-grid[data-columns="5"] .log-summary-kind>span,
+#page-logs .log-summary-grid[data-columns="5"] .log-summary-meta>span{flex:0 0 auto;white-space:nowrap}
 #page-logs .log-summary-grid[data-columns="5"] small{white-space:nowrap;overflow:hidden;text-overflow:clip}
 #page-logs .log-summary-kind strong,#page-logs .log-summary-meta strong{font-size:21px;line-height:1.15}
 #page-logs .log-summary-kind small{font-size:10px;margin-top:1px}
@@ -237,9 +240,8 @@ body:has(#page-logs.active) main{padding-bottom:10px}
 #page-logs{padding-bottom:0}
 .record-account-main strong{max-width:12em}
 .record-account-main .small{display:none}
-#page-logs .log-summary-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
-@media(max-width:900px){#page-logs .log-summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}#page-logs .log-summary-kind small,#page-logs .log-summary-meta small{white-space:normal;overflow:visible}}
-@media(max-width:900px){#page-logs .log-summary-kind,#page-logs .log-summary-meta{flex-wrap:wrap}#page-logs .log-summary-kind span,#page-logs .log-summary-meta span{flex:0 0 auto;white-space:nowrap}#page-logs .log-summary-kind small,#page-logs .log-summary-meta small{flex:1 0 100%;white-space:normal}}
+@media(max-width:900px){#page-logs .log-summary-grid{grid-template-columns:repeat(2,minmax(0,1fr));grid-auto-flow:row;grid-auto-columns:auto}#page-logs .log-summary-kind small,#page-logs .log-summary-meta small{white-space:normal;overflow:visible}}
+@media(max-width:900px){#page-logs .log-summary-kind,#page-logs .log-summary-meta{flex-wrap:wrap}#page-logs .log-summary-kind span,#page-logs .log-summary-meta span{flex:0 0 auto;white-space:nowrap}#page-logs .log-summary-kind small,#page-logs .log-summary-meta small{flex:1 1 100%;max-width:100%;white-space:normal;overflow-wrap:anywhere}}
 .record-detail-dialog{display:flex;flex-direction:column;max-height:72vh;overflow:hidden}
 .record-detail-body{flex:1;min-height:0;overflow:auto}
 .record-detail-dialog .panel-pager{position:static;background:var(--surface);padding:8px 0 0}
@@ -652,6 +654,7 @@ input[type=checkbox]{flex:none;aspect-ratio:1;min-width:16px;min-height:16px}
 .account-row .row-tags .result,.account-row .row-tags .status-pill{font-size:10px;padding:1px 6px;white-space:nowrap}
 .account-row .row-actions{display:flex;gap:2px;justify-content:flex-end}
 .account-row .row-actions button{min-height:28px;padding:0 7px;font-size:11px;border-radius:7px;background:transparent;border-color:transparent}
+.account-row .row-actions .row-action-reserve{visibility:hidden;pointer-events:none}
 .account-row .row-actions button.quiet,.account-row .row-actions button.danger{background:transparent!important;border-color:transparent!important;color:#8d6d7c!important;box-shadow:none!important}
 .account-row .row-actions button.danger{color:#b34a58!important}
 .account-row .row-actions button:hover{background:#fff0f6;border-color:#f0c9d9}

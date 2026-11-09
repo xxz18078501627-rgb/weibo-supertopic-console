@@ -10,7 +10,7 @@ process.env.WEIBO_CONSOLE_LICENSE = 'off';
 process.env.WEIBO_CONSOLE_TOPIC_MODE = 'general';
 process.env.WEIBO_CONSOLE_NOTIFY = 'off';
 const database = await import('../src/db.js');
-const { db, clearAllDataForTests, createAccount, updateAccountAuth, createTopic, addPostMaterials, addCommentMaterials, getJob, getStepAction, listAccounts, listTopics, createJob, listActionLogs, setSetting, updateJob } = database;
+const { db, clearAllDataForTests, createAccount, updateAccountAuth, createTopic, addPostMaterials, addOriginalMaterials, addCommentMaterials, getJob, getStepAction, listAccounts, listTopics, createJob, listActionLogs, setSetting, updateJob } = database;
 const { TaskRunner, buildSteps, createSnapshot } = await import('../src/runner.js');
 const { VerificationError, RateLimitError, UnsupportedPageError } = await import('../src/weibo-adapter.js');
 const { listRoundReports } = await import('../src/task-reports.js');
@@ -31,7 +31,7 @@ async function until(predicate, ms = 4000) { const end = Date.now() + ms; while 
 function fixture(plan, options = {}) {
   const accounts = ['A','B'].map((name, index) => { const account = createAccount(name); return updateAccountAuth(account.id, { status: 'valid', uid: String(1001 + index), nickname: name }); });
   const topics = [createTopic({ name: '主题', url: 'https://example.test/topic' })];
-  addPostMaterials(['发帖原文', '发帖原文二']); addCommentMaterials(['评论甲', '评论乙']);
+  addPostMaterials(['发帖原文', '发帖原文二']); addOriginalMaterials(['原创甲', '原创乙']); addCommentMaterials(['评论甲', '评论乙']);
   const snapshot = createSnapshot({ accountIds: accounts.map(a => a.id), topicIds: topics.map(t => t.id), actionPlan: plan.map(item => ({ ...item, intervalSeconds: 0 })), roundIntervalSeconds: 0, candidateRefreshSeconds: 0, ...options }, listAccounts(), listTopics());
   return { accounts, topics, job: createJob(snapshot) };
 }
@@ -46,6 +46,189 @@ test('新快照按操作段遍历账号，旧快照保留账号优先顺序', ()
   const format = steps => steps.map(step => `${step.accountId}:${step.kind}:${step.unitIndex}`);
   assert.deepEqual(format(buildSteps({ ...base, schedulerVersion: 2 })), ['A:comment:0','A:comment:1','B:comment:0','B:comment:1','A:post:0','B:post:0']);
   assert.deepEqual(format(buildSteps(base)), ['A:comment:0','A:comment:1','A:post:0','B:comment:0','B:comment:1','B:post:0']);
+});
+
+test('工作台同一账号连续评论复用浏览器上下文，整组只释放一次', async () => {
+  const account = updateAccountAuth(createAccount('连续评论账号').id, { status: 'valid', uid: '2301', nickname: '连续评论账号' });
+  const topic = createTopic({ name: '连续评论超话', url: 'https://weibo.com/p/100808comments' });
+  addCommentMaterials(['评论甲', '评论乙']);
+  const snapshot = createSnapshot({ accountIds: [account.id], topicIds: [topic.id],
+    actionPlan: [{ type: 'comment', count: 3, intervalSeconds: 0 }], roundIntervalSeconds: 0,
+    candidateRefreshSeconds: 0 }, listAccounts(), listTopics());
+  const job = createJob(snapshot);
+  let comments = 0, closes = 0, contextOpen = false, runner;
+  const manager = { generation: 1, get context() { return contextOpen ? {} : null; },
+    closeRunner: async () => { if (contextOpen) { contextOpen = false; closes += 1; } } };
+  runner = new TaskRunner({ ...candidates(), ensureIdentity: async () => { contextOpen = true; return { uid: account.uid }; },
+    comment: async (_account, candidate, _content, options) => {
+      comments += 1; options.onSubmit(); return { state: 'succeeded', url: candidate.url };
+    }, browserManager: manager }, { scope: 'workbench', leases: new AccountLeases() });
+  await runner.run(job.id);
+  assert.equal(comments, 3);
+  assert.equal(getJob(job.id).metrics.success, 3);
+  assert.equal(closes, 1, '连续三条评论应只关闭一次浏览器');
+  assert.equal(runner.workbenchCommentSession, null);
+});
+
+test('工作台评论会话在账号、超话、轮次或操作类型变化时立即释放', async () => {
+  const accounts = ['甲','乙'].map((name, index) => updateAccountAuth(createAccount(name).id,
+    { status: 'valid', uid: String(2401 + index), nickname: name }));
+  const topic = createTopic({ name: '边界超话', url: 'https://weibo.com/p/100808boundary' });
+  addCommentMaterials(['评论甲', '评论乙']);
+  const snapshot = createSnapshot({ accountIds: accounts.map(item => item.id), topicIds: [topic.id],
+    actionPlan: [{ type: 'comment', count: 2, intervalSeconds: 0 }, { type: 'post', count: 1, intervalSeconds: 0 }],
+    roundIntervalSeconds: 0, candidateRefreshSeconds: 0 }, listAccounts(), listTopics());
+  const job = createJob(snapshot);
+  const steps = buildSteps(job.config);
+  const firstAccountComments = steps.filter(step => step.accountId === accounts[0].id && step.kind === 'comment');
+  const otherAccountComment = steps.find(step => step.accountId === accounts[1].id && step.kind === 'comment');
+  const postStep = steps.find(step => step.kind === 'post');
+  let closes = 0;
+  const leases = new AccountLeases();
+  const manager = { generation: 1, closeRunner: async () => { closes += 1; } };
+  const runner = new TaskRunner({ ensureIdentity: async () => ({}), browserManager: manager },
+    { scope: 'workbench', leases });
+  await runner.withAccountLease(job, accounts[0], async () => {}, { step: firstAccountComments[0] });
+  await runner.withAccountLease(job, accounts[0], async () => {}, { step: firstAccountComments[1] });
+  assert.equal(closes, 0);
+  await runner.withAccountLease(job, accounts[1], async () => {}, { step: otherAccountComment });
+  assert.equal(closes, 1, '切换账号必须关闭上一账号上下文');
+  await runner.withAccountLease(job, accounts[1], async () => {}, { step: { ...otherAccountComment, round: 1 } });
+  assert.equal(closes, 2, '轮次变化必须关闭上下文');
+  await runner.withAccountLease(job, accounts[1], async () => {}, { step: postStep });
+  assert.equal(closes, 4, '切换评论到发帖必须关闭评论会话，发帖步骤本身仍按原生命周期关闭');
+  assert.equal(leases.owners.size, 0);
+});
+
+test('工作台评论等待候选刷新时保持同一浏览器上下文', async () => {
+  const account = updateAccountAuth(createAccount('等待评论账号').id, { status: 'valid', uid: '2403', nickname: '等待评论账号' });
+  const topic = createTopic({ name: '等待评论超话', url: 'https://weibo.com/p/100808waiting' });
+  addCommentMaterials(['评论甲', '评论乙']);
+  const snapshot = createSnapshot({ accountIds: [account.id], topicIds: [topic.id],
+    actionPlan: [{ type: 'comment', count: 1, intervalSeconds: 0 }], roundIntervalSeconds: 0,
+    candidateRefreshSeconds: 0 }, listAccounts(), listTopics());
+  const job = createJob(snapshot);
+  let scans = 0, opens = 0, closes = 0, contextOpen = false;
+  const manager = { generation: 1, get context() { return contextOpen ? {} : null; },
+    closeRunner: async () => { if (contextOpen) { contextOpen = false; closes += 1; } } };
+  const runner = new TaskRunner({
+    ensureIdentity: async () => { if (!contextOpen) { contextOpen = true; opens += 1; } return { uid: account.uid }; },
+    collectCandidates: async () => {
+      scans += 1;
+      return scans === 1 ? [] : [{ id: 'Rwait', url: 'https://weibo.com/900/Rwait', authorUid: '900', commentCount: 0 }];
+    },
+    inspectCandidate: async (_account, candidate) => ({ ...candidate, commentCount: 0 }),
+    comment: async (_account, candidate, _content, options) => {
+      options.onSubmit(); return { state: 'succeeded', url: candidate.url };
+    }, browserManager: manager
+  }, { scope: 'workbench', leases: new AccountLeases() });
+  await runner.run(job.id);
+  assert.ok(scans >= 2);
+  assert.equal(getJob(job.id).metrics.success, 1);
+  assert.equal(opens, 1, '等待刷新不得重新打开浏览器');
+  assert.equal(closes, 1, '评论完成后只释放一次');
+});
+
+test('复用评论会话时在当前超话页刷新而不是重新打开浏览器', async () => {
+  const account = updateAccountAuth(createAccount('评论刷新账号').id, { status: 'valid', uid: '2404', nickname: '评论刷新账号' });
+  const topic = createTopic({ name: '刷新超话', url: 'https://weibo.com/p/100808fixture' });
+  const profile = fs.mkdtempSync(path.join(data, 'comment-refresh-'));
+  let documents = 0;
+  const manager = new BrowserManager(async ({ options }) => {
+    const context = await chromium.launchPersistentContext(profile, { ...options, headless: true });
+    await context.route('**/*', route => {
+      const url = new URL(route.request().url());
+      if (url.hostname !== 'weibo.com') return route.abort();
+      documents += 1;
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `
+        <script>window.$CONFIG={uid:'2404',user:{screen_name:'fixture'}};</script>
+        <div class="chaohua-tab-wrap"><button>超like</button><div class="woo-box-item-inlineBlock cur">超like</div></div>
+        <button>最新发帖</button>
+        <article><a href="/900/Rrefresh">帖子</a><a href="/p/100808fixture">超话</a><footer>转发 评论 赞</footer></article>` });
+    });
+    return context;
+  }, { headless: true, activate: async () => {} });
+  try {
+    const adapter = new WeiboAdapter(manager);
+    const first = await adapter.collectCandidates(account, topic, { section: '超like', limit: 1, refreshTopicPage: true });
+    const second = await adapter.collectCandidates(account, topic, { section: '超like', limit: 1, refreshTopicPage: true });
+    assert.equal(first[0].id, 'Rrefresh');
+    assert.equal(second[0].id, 'Rrefresh');
+    assert.equal(documents, 2, '第二次应刷新当前超话页面，不重新创建页面');
+  } finally { await manager.close(); }
+});
+
+test('工作台评论遇到验证或网络中断时立即释放会话和账号租约', async () => {
+  const account = updateAccountAuth(createAccount('评论中断账号').id, { status: 'valid', uid: '2405', nickname: '评论中断账号' });
+  const topic = createTopic({ name: '中断超话', url: 'https://weibo.com/p/100808interrupt' });
+  addCommentMaterials(['评论甲', '评论乙']);
+  const snapshot = createSnapshot({ accountIds: [account.id], topicIds: [topic.id],
+    actionPlan: [{ type: 'comment', count: 1, intervalSeconds: 0 }], roundIntervalSeconds: 0,
+    candidateRefreshSeconds: 0 }, listAccounts(), listTopics());
+  const job = createJob(snapshot);
+  const step = buildSteps(job.config).find(item => item.kind === 'comment');
+  let closes = 0, contextOpen = false;
+  const leases = new AccountLeases();
+  const manager = { generation: 1, get context() { return contextOpen ? {} : null; },
+    closeRunner: async () => { if (contextOpen) { contextOpen = false; closes += 1; } } };
+  const runner = new TaskRunner({ ensureIdentity: async () => { contextOpen = true; return {}; },
+    browserManager: manager }, { scope: 'workbench', leases });
+  runner.workflow.ensureSteps(job);
+  await runner.withAccountLease(job, account, async () => { contextOpen = true; }, { step });
+  const row = runner.workflow.rows(job.id, step.round).find(item => item.step_key === `${step.round}:${step.topicId}:${step.accountId}:${step.segmentId || step.actionIndex}:${step.unitIndex}`);
+  await runner.maybeReleaseWorkbenchCommentSession(job.id, row, 'verification');
+  assert.equal(closes, 1);
+  assert.equal(leases.owners.size, 0);
+  assert.equal(runner.workbenchCommentSession, null);
+});
+
+test('工作台评论会话期间后台网络探测不关闭复用浏览器', async () => {
+  const account = updateAccountAuth(createAccount('探测评论账号').id, { status: 'valid', uid: '2406', nickname: '探测评论账号' });
+  const topic = createTopic({ name: '探测超话', url: 'https://weibo.com/p/100808probe' });
+  addCommentMaterials(['评论甲', '评论乙']);
+  const snapshot = createSnapshot({ accountIds: [account.id], topicIds: [topic.id],
+    actionPlan: [{ type: 'comment', count: 1, intervalSeconds: 0 }], roundIntervalSeconds: 0,
+    candidateRefreshSeconds: 0 }, listAccounts(), listTopics());
+  const job = createJob(snapshot);
+  const step = buildSteps(job.config).find(item => item.kind === 'comment');
+  let closes = 0, probes = 0, contextOpen = false;
+  const manager = { generation: 1, get context() { return contextOpen ? {} : null; },
+    closeRunner: async () => { if (contextOpen) { contextOpen = false; closes += 1; } } };
+  const runner = new TaskRunner({
+    ensureIdentity: async () => { contextOpen = true; return {}; },
+    probeConnectivity: async () => { probes += 1; return { state: 'online', contextGeneration: 1 }; },
+    browserManager: manager
+  }, { scope: 'workbench', leases: new AccountLeases() });
+  await runner.withAccountLease(job, account, async () => { contextOpen = true; }, { step });
+  await runner.network.monitor(job);
+  assert.equal(probes, 0, '评论会话占用期间应跳过后台探测');
+  assert.equal(closes, 0);
+  assert.equal(contextOpen, true);
+  await runner.releaseWorkbenchCommentSession('测试结束');
+  assert.equal(closes, 1);
+});
+
+test('工作台原创仅任务不选超话也能按账号次数执行', async () => {
+  const account = updateAccountAuth(createAccount('原创任务账号').id, { status: 'valid', uid: '2409', nickname: '原创任务账号' });
+  addOriginalMaterials(['原创甲', '原创乙']);
+  const snapshot = createSnapshot({ accountIds: [account.id], topicIds: [],
+    actionPlan: [{ type: 'original', count: 2, intervalSeconds: 0 }], roundIntervalSeconds: 0,
+    candidateRefreshSeconds: 0 }, listAccounts(), listTopics());
+  const job = createJob(snapshot);
+  let sends = 0, closes = 0, contextOpen = false;
+  const manager = { generation: 1, get context() { return contextOpen ? {} : null; },
+    closeRunner: async () => { if (contextOpen) { contextOpen = false; closes += 1; } } };
+  const runner = new TaskRunner({
+    ensureIdentity: async () => { contextOpen = true; return { uid: account.uid }; },
+    openPostHome: async () => ({}),
+    originalPost: async (_account, _text, options) => {
+      sends += 1; options.onSubmit(); return { state: 'succeeded', receiptId: '5359362629436099' };
+    }, browserManager: manager
+  }, { scope: 'workbench', leases: new AccountLeases() });
+  await runner.run(job.id);
+  assert.equal(sends, 2);
+  assert.equal(getJob(job.id).metrics.success, 2);
+  assert.equal(closes, 2, '原创按独立步骤保持发帖原有开合规则');
 });
 
 test('发帖与评论卡片初始已有验证码，解除后执行原类型且不混做签到', async () => {
@@ -66,9 +249,8 @@ test('发帖与评论卡片初始已有验证码，解除后执行原类型且�
       isVerificationResolved: async () => !challenge
     });
     await runner.run(job.id);
-    manual = true; runner.workflow.requestManual(job.id, '1001');
-    await until(() => runner.workflow.session?.wake);
-    challenge = false; blocked = false; runner.workflow.session.wake();
+    manual = true; challenge = false; blocked = false;
+    await runner.workflow.requestManual(job.id, '1001');
     await until(() => !runner.workflow.session);
     assert.deepEqual(calls.filter(call => call.startsWith('manual:')), [`manual:${kind}:1001`]);
     assert.equal(runner.workflow.rows(job.id, 0).find(row => row.identity === '1001' && row.kind === kind).outcome, 'succeeded');
@@ -86,7 +268,8 @@ test('一次验证仅完成当前签到，同日其余签到在继续运行时�
     }, verifyCheckin: async () => ({ state: 'uncertain' }),
     openVerification: async () => ({ isClosed: () => false }), hasTaskChallenge: async () => false });
   await runner.run(job.id); manual = true;
-  runner.workflow.requestManual(job.id, '1001'); await until(() => !runner.workflow.session);
+  await runner.workflow.requestManual(job.id, '1001');
+  await until(() => !runner.workflow.session);
   assert.equal(clicks, 1);
   const rows = runner.workflow.rows(job.id, 0).filter(row => row.identity === '1001');
   assert.equal(rows[0].outcome, 'succeeded'); assert.equal(rows[1].outcome, null);
@@ -107,7 +290,10 @@ test('人工评论明确拒绝后不递归换帖再发送', async () => {
     }, openVerification: async () => ({ isClosed: () => false }), hasTaskChallenge: async () => false });
   await runner.run(job.id); manual = true;
   runner.workflow.requestManual(job.id, '1001'); await until(() => !runner.workflow.session);
-  assert.equal(clicks, 1); assert.equal(getJob(job.id).metrics.failed, 1);
+  assert.equal(clicks, 1);
+  assert.equal(getJob(job.id).metrics.failed, 0);
+  assert.equal(getJob(job.id).metrics.uncertain, 0, '待验证未确认结果暂不计入最终待核对');
+  assert.equal(runner.workflow.status(getJob(job.id)).cards[0].source, 'manual_unconfirmed');
 });
 
 test('人工发送中停止会安全收尾，已确认成功保留且不再执行后续', async () => {
@@ -124,7 +310,7 @@ test('人工发送中停止会安全收尾，已确认成功保留且不再执�
   assert.equal(getJob(job.id).status, 'stopped'); assert.equal(getJob(job.id).metrics.success, 2);
 });
 
-test('人工续发已见成功但保存异常时暂停，重新开卡片也不能重发', async () => {
+test('人工续发保存异常时暂停，再次点验证仍会直接触发发帖', async () => {
   const { accounts, job } = fixture([{ type: 'post', count: 1 }]); let manual = false, sends = 0;
   const page = { isClosed: () => false };
   const adapter = { ensureIdentity: async () => ({}), post: async (account, _topic, _content, options) => {
@@ -143,10 +329,10 @@ test('人工续发已见成功但保存异常时暂停，重新开卡片也不�
   const row = runner.workflow.rows(job.id, 0).find(row => row.identity === '1001');
   assert.equal(getStepAction(job.id, row.step_key).verification_pending, 0);
   runner.workflow.requestManual(job.id, '1001'); await until(() => !runner.workflow.session);
-  assert.equal(sends, 1);
+  assert.equal(sends, 2, '重新点验证应直接触发一次新的发帖');
 });
 
-test('人工发送等结果超时后只保留核对，再次打开不会触发第二次发送', async () => {
+test('人工发送结果未确认时每次点击都会重新触发发帖并保持待核对', async () => {
   const { accounts, job } = fixture([{ type: 'post', count: 1 }]); let manual = false, sends = 0, clock = Date.now();
   const page = { isClosed: () => false };
   const adapter = { ensureIdentity: async () => ({}), post: async (account, _topic, _content, options) => {
@@ -163,9 +349,10 @@ test('人工发送等结果超时后只保留核对，再次打开不会触发�
   runner.workflow.requestManual(job.id, '1001'); await until(() => !runner.workflow.session);
   const row = runner.workflow.rows(job.id, 0).find(row => row.identity === '1001');
   assert.equal(getStepAction(job.id, row.step_key).state, 'uncertain');
-  assert.equal(getStepAction(job.id, row.step_key).verification_pending, 0);
+  assert.equal(getStepAction(job.id, row.step_key).verification_pending, 1);
+  runner.workflow.waitForManualSubmission = async () => {};
   runner.workflow.requestManual(job.id, '1001'); await until(() => !runner.workflow.session);
-  assert.equal(sends, 1); assert.equal(getJob(job.id).metrics.uncertain, 1);
+  assert.equal(sends, 2); assert.equal(getJob(job.id).metrics.uncertain, 0);
 });
 
 test('人工窗口只触发当前发帖一次，验证码自动续发成功不重复发送或计数', async () => {
@@ -199,6 +386,39 @@ test('人工窗口只触发当前发帖一次，验证码自动续发成功不�
   assert.equal(calls.filter(call => call.manual).length, 1);
   assert.equal(after.id, before.id); assert.equal(after.content.replace(/\d+$/, ''), before.content.replace(/\d+$/, '')); assert.ok(after.sequence_number >= 1);
   assert.equal(after.state, 'succeeded'); assert.equal(getJob(job.id).metrics.success, 2);
+});
+
+test('原创验证码进入独立卡片，人工完成后原动作只提交一次', async () => {
+  const { accounts, job } = fixture([{ type: 'original', count: 1 }], { postDecoration: { mode: 'number' } });
+  let manual = false, challenge = false, receipt;
+  const calls = [], page = { isClosed: () => false };
+  const adapter = { ensureIdentity: async () => ({}),
+    openPostHome: async () => ({}),
+    originalPost: async (account, content, options) => {
+      calls.push({ uid: account.uid, content, manual }); options.onSubmit();
+      if (account.id === accounts[0].id && !manual) {
+        const error = new VerificationError('原创发布要求安全验证'); error.explicitlyUnpublished = true; throw error;
+      }
+      if (manual) {
+        receipt = options.onReceipt; challenge = true;
+        adapter.manualPostReceipt = { page, actionId: options.actionId, attemptId: options.attemptId, read: () => null };
+        throw new VerificationError('人工原创发送触发验证码');
+      }
+      return { state: 'succeeded' };
+    }, openVerification: async () => page, hasTaskChallenge: async () => challenge,
+    isVerificationResolved: async () => !challenge };
+  const runner = new TaskRunner(adapter);
+  await runner.run(job.id);
+  const row = runner.workflow.rows(job.id, 0).find(row => row.identity === '1001' && row.kind === 'original');
+  const card = db.prepare('SELECT blocked_kinds_json FROM verification_cards WHERE job_id=? AND identity=?').get(job.id, '1001');
+  assert.match(card.blocked_kinds_json, /original/);
+  manual = true; runner.workflow.requestManual(job.id, '1001', row.step_key);
+  await until(() => receipt && runner.workflow.session?.wake);
+  challenge = false; await receipt({ state: 'succeeded', successSource: 'page_notice' });
+  runner.workflow.session?.wake?.(); await until(() => !runner.workflow.session);
+  const after = getStepAction(job.id, row.step_key);
+  assert.equal(after.state, 'succeeded');
+  assert.equal(calls.filter(call => call.uid === '1001').length, 2);
 });
 
 test('发帖明确被验证拦截后保留原编号进入卡片，人工自动发布只计一次', async () => {
@@ -294,7 +514,7 @@ test('全部类型触发验证后继续其他账号，同UID跨超话待办合�
   assert.equal(getJob(job.id).metrics.failed, 0); assert.equal(getJob(job.id).metrics.skipped, 0);
 });
 
-test('普通已提交未知步骤只读复核，经明确确认后才能用原编号补发', async () => {
+test('普通已提交未知步骤首次点验证直接触发发帖并保留原编号', async () => {
   const { accounts, job } = fixture([{ type: 'post', count: 1 }], { postDecoration: { mode: 'number' } });
   let calls = 0, first = true, reads = 0;
   const runner = new TaskRunner({ ensureIdentity: async () => ({}), post: async (account, _topic, _text, options) => {
@@ -308,30 +528,32 @@ test('普通已提交未知步骤只读复核，经明确确认后才能用原�
   assert.equal(callsAfterRun, 2, '账号 A 待核对，账号 B 已成功');
   assert.ok(getStepAction(job.id, key).submitted_at);
   assert.equal(getJob(job.id).metrics.uncertain, 1, '普通未知结果仍计待核对');
-  runner.workflow.requestManual(job.id, card.identity); await until(() => !runner.workflow.session);
-  assert.equal(calls, callsAfterRun); assert.equal(reads, 0, '可见发帖窗口关闭前不得导航到超话页复核');
-  assert.equal(getStepAction(job.id, key).state, 'uncertain');
+  runner.workflow.waitForManualSubmission = async () => {};
+  await runner.workflow.requestManual(job.id, card.identity);
+  await until(() => !runner.workflow.session);
+  assert.equal(calls, callsAfterRun + 1, '首次点验证必须直接触发发帖');
+  assert.equal(reads, 0, '首次点验证不得先做只读复核');
+  assert.equal(getStepAction(job.id, key).state, 'succeeded');
+  const passedCard = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === card.identity);
+  assert.equal(passedCard.verificationResult, 'passed');
   const original = getStepAction(job.id, key).content;
-  runner.workflow.confirmUnpublished(job.id, key);
-  assert.equal(getJob(job.id).metrics.uncertain, 0);
-  const ready = runner.workflow.status(getJob(job.id));
-  assert.equal(ready.canContinue, true, JSON.stringify(ready));
-  runner.workflow.continue(job.id);
-  await until(() => getJob(job.id).status === 'completed');
-  assert.equal(calls, callsAfterRun + 1); assert.equal(getJob(job.id).metrics.success, 2);
   assert.equal(getStepAction(job.id, key).content, original);
 });
 
-test('未明确确认的未知提交保留待核对，不自动补发，也不阻止其他待办完成', async () => {
+test('未确认的未知提交点验证后直接触发，不阻止其他待办完成', async () => {
   const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
   let calls = 0;
   const runner = new TaskRunner({ ensureIdentity: async () => ({}), post: async (account, _topic, _text, options) => {
     calls++; options.onSubmit(); if (account.id === accounts[0].id) { const error = new VerificationError('提交中断，结果未知'); error.verificationRequired = false; throw error; } return { state: 'succeeded' };
   }, openVerification: async () => {}, hasTaskChallenge: async () => false, verifyPost: async () => ({ state: 'uncertain' }) });
   await runner.run(job.id);
-  runner.workflow.requestManual(job.id, '1001'); await until(() => !runner.workflow.session);
-  runner.workflow.continue(job.id); await until(() => getJob(job.id).status === 'completed');
-  assert.equal(calls, 2); assert.equal(getJob(job.id).metrics.uncertain, 1);
+  runner.workflow.waitForManualSubmission = async () => {};
+  await runner.workflow.requestManual(job.id, '1001'); await until(() => !runner.workflow.session);
+  assert.equal(calls, 3, '点验证卡应直接触发该账号的新发帖尝试');
+  assert.equal(getJob(job.id).metrics.uncertain, 0);
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  assert.equal(card.verificationResult, 'pending');
+  assert.equal(card.source, 'manual_unconfirmed');
 });
 
 test('混合验证卡时继续运行只补做已验证账号，未验证账号保持卡片', async () => {
@@ -421,15 +643,264 @@ test('手动验证请求等当前操作完成，期间不切账号；取消验�
     if (account.id === accounts[0].id) throw new VerificationError('A验证'); inB = true; await hold; return { state: 'succeeded' };
   }, openVerification: async () => { opens++; }, hasTaskChallenge: async () => true, isVerificationResolved: async () => false });
   runner.run(job.id); await until(() => inB);
-  runner.workflow.requestManual(job.id, '1001');
-  assert.equal(opens, 0); assert.equal(runner.workflow.status(getJob(job.id)).session.phase, 'requested');
-  release(); await until(() => runner.workflow.session?.wake);
+  const opening = runner.workflow.requestManual(job.id, '1001');
+  assert.equal(opens, 0); assert.equal(runner.workflow.status(getJob(job.id)).session.phase, 'opening');
+  release(); await opening;
   assert.equal(opens, 1); assert.equal(getJob(job.id).metrics.success, 1);
-  assert.throws(() => runner.workflow.requestManual(job.id, '1001'), /先结束/);
+  await assert.rejects(runner.workflow.requestManual(job.id, '1001'), /已经打开/);
   await runner.workflow.endManual(job.id);
   assert.equal(runner.workflow.status(getJob(job.id)).cards[0].status, 'pending');
   assert.equal(getJob(job.id).status, 'waiting');
   assert.equal(runner.workflow.busy(), false);
+});
+
+test('连续点击同一验证卡只创建一个窗口并共享同一个请求编号', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  const page = { context: () => ({}), isClosed: () => false, once: () => {} };
+  let opens = 0, releaseOpen;
+  const gate = new Promise(resolve => { releaseOpen = resolve; });
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    post: async account => { if (account.id === accounts[0].id) throw new VerificationError('需要验证'); return { state: 'succeeded' }; },
+    openVerification: async () => { opens += 1; await gate; return page; },
+    hasTaskChallenge: async () => true,
+    isVerificationResolved: async () => false
+  });
+  await runner.run(job.id);
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  const first = runner.workflow.requestManual(job.id, card.identity, card.currentStepKey);
+  const second = runner.workflow.requestManual(job.id, card.identity, card.currentStepKey);
+  await until(() => opens === 1);
+  releaseOpen();
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(opens, 1);
+  assert.equal(a.session.requestId, b.session.requestId);
+  assert.equal(getJob(job.id).cursor.manualVerification.requestId, a.session.requestId);
+  await runner.workflow.endManual(job.id);
+});
+
+test('其他操作每次验证只自动触发一次，未触发时保留卡片供下次点击', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  const page = { context: () => ({}), isClosed: () => false, once: () => {} };
+  let opens = 0, attempts = 0;
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    post: async (account, _topic, _content, options) => {
+      if (account.id !== accounts[0].id) return { state: 'succeeded' };
+      if (!runner.workflow.session) throw new VerificationError('需要验证');
+      attempts += 1;
+      return { state: 'failed', reason: '页面目标未出现' };
+    },
+    openVerification: async () => { opens += 1; return page; },
+    hasTaskChallenge: async () => false,
+    closeManual: async () => {}
+  });
+  await runner.run(job.id);
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  await assert.rejects(runner.workflow.requestManual(job.id, card.identity, card.currentStepKey), /已尝试 1\/1 次/);
+  await until(() => !runner.workflow.session);
+  assert.equal(opens, 1);
+  assert.equal(attempts, 1);
+  const pending = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  assert.equal(pending.verificationResult, 'pending');
+  assert.equal(pending.currentActionable, true);
+});
+
+test('动作未触发后重新点验证只再触发一次', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  let opens = 0, attempts = 0;
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    post: async (account, _topic, _content, options) => {
+      if (account.id !== accounts[0].id) return { state: 'succeeded' };
+      if (!runner.workflow.session) throw new VerificationError('需要验证');
+      attempts += 1;
+      if (attempts === 1) return { state: 'failed', reason: '发帖入口没有出现' };
+      options.onSubmit();
+      return { state: 'succeeded', receiptId: '5359362629437778', receiptUrl: 'https://weibo.com/detail/5359362629437778' };
+    },
+    openVerification: async () => { opens += 1; return { context: () => ({}), isClosed: () => false, once: () => {} }; },
+    hasTaskChallenge: async () => false,
+    closeManual: async () => {}
+  });
+  await runner.run(job.id);
+  let card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  await assert.rejects(runner.workflow.requestManual(job.id, card.identity, card.currentStepKey), /已尝试 1\/1 次/);
+  await until(() => !runner.workflow.session);
+  assert.equal(opens, 1);
+  assert.equal(attempts, 1);
+  card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  await runner.workflow.requestManual(job.id, card.identity, card.currentStepKey);
+  await until(() => !runner.workflow.session);
+  assert.equal(opens, 2);
+  assert.equal(attempts, 2);
+  assert.equal(getJob(job.id).metrics.success, 2);
+});
+
+test('第一次触发送后出现验证码时立即停止重试并等待人工处理', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  let manualActions = 0, challenge = false;
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    post: async (account, _topic, _content, options) => {
+      if (account.id !== accounts[0].id) return { state: 'succeeded' };
+      if (!runner.workflow.session) throw new VerificationError('需要验证');
+      manualActions += 1;
+      options.onSubmit();
+      challenge = true;
+      throw new VerificationError('发送后要求人工验证');
+    },
+    openVerification: async () => ({ context: () => ({}), isClosed: () => false, once: () => {} }),
+    hasTaskChallenge: async () => challenge,
+    isVerificationResolved: async () => false,
+    closeManual: async () => {}
+  });
+  await runner.run(job.id);
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  await runner.workflow.requestManual(job.id, card.identity, card.currentStepKey);
+  await until(() => getJob(job.id).cursor.manualVerification?.phase === 'challenge');
+  await new Promise(resolve => setTimeout(resolve, 150));
+  assert.equal(manualActions, 1);
+  assert.equal(runner.workflow.session.requestId, getJob(job.id).cursor.manualVerification.requestId);
+  await runner.workflow.endManual(job.id);
+});
+
+test('未确认发帖第一次点击就打开窗口并重新发帖', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  let manual = false, writes = 0, opens = 0;
+  const page = { context: () => ({}), isClosed: () => false, once: () => {} };
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    post: async (account, _topic, _content, options) => {
+      if (account.id !== accounts[0].id) return { state: 'succeeded' };
+      writes += 1;
+      if (!manual) throw new VerificationError('需要验证');
+      options.onSubmit();
+      return { state: 'succeeded', receiptId: '5359362629439999', receiptUrl: 'https://weibo.com/detail/5359362629439999' };
+    },
+    openVerification: async () => { opens += 1; return page; },
+    hasTaskChallenge: async () => false,
+    closeManual: async () => {},
+    verifyPost: async () => ({ state: 'uncertain', reason: '仍未找到唯一已发布帖子' })
+  });
+  await runner.run(job.id);
+  let card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  const action = getStepAction(job.id, card.currentStepKey);
+  db.prepare("UPDATE action_logs SET state='uncertain',submitted_at=?,verification_pending=1,error='历史提交结果未知' WHERE id=?")
+    .run('2026-11-08T00:00:00.000Z', action.id);
+  db.prepare("UPDATE task_step_state SET state='review',outcome='uncertain' WHERE job_id=? AND step_key=?").run(job.id, card.currentStepKey);
+  const writesBefore = writes;
+  const stepKey = card.currentStepKey;
+
+  manual = true;
+  await runner.workflow.requestManual(job.id, card.identity, card.currentStepKey);
+  await until(() => !runner.workflow.session);
+  card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  assert.equal(writes, writesBefore + 1, '第一次点击必须实际发起新的发帖');
+  assert.equal(opens, 1);
+  assert.equal(getStepAction(job.id, stepKey).attempt_id !== undefined, true);
+  assert.equal(card.verificationResult, 'passed');
+  assert.ok(card.verifiedAt);
+});
+
+test('历史未确认成功却已通过的验证卡会恢复为再次验证', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    post: async account => { if (account.id === accounts[0].id) throw new VerificationError('需要验证'); return { state: 'succeeded' }; }
+  });
+  await runner.run(job.id);
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  const action = getStepAction(job.id, card.currentStepKey);
+  db.prepare("UPDATE action_logs SET state='uncertain',submitted_at=?,error='人工验证后仍未观察到本次操作的成功提示，保留核对且不重复发送' WHERE id=?")
+    .run(new Date().toISOString(), action.id);
+  db.prepare("UPDATE task_step_state SET state='review',outcome='uncertain' WHERE job_id=? AND step_key=?").run(job.id, action.step_key);
+  db.prepare("UPDATE verification_cards SET status='ready',verification_result='passed',verified_at=?,reason='已发送，结果待核对，不会自动重发' WHERE job_id=? AND identity=?")
+    .run(new Date().toISOString(), job.id, '1001');
+  const repaired = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  assert.equal(repaired.status, 'pending');
+  assert.equal(repaired.verificationResult, 'pending');
+  assert.equal(repaired.verifiedAt, null);
+  assert.equal(repaired.source, 'manual_unconfirmed');
+  assert.equal(repaired.canOpen, true);
+  db.prepare("UPDATE action_logs SET state='uncertain',verification_pending=0,error='人工验证后仍未观察到本次操作的成功提示，保留核对且不重复发送' WHERE id=?").run(action.id);
+  db.prepare("UPDATE task_step_state SET state='review',outcome='uncertain' WHERE job_id=? AND step_key=?").run(job.id, action.step_key);
+  db.prepare("UPDATE verification_cards SET status='pending',verification_result='pending',verified_at=NULL,source='verification_detected',reason='之后另一操作再次触发验证' WHERE job_id=? AND identity='1001'").run(job.id);
+  const repairedAgain = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  assert.equal(repairedAgain.source, 'manual_unconfirmed');
+  assert.equal(repairedAgain.currentStepKey, action.step_key);
+  assert.equal(getStepAction(job.id, action.step_key).verification_pending, 1);
+});
+
+test('待验证发帖即使有旧 submitted_at 也会在验证卡中发起新一次发送', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  let manual = false, writes = 0;
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    post: async (account, _topic, _content, options) => {
+      if (account.id !== accounts[0].id) return { state: 'succeeded' };
+      writes += 1;
+      if (!manual) throw new VerificationError('For your safety, please verify your account');
+      options.onSubmit();
+      return { state: 'succeeded', receiptId: '5359362629438888', receiptUrl: 'https://weibo.com/detail/5359362629438888' };
+    },
+    openVerification: async () => ({ context: () => ({}), isClosed: () => false, once: () => {} }),
+    hasTaskChallenge: async () => false,
+    closeManual: async () => {}
+  });
+  await runner.run(job.id);
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  db.prepare("UPDATE action_logs SET submitted_at=?,verification_pending=1 WHERE job_id=? AND step_key=?")
+    .run(new Date().toISOString(), job.id, card.currentStepKey);
+  const before = writes;
+  manual = true;
+  await runner.workflow.requestManual(job.id, card.identity, card.currentStepKey);
+  await until(() => !runner.workflow.session);
+  assert.equal(writes, before + 1, '明确待人工验证的发帖必须在验证卡中重新触发一次');
+  assert.equal(getStepAction(job.id, card.currentStepKey).state, 'succeeded');
+});
+
+test('服务残留的验证游标不会阻止重新开窗', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  let opens = 0;
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    post: async account => { if (account.id === accounts[0].id) throw new VerificationError('需要验证'); return { state: 'succeeded' }; },
+    openVerification: async () => { opens += 1; return { context: () => ({}), isClosed: () => false, once: () => {} }; },
+    hasTaskChallenge: async () => true,
+    isVerificationResolved: async () => false
+  });
+  await runner.run(job.id);
+  const current = getJob(job.id);
+  updateJob(job.id, { cursor: { ...current.cursor, manualVerification: {
+    requestId: 'vreq_stale', identity: '1001', phase: 'opening', requestedAt: new Date().toISOString()
+  } } });
+  const opened = await runner.workflow.requestManual(job.id, '1001');
+  assert.equal(opens, 1);
+  assert.notEqual(opened.session.requestId, 'vreq_stale');
+  assert.match(getJob(job.id).cursor.manualVerification.phase, /waiting_challenge|challenge/);
+  await runner.workflow.endManual(job.id);
+  assert.equal(runner.workflow.busy(), false);
+});
+
+test('验证窗口创建失败会恢复卡片并释放账号租约', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  const leases = new AccountLeases();
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    post: async account => { if (account.id === accounts[0].id) throw new VerificationError('需要验证'); return { state: 'succeeded' }; },
+    openVerification: async () => { throw new Error('Chrome launch failed'); },
+    hasTaskChallenge: async () => false
+  }, { scope: 'workbench', leases });
+  await runner.run(job.id);
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  await assert.rejects(runner.workflow.requestManual(job.id, card.identity, card.currentStepKey), /Chrome launch failed/);
+  assert.equal(runner.workflow.session, null);
+  assert.equal(getJob(job.id).cursor.manualVerification, null);
+  assert.equal(leases.owners.size, 0);
+  const failedCard = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  assert.equal(failedCard.status, 'pending');
+  assert.match(failedCard.reason, /Chrome launch failed/);
 });
 
 test('验证卡片不被存活的等待循环卡住，初始标签关闭后恢复为可重试', async () => {
@@ -450,9 +921,10 @@ test('验证卡片不被存活的等待循环卡住，初始标签关闭后恢�
   // only opened a manual browser when this value was null.
   runner.promise = new Promise(() => {});
   blocked = false;
-  runner.workflow.requestManual(job.id, '1001');
+  await assert.rejects(runner.workflow.requestManual(job.id, '1001'), /立即关闭|无法打开/);
   await until(() => opens === 1);
-  await until(() => !runner.workflow.session);
+  assert.equal(runner.workflow.session, null);
+  assert.equal(getJob(job.id).cursor.manualVerification, null);
   assert.equal(runner.workflow.status(getJob(job.id)).cards[0].status, 'pending');
   assert.equal(getJob(job.id).metrics.success, 0);
   runner.promise = null;
@@ -503,23 +975,24 @@ test('23:59终止手动验证、保留未完成待办历史，禁止继续补做
   assert.equal(runner.workflow.status(getJob(job.id)).canContinue, false);
 });
 
-test('签到结果未知且没有新验证码时只读等待，重新打开不获得补点资格', async () => {
+test('签到结果未知时首次验证直接打开窗口，核验未签到后触发一次', async () => {
   const { job } = fixture([{ type: 'checkin', count: 1 }]);
-  let submits = 0, reads = 0;
+  let submits = 0, reads = 0, opens = 0, manual = false;
   const runner = new TaskRunner({ ensureIdentity: async () => ({}),
-    checkin: async (_a, _t, {onSubmit}) => { submits++; onSubmit(); return {state:'uncertain'}; },
-    verifyCheckin: async () => { reads++; return {state:'uncertain'}; },
-    openVerification: async () => ({isClosed:()=>false}), hasTaskChallenge: async () => false });
+    checkin: async (_a, _t, {onSubmit}) => { submits++; onSubmit(); return manual ? {state:'succeeded'} : {state:'uncertain'}; },
+    verifyCheckin: async () => { reads++; return manual ? {state:'uncertain'} : {state:'uncertain'}; },
+    openVerification: async () => { opens++; return {isClosed:()=>false}; }, hasTaskChallenge: async () => false });
   await runner.run(job.id);
-  assert.equal(submits,2);
-  try {
-    for(let attempt=0;attempt<2;attempt++) {
-      runner.workflow.requestManual(job.id,'1001'); await until(()=>runner.workflow.session?.wake);
-      await runner.workflow.recheckManual(job.id); assert.equal(submits,2);
-      await runner.workflow.endManual(job.id);
-    }
-    assert.ok(reads>=2);
-  } finally { await runner.workflow.endManual(job.id); }
+  const before = submits;
+  manual = true;
+  await runner.workflow.requestManual(job.id,'1001');
+  await until(() => !runner.workflow.session, 6000);
+  assert.equal(opens,1);
+  assert.equal(submits,before+1);
+  assert.ok(reads>=1);
+  const card=runner.workflow.status(getJob(job.id)).cards.find(item=>item.identity==='1001');
+  assert.equal(card.verificationResult,'passed');
+  assert.ok(['ready','resolved'].includes(card.status));
 });
 
 test('关闭人工验证窗口后卡片立即恢复为可再次验证', async () => {
@@ -537,14 +1010,106 @@ test('关闭人工验证窗口后卡片立即恢复为可再次验证', async ()
     isVerificationResolved: async () => false
   });
   await runner.run(job.id);
-  runner.workflow.requestManual(job.id, '1001');
+  const opening = runner.workflow.requestManual(job.id, '1001');
+  const rejectedOpening = assert.rejects(opening, /关闭/);
   await until(() => runner.workflow.session?.wake);
   closeWindow();
   await until(() => !runner.workflow.session);
+  await rejectedOpening;
   const view = runner.workflow.status(getJob(job.id));
   assert.equal(view.cards[0].status, 'pending');
   assert.equal(view.session, null);
   assert.match(view.cards[0].reason, /验证窗口已关闭/);
+});
+
+test('人工验证窗口打开后直接触发操作，不预扫验证码', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  let manual = false, actions = 0, challengeChecks = 0;
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    post: async (account, _topic, _content, options) => {
+      if (account.id === accounts[0].id && !manual) throw new VerificationError('需要验证');
+      actions += 1;
+      options.onSubmit();
+      return { state: 'succeeded', receiptId: '5359362629438888' };
+    },
+    openVerification: async () => ({ context: () => ({}), isClosed: () => false, once: () => {} }),
+    hasTaskChallenge: async () => { challengeChecks += 1; return false; },
+    closeManual: async () => {}
+  }, { scope: 'workbench', leases: new AccountLeases() });
+  await runner.run(job.id);
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  const actionsBefore = actions;
+  manual = true;
+  await runner.workflow.requestManual(job.id, card.identity, card.currentStepKey);
+  await until(() => !runner.workflow.session);
+  assert.equal(actions, actionsBefore + 1);
+  assert.equal(challengeChecks, 0, '打开窗口后必须先直接触发操作，不能预扫验证码');
+  assert.equal(getJob(job.id).metrics.success, 2);
+});
+
+test('人工验证中成功回执立即唤醒会话并标记验证通过', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  let manual = false, challenge = false;
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    post: async (account, _topic, _content, options) => {
+      if (account.id !== accounts[0].id) return { state: 'succeeded' };
+      if (!manual) throw new VerificationError('需要验证');
+      options.onSubmit();
+      challenge = true;
+      throw new VerificationError('点击后出现验证码');
+    },
+    openVerification: async () => ({ context: () => ({}), isClosed: () => false, once: () => {} }),
+    hasTaskChallenge: async () => challenge,
+    isVerificationResolved: async () => false,
+    closeManual: async () => {}
+  }, { scope: 'workbench', leases: new AccountLeases() });
+  await runner.run(job.id);
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  manual = true;
+  await runner.workflow.requestManual(job.id, card.identity, card.currentStepKey);
+  await until(() => runner.workflow.session?.challengeSeen);
+  const action = getStepAction(job.id, card.currentStepKey);
+  const started = Date.now();
+  runner.settlePostAction(action.id, {
+    state: 'succeeded', receiptId: '5363450649774999', receiptUrl: 'https://weibo.com/detail/5363450649774999',
+    successSource: 'api_receipt', attemptId: action.attempt_id,
+  });
+  await until(() => !runner.workflow.session, 1500);
+  assert.ok(Date.now() - started < 1500, '成功回执应立即结束等待');
+  const passed = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  assert.equal(passed.verificationResult, 'passed');
+  assert.ok(passed.verifiedAt);
+});
+
+test('验证完成后立即解除下一张卡禁用，浏览器在后台继续关闭', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  let manual = false, releaseClose;
+  const closeGate = new Promise(resolve => { releaseClose = resolve; });
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    post: async (account, _topic, _content, options) => {
+      if (account.id !== accounts[0].id) return { state: 'succeeded' };
+      if (!manual) throw new VerificationError('需要验证');
+      options.onSubmit();
+      return { state: 'succeeded', receiptId: '5363450649774888' };
+    },
+    openVerification: async () => ({ context: () => ({}), isClosed: () => false, once: () => {} }),
+    hasTaskChallenge: async () => false,
+    closeManual: async () => closeGate,
+  }, { scope: 'workbench', leases: new AccountLeases() });
+  await runner.run(job.id);
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  manual = true;
+  await runner.workflow.requestManual(job.id, card.identity, card.currentStepKey);
+  await until(() => !runner.workflow.session && Boolean(releaseClose), 3000);
+  const cleanup = runner.workflow.manualCleanupPromise;
+  assert.ok(cleanup, '浏览器关闭应在后台继续执行');
+  assert.equal(runner.workflow.status(getJob(job.id)).canContinue, false, '浏览器关闭期间只阻止继续运行，不阻止下一张验证卡');
+  releaseClose();
+  await cleanup;
+  assert.equal(runner.workflow.manualCleanupPromise, null);
 });
 
 test('真实管理器和适配器的身份检查、复核、签到全程复用人工验证上下文', async () => {
@@ -691,6 +1256,7 @@ test('补做签到前再次出现验证码时保持手动验证状态', async ()
     }
   });
   await runner.run(job.id);
+  db.prepare("UPDATE verification_cards SET source='manual_unconfirmed' WHERE job_id=? AND identity='1001'").run(job.id);
   runner.workflow.requestManual(job.id, '1001');
   await until(() => phases.length >= 3 && !runner.workflow.session, 15000);
   assert.equal(verifyCalls, 1, '第二次验证码解除前不能做签到核验');
@@ -704,13 +1270,14 @@ test('签到点击后仍待核对时保持窗口并按只读核验补记', async
   const { job } = fixture([{ type: 'checkin', count: 1 }]);
   let confirmed = false;
   const runner = new TaskRunner({ ensureIdentity: async () => ({}),
-    checkin: async () => ({ state: 'uncertain' }),
+    checkin: async (_account, _topic, { onSubmit }) => { onSubmit(); return { state: 'uncertain' }; },
     verifyCheckin: async () => ({ state: confirmed ? 'succeeded' : 'uncertain' }),
     openVerification: async () => ({ isClosed: () => false }),
     hasTaskChallenge: async () => false,
     isVerificationResolved: async () => true
   });
   await runner.run(job.id);
+  db.prepare("UPDATE verification_cards SET source='manual_unconfirmed' WHERE job_id=? AND identity='1001'").run(job.id);
   runner.workflow.requestManual(job.id, '1001');
   await until(() => getJob(job.id).cursor.manualVerification?.phase === 'signing_checkin');
   await new Promise(resolve => setTimeout(resolve, 2600));
@@ -736,7 +1303,7 @@ test('进入等待人工验证时只发一次「还有 N 个号待验证」', as
   setNotificationExecutor((cmd, args, options, callback) => { messages.push(args.at(-1)); callback(null); });
   const { job } = fixture([{ type: 'checkin', count: 1 }]);
   const runner = new TaskRunner({ ensureIdentity: async () => ({}),
-    checkin: async () => ({ state: 'uncertain' }),
+    checkin: async (_account, _topic, { onSubmit }) => { onSubmit(); return { state: 'uncertain' }; },
     verifyCheckin: async () => ({ state: 'uncertain' }),
     openVerification: async () => ({ isClosed: () => false }),
     hasTaskChallenge: async () => false,
@@ -803,13 +1370,14 @@ test('签到验证只阻塞签到，评论继续；继续运行只补签到', as
 test('结束验证能立即打断签到等待，不会卡住会话', async () => {
   const { job } = fixture([{ type: 'checkin', count: 1 }]);
   const runner = new TaskRunner({ ensureIdentity: async () => ({}),
-    checkin: async () => ({ state: 'uncertain' }),
+    checkin: async (_account, _topic, { onSubmit }) => { onSubmit(); return { state: 'uncertain' }; },
     verifyCheckin: async () => ({ state: 'uncertain' }),
     openVerification: async () => ({ isClosed: () => false }),
     hasTaskChallenge: async () => false,
     isVerificationResolved: async () => true
   });
   await runner.run(job.id);
+  db.prepare("UPDATE verification_cards SET source='manual_unconfirmed' WHERE job_id=? AND identity='1001'").run(job.id);
   runner.workflow.requestManual(job.id, '1001');
   await until(() => getJob(job.id).cursor.manualVerification?.phase === 'signing_checkin');
   const stopped = runner.workflow.endManual(job.id);
@@ -820,6 +1388,70 @@ test('结束验证能立即打断签到等待，不会卡住会话', async () =>
   assert.equal(card.checkinResult, 'pending');
   const action = db.prepare("SELECT state FROM action_logs WHERE job_id=? AND kind='checkin' AND account_id=(SELECT id FROM accounts WHERE uid='1001')").get(job.id);
   assert.equal(action.state, 'uncertain');
+});
+
+test('签到未触发时同一窗口最多触发两次，第二次成功后完成', async () => {
+  const { job, topics } = fixture([{ type: 'checkin', count: 1 }]);
+  let manual = false, opens = 0, attempts = 0, openedTopic = null;
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    checkin: async (_account, topic, { onSubmit }) => {
+      if (!manual) throw new VerificationError('签到需要验证');
+      attempts += 1;
+      if (attempts < 2) return { state: 'failed', reason: '签到按钮点击没有生效' };
+      onSubmit();
+      return { state: 'succeeded', url: topic.url };
+    },
+    verifyCheckin: async () => ({ state: 'uncertain' }),
+    openVerification: async (_account, topic) => {
+      opens += 1; openedTopic = topic;
+      return { context: () => ({}), isClosed: () => false, once: () => {} };
+    },
+    closeManual: async () => {},
+    hasTaskChallenge: async () => false
+  });
+  await runner.run(job.id);
+  manual = true;
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  await runner.workflow.requestManual(job.id, card.identity, card.currentStepKey);
+  await until(() => !runner.workflow.session);
+  assert.equal(opens, 1);
+  assert.equal(attempts, 2);
+  assert.equal(openedTopic.url, topics[0].url);
+  assert.notEqual(openedTopic.url, 'https://weibo.com/');
+  assert.equal(getStepAction(job.id, card.currentStepKey).state, 'succeeded');
+});
+
+test('工作台评论验证回到对应超话页重新找帖并评论', async () => {
+  const { job, topics } = fixture([{ type: 'comment', count: 1 }]);
+  let manual = false, opens = 0, forceTopic = false, selected = null, openedInfo = null;
+  const runner = new TaskRunner({
+    ...candidates(), ensureIdentity: async () => ({}),
+    collectCandidates: async () => [{ id: 'new-comment-target', url: 'https://weibo.com/900/new-comment-target', authorUid: '900', commentCount: 0 }],
+    inspectCandidate: async (_account, candidate) => candidate,
+    comment: async (_account, candidate, _text, options) => {
+      if (!manual) throw new VerificationError('评论需要验证');
+      selected = candidate;
+      options.onSubmit();
+      return { state: 'succeeded', url: candidate.url };
+    },
+    openVerification: async (_account, topic, action) => {
+      opens += 1; forceTopic = action.forceTopic === true; openedInfo = { topic: topic.url, actionUrl: action.url };
+      return { context: () => ({}), isClosed: () => false, once: () => {} };
+    },
+    closeManual: async () => {}, hasTaskChallenge: async () => false
+  });
+  await runner.run(job.id);
+  manual = true;
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  await runner.workflow.requestManual(job.id, card.identity, card.currentStepKey);
+  await until(() => !runner.workflow.session);
+  assert.equal(opens, 1);
+  assert.equal(forceTopic, true);
+  assert.equal(openedInfo.topic, topics[0].url);
+  assert.equal(selected.id, 'new-comment-target');
+  assert.equal(getStepAction(job.id, card.currentStepKey).target_id, 'new-comment-target');
+  assert.equal(getStepAction(job.id, card.currentStepKey).state, 'succeeded');
 });
 test('已提交待核对的签到在验证通过后补点一次并收尾', async () => {
   const { job } = fixture([{ type: 'checkin', count: 1 }]);
@@ -832,6 +1464,7 @@ test('已提交待核对的签到在验证通过后补点一次并收尾', async
     isVerificationResolved: async () => resolved
   });
   await runner.run(job.id);
+  db.prepare("UPDATE verification_cards SET source='manual_unconfirmed' WHERE job_id=? AND identity='1001'").run(job.id);
   assert.equal(db.prepare("SELECT state FROM task_step_state WHERE job_id=? AND identity='1001'").get(job.id).state, 'review');
   assert.equal(runner.workflow.status(getJob(job.id)).cards.find(card => card.identity === '1001').status, 'pending');
   runner.workflow.requestManual(job.id, '1001');
@@ -891,7 +1524,9 @@ test('签到连续两次真实验证码解除各补点一次；重新检测/轮�
     },verifyCheckin:async()=>({state:checked?'succeeded':'uncertain'}),
     openVerification:async()=>({isClosed:()=>false}),hasTaskChallenge:async()=>challenge,isVerificationResolved:async()=>!challenge
   },{scope:'workbench',leases:new AccountLeases(),now:()=>clock});
-  await runner.run(job.id);manual=true;
+  await runner.run(job.id);
+  db.prepare("UPDATE verification_cards SET source='manual_unconfirmed' WHERE job_id=? AND identity='1001'").run(job.id);
+  manual=true;
   try {
     runner.workflow.requestManual(job.id,'1001');await until(()=>clicks===1&&runner.workflow.session?.wake);
     assert.equal(getJob(job.id).cursor.manualVerification.phase,'challenge');
@@ -901,25 +1536,29 @@ test('签到连续两次真实验证码解除各补点一次；重新检测/轮�
     runner.workflow.session?.wake?.();await until(()=>runner.workflow.session?.wake);
     assert.equal(clicks,2,'没有新验证码，不可第三次点击');
     await runner.workflow.endManual(job.id);
-    runner.workflow.requestManual(job.id,'1001');await until(()=>runner.workflow.session?.wake);assert.equal(clicks,2,'重开仍然只读');
+    runner.workflow.requestManual(job.id,'1001');await until(()=>runner.workflow.session?.wake);assert.equal(clicks,3,'再次验证允许重新触发一次签到');
     checked=true;runner.workflow.session.wake();await until(()=>!runner.workflow.session);
-    assert.equal(clicks,2);assert.equal(getJob(job.id).metrics.success,2);
+    assert.equal(clicks,3);assert.equal(getJob(job.id).metrics.success,2);
   } finally {await runner.workflow.endManual(job.id);}
 });
 
-test('验证码解除不能把已提交未知的评论/发帖当作未发布自动重发', async () => {
+test('评论和发帖验证卡首次点击都会重新触发当前操作', async () => {
   for(const kind of ['comment','post']) {
     clearAllDataForTests();setSetting('task_defaults',defaultTaskConfig);
-    const {accounts,job}=fixture([{type:kind,count:1}]);let clicks=0,reads=0;
+    const {accounts,job}=fixture([{type:kind,count:1}]);let clicks=0,reads=0;const order=[];
     const runner=new TaskRunner({...candidates(),ensureIdentity:async()=>({}),
       [kind]:async(account,_target,_text,options)=>{options.onSubmit();clicks++;if(account.id===accounts[0].id)throw new VerificationError('提交后验证码，结果未知');return{state:'succeeded'};},
-      openVerification:async()=>({isClosed:()=>false}),hasTaskChallenge:async()=>false,
-      verifyComment:async()=>{reads++;return{state:'uncertain'};},verifyPost:async()=>{reads++;return{state:'uncertain'};}
+      openVerification:async()=>{order.push('open');return{isClosed:()=>false};},hasTaskChallenge:async()=>false,
+      verifyComment:async()=>{order.push('verify');reads++;return{state:'uncertain'};},verifyPost:async()=>{order.push('verify');reads++;return{state:'uncertain'};}
     });
-    await runner.run(job.id);runner.workflow.requestManual(job.id,'1001');await until(()=>!runner.workflow.session);
-    assert.equal(clicks,2);
-    assert.equal(reads,0,'可见验证窗口内不得导航到超话页做只读复核');
-    runner.workflow.continue(job.id);await until(()=>getJob(job.id).status==='completed'); await runner.promise;assert.equal(clicks,2);
+    await runner.run(job.id);
+    runner.workflow.waitForManualSubmission = async () => {};
+    await runner.workflow.requestManual(job.id,'1001');await until(()=>!runner.workflow.session);
+    assert.ok(clicks>=2,'首次验证必须实际触发当前操作');
+    const clicksAfterVerification=clicks;
+    assert.equal(order[0],'open','必须先打开验证窗口再执行操作');
+    assert.equal(runner.workflow.status(getJob(job.id)).cards[0].source,'manual_unconfirmed');
+    runner.workflow.continue(job.id);await until(()=>getJob(job.id).status==='waiting');assert.equal(clicks,clicksAfterVerification);
     assert.equal(runner.workflow.rows(job.id,0).find(r=>r.identity==='1001').outcome,'uncertain');
   }
 });
@@ -1039,7 +1678,7 @@ for (const kind of ['post', 'comment']) test('工作台浏览器验证契约：'
     const page = runner.workflow.session.page;
     assert.equal(runner.workflow.status(getJob(job.id)).canContinue, false);
     await page.getByRole('button',{name:'模拟通过'}).click();
-    await until(() => !runner.workflow.session, 15000);
+    await until(() => !runner.workflow.session && !runner.workflow.manualCleanupPromise, 15000);
     const after = getStepAction(job.id, card.currentStepKey);
     assert.equal(after.state, 'succeeded');
     assert.equal(after.content, before.content);
@@ -1055,7 +1694,64 @@ for (const kind of ['post', 'comment']) test('工作台浏览器验证契约：'
   } finally { await runner.workflow.endManual(job.id); await manager.close(); }
 });
 
-test('发帖超话搜索忽略旧响应并只提交一次', async () => {
+test('原创直接填写主页输入框并在按钮启用后提交一次', async () => {
+  const account = updateAccountAuth(createAccount('原创账号').id, { status: 'valid', uid: '2407', nickname: '原创账号' });
+  const profile = fs.mkdtempSync(path.join(data, 'original-home-'));
+  let sends = 0, sentText = '', sentDisabled = false;
+  const manager = new BrowserManager(async ({ options }) => {
+    const context = await chromium.launchPersistentContext(profile, { ...options, headless: true });
+    await context.route('**/*', route => {
+      const url = new URL(route.request().url());
+      if (url.hostname !== 'weibo.com') return route.abort();
+      if (url.pathname === '/ajax/statuses/update') {
+        sends += 1;
+        sentText = route.request().postDataJSON().status;
+        sentDisabled = context.pages()[0]?.evaluate?.(() => document.querySelector('button')?.disabled).catch(() => false);
+        return route.fulfill({ json: { ok: 1, data: { idstr: '5359362629436020' } } });
+      }
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `
+        <script>window.$CONFIG={uid:'2407',user:{screen_name:'fixture'}};</script>
+        <div id="homeWrap" class="_wrap"><div class="publish">
+          <textarea placeholder="有什么新鲜事想分享给大家？" oninput="document.querySelector('#send').disabled=!this.value.trim()"></textarea>
+          <button id="send" disabled onclick="fetch('/ajax/statuses/update',{method:'POST',body:JSON.stringify({status:document.querySelector('textarea').value})})">发送</button>
+        </div></div>` });
+    });
+    return context;
+  }, { headless: true, activate: async () => {} });
+  try {
+    let submitted = 0;
+    const result = await new WeiboAdapter(manager).originalPost(account, '原创正文',
+      { onSubmit: () => { submitted += 1; } });
+    assert.equal(result.state, 'succeeded');
+    assert.equal(submitted, 1);
+    assert.equal(sends, 1);
+    assert.equal(sentText, '原创正文');
+  } finally { await manager.close(); }
+});
+
+test('主页已有其他原创草稿时保留原内容且不发送', async () => {
+  const account = updateAccountAuth(createAccount('原创草稿账号').id, { status: 'valid', uid: '2408', nickname: '原创草稿账号' });
+  const profile = fs.mkdtempSync(path.join(data, 'original-draft-'));
+  let sends = 0;
+  const manager = new BrowserManager(async ({ options }) => {
+    const context = await chromium.launchPersistentContext(profile, { ...options, headless: true });
+    await context.route('**/*', route => {
+      const url = new URL(route.request().url());
+      if (url.hostname !== 'weibo.com') return route.abort();
+      if (url.pathname === '/ajax/statuses/update') { sends += 1; return route.fulfill({ json: { ok: 1 } }); }
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `
+        <script>window.$CONFIG={uid:'2408',user:{screen_name:'fixture'}};</script>
+        <div id="homeWrap"><textarea placeholder="有什么新鲜事想分享给大家？">旧草稿</textarea><button disabled>发送</button></div>` });
+    });
+    return context;
+  }, { headless: true, activate: async () => {} });
+  try {
+    await assert.rejects(new WeiboAdapter(manager).originalPost(account, '新原创正文'), /保留原内容/);
+    assert.equal(sends, 0);
+  } finally { await manager.close(); }
+});
+
+test('发帖超话搜索忽略旧响应，按page_id对应显示别名卡片并只提交一次', async () => {
   const account = updateAccountAuth(createAccount('超话搜索账号').id, { status: 'valid', uid: '2201', nickname: '超话搜索账号' });
   const topic = createTopic({ name: '测试超话', url: 'https://weibo.com/p/100808fixture' });
   const profile = fs.mkdtempSync(path.join(data, 'topic-search-'));
@@ -1079,7 +1775,7 @@ test('发帖超话搜索忽略旧响应并只提交一次', async () => {
         <div class="woo-modal-wrap"><button>选择超话</button>
           <input placeholder="搜索超话" oninput="fetch('/ajax/stopic/list')">
           <div class="_h3_fixture" onclick="document.querySelector('textarea').value='测试[超话]'">测试</div>
-          <textarea placeholder="掐指一算，此贴必火"></textarea><label><input type="checkbox">同步到微博</label>
+          <textarea placeholder="掐指一算，此贴必火">测试[超话]</textarea><label><input type="checkbox">同步到微博</label>
           <button onclick="fetch('/ajax/statuses/update',{method:'POST',body:JSON.stringify({status:document.querySelector('textarea').value,page_id:'100808fixture'})})">发送</button>
         </div>` });
     });
@@ -1096,7 +1792,46 @@ test('发帖超话搜索忽略旧响应并只提交一次', async () => {
   } finally { await manager.close(); }
 });
 
-test('发帖准备最多尝试三次，同名结果无法唯一识别时绝不点击发送', async () => {
+test('精确目标标题唯一时不被带超话后缀的另一条接口结果误判为歧义', async () => {
+  const account = updateAccountAuth(createAccount('精确标题账号').id, { status: 'valid', uid: '2207', nickname: '精确标题账号' });
+  const topic = createTopic({ name: '苏新皓', url: 'https://weibo.com/p/100808fixture' });
+  const profile = fs.mkdtempSync(path.join(data, 'topic-exact-title-suffix-'));
+  let sends = 0, sentText = '';
+  const items = Array.from({ length: 20 }, (_, index) => ({ title: `其他超话${index}`, page_id: `100808other${index}` }));
+  items[0] = { title: '苏新皓', page_id: '100808fixture' };
+  items[17] = { title: '苏新皓超话', page_id: '100808other17' };
+  const manager = new BrowserManager(async ({ options }) => {
+    const context = await chromium.launchPersistentContext(profile, { ...options, headless: true });
+    await context.route('**/*', route => {
+      const url = new URL(route.request().url());
+      if (url.hostname !== 'weibo.com') return route.abort();
+      if (url.pathname === '/ajax/stopic/list') return route.fulfill({ json: { data: items } });
+      if (url.pathname === '/ajax/statuses/update') {
+        sends += 1; sentText = route.request().postDataJSON().status;
+        return route.fulfill({ json: { ok: 1, data: { idstr: '5359362629436010' } } });
+      }
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `
+        <script>window.$CONFIG={uid:'2207',user:{screen_name:'fixture'}};</script>
+        <button>更多</button><button>超话</button>
+        <div class="woo-modal-wrap"><button>选择超话</button><input placeholder="搜索超话" oninput="fetch('/ajax/stopic/list')">
+          <div class="_h3_fixture" onclick="document.querySelector('textarea').value='苏新皓[超话]'">苏新皓</div>
+          <div class="_h3_fixture">苏新皓周边中转站</div><div class="_h3_fixture">信号满格苏新皓</div>
+          <div class="_h3_fixture">全能ACE苏新皓</div><div class="_h3_fixture">苏新皓帅帅</div>
+          <textarea placeholder="掐指一算，此贴必火"></textarea><label><input type="checkbox">同步到微博</label>
+          <button onclick="fetch('/ajax/statuses/update',{method:'POST',body:JSON.stringify({status:document.querySelector('textarea').value,page_id:'100808fixture'})})">发送</button>
+        </div>` });
+    });
+    return context;
+  }, { headless: true, activate: async () => {} });
+  try {
+    const result = await new WeiboAdapter(manager).post(account, topic, '精确标题测试正文');
+    assert.equal(result.state, 'succeeded');
+    assert.equal(sends, 1);
+    assert.equal(sentText, '苏新皓[超话]精确标题测试正文');
+  } finally { await manager.close(); }
+});
+
+test('发帖准备遇到重复同名卡片无法唯一对应时不发送且不重复打开弹层', async () => {
   const account = updateAccountAuth(createAccount('超话歧义账号').id, { status: 'valid', uid: '2203', nickname: '超话歧义账号' });
   const topic = createTopic({ name: '测试超话', url: 'https://weibo.com/p/100808fixture' });
   const profile = fs.mkdtempSync(path.join(data, 'topic-ambiguous-'));
@@ -1216,16 +1951,16 @@ test('人工验证后发帖准备失败保留可重试卡，不重复提交且�
     await runner.run(job.id);
     let card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === account.uid);
     mode = 'manual_fail';
-    runner.workflow.requestManual(job.id, account.uid, card.currentStepKey);
+    await assert.rejects(runner.workflow.requestManual(job.id, account.uid, card.currentStepKey), /已尝试 1\/1 次/);
     await until(() => opens === 1 && !runner.workflow.session, 10000);
     card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === account.uid);
     assert.equal(card.verificationResult, 'pending');
     assert.equal(card.currentActionable, true);
-    assert.match(card.reason, /发帖未发送.*验证尚未完成/);
+    assert.match(card.reason, /已尝试 1\/1 次/);
     assert.equal(submits, 0);
     assert.equal(getJob(job.id).metrics.failed, 0);
     const row = db.prepare('SELECT state FROM task_step_state WHERE job_id=? AND step_key=?').get(job.id, card.currentStepKey);
-    assert.equal(row.state, 'deferred');
+    assert.equal(row.state, 'review');
     mode = 'manual_success';
     runner.workflow.requestManual(job.id, account.uid, card.currentStepKey);
     await until(() => opens === 2 && !runner.workflow.session, 10000);
@@ -1235,7 +1970,7 @@ test('人工验证后发帖准备失败保留可重试卡，不重复提交且�
   } finally { await runner.workflow.endManual(job.id); }
 });
 
-test('已提交发帖的人工验证复用持久提交状态，不在可见窗口重发或跳转只读核对', async () => {
+test('已提交未知发帖首次点击直接打开窗口并重新发帖', async () => {
   const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
   const account = accounts[0];
   let writes = 0, opens = 0, rechecks = 0;
@@ -1244,7 +1979,9 @@ test('已提交发帖的人工验证复用持久提交状态，不在可见窗�
     browserManager: { closeRunner: async () => {} },
     post: async (_account, _topic, _content, options) => {
       writes += 1;
-      throw new VerificationError('需要验证');
+      options.onSubmit();
+      if (writes === 1) throw new VerificationError('需要验证');
+      return { state: 'succeeded', receiptId: '5359362629439998', receiptUrl: 'https://weibo.com/detail/5359362629439998' };
     },
     openVerification: async () => { opens += 1; return { context: () => ({}), isClosed: () => false, once: () => {} }; },
     closeManual: async () => {},
@@ -1254,14 +1991,62 @@ test('已提交发帖的人工验证复用持久提交状态，不在可见窗�
   const writesBeforeManual = writes;
   const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === account.uid);
   const action = db.prepare('SELECT * FROM action_logs WHERE job_id=? AND step_key=?').get(job.id, card.currentStepKey);
-  db.prepare('UPDATE action_logs SET submitted_at=? WHERE id=?').run(new Date().toISOString(), action.id);
-  const originalRecheck = runner.workflow.recheckRow.bind(runner.workflow);
-  runner.workflow.recheckRow = async (...args) => { rechecks += 1; return originalRecheck(...args); };
-  runner.workflow.waitForManualSubmission = async () => {};
-  runner.workflow.requestManual(job.id, account.uid, card.currentStepKey);
-  await until(() => opens === 1 && !runner.workflow.session, 10000);
-  assert.equal(writes, writesBeforeManual, '人工验证不得重发已提交的发帖');
-  assert.equal(rechecks, 0, '发帖人工窗口内不得触发会导航到超话页的只读扫描');
+  db.prepare("UPDATE action_logs SET state='uncertain',submitted_at=? WHERE id=?").run(new Date().toISOString(), action.id);
+  runner.workflow.recheckRow = async () => { rechecks += 1; return { state: 'uncertain' }; };
+  await runner.workflow.requestManual(job.id, account.uid, card.currentStepKey);
+  await until(() => !runner.workflow.session, 10000);
+  assert.equal(writes, writesBeforeManual + 1, '第一次点击必须重新发帖');
+  assert.equal(opens, 1, '第一次点击必须打开验证窗口');
+  assert.equal(rechecks, 0, '首次验证不得先做只读复核');
+  const passed = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === account.uid);
+  assert.equal(passed.verificationResult, 'passed');
+});
+
+test('人工验证后晚到的发帖成功回执直接把验证卡标记通过', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}),
+    post: async account => { if (account.id === accounts[0].id) throw new VerificationError('需要验证'); return { state: 'succeeded' }; },
+    openVerification: async () => ({ context: () => ({}), isClosed: () => false, once: () => {} }),
+    hasTaskChallenge: async () => false,
+    closeManual: async () => {}
+  }, { scope: 'workbench', leases: new AccountLeases() });
+  await runner.run(job.id);
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  const action = getStepAction(job.id, card.currentStepKey);
+  runner.settlePostAction(action.id, {
+    state: 'succeeded', receiptId: '5363450649774055', receiptUrl: 'https://weibo.com/detail/5363450649774055',
+    successSource: 'api_receipt', attemptId: action.attempt_id,
+  });
+  const passed = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
+  assert.equal(passed.verificationResult, 'passed');
+  assert.ok(passed.verifiedAt);
+  assert.equal(passed.status, 'ready');
+  assert.match(passed.reason, /发帖已完成/);
+});
+
+test('验证卡首次点击打开窗口失败时保持待验证并允许重试', async () => {
+  const { accounts, job } = fixture([{ type: 'post', count: 1 }]);
+  let writes = 0, openAttempts = 0;
+  const runner = new TaskRunner({
+    ensureIdentity: async item => ({ uid: item.uid, status: 'valid' }),
+    browserManager: { closeRunner: async () => {} },
+    post: async () => { writes += 1; throw new VerificationError('需要验证'); },
+    openVerification: async () => { openAttempts += 1; throw new Error('验证窗口打开失败'); },
+    closeManual: async () => {}, hasTaskChallenge: async () => false
+  }, { scope: 'workbench', leases: new AccountLeases() });
+  await runner.run(job.id);
+  const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === accounts[0].uid);
+  db.prepare("UPDATE action_logs SET state='uncertain',submitted_at=? WHERE job_id=? AND step_key=?")
+    .run(new Date().toISOString(), job.id, card.currentStepKey);
+  const before = writes;
+  await assert.rejects(runner.workflow.requestManual(job.id, card.identity, card.currentStepKey), /验证窗口打开失败/);
+  await until(() => !runner.workflow.session, 10000);
+  assert.equal(openAttempts, 1);
+  assert.equal(writes, before, '窗口未打开时不得执行发帖');
+  const pending = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === accounts[0].uid);
+  assert.equal(pending.verificationResult, 'pending');
+  assert.equal(pending.canOpen, true);
 });
 
 test('历史“已验证但发帖未发送”卡片自动恢复为安全重试且幂等', async () => {

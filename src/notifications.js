@@ -45,7 +45,8 @@ export async function notifyRound(report, execute = executor) {
   if (notificationsDisabled()) return false;
   if (!claimRoundNotification(report.jobId, report.round)) return false;
   const counts = report.counts;
-  const message = '第 ' + (report.round + 1) + ' 轮完成：签到 ' + counts.checkin.succeeded + '，发帖 ' + counts.post.succeeded + '，评论 ' + counts.comment.succeeded + '；异常账号 ' + report.abnormalAccounts.length + ' 个。详情请查看工作台。';
+  const message = '第 ' + (report.round + 1) + ' 轮完成：签到 ' + (counts.checkin?.succeeded || 0) + '，发帖 ' + (counts.post?.succeeded || 0)
+    + '，原创 ' + (counts.original?.succeeded || 0) + '，评论 ' + (counts.comment?.succeeded || 0) + '；异常账号 ' + report.abnormalAccounts.length + ' 个。详情请查看工作台。';
   return deliver('制饼工坊 · 本轮已完成', message, execute);
 }
 

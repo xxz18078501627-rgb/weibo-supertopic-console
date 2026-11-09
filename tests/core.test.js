@@ -16,12 +16,12 @@ const dbModule = await import('../src/db.js');
 const runnerModule = await import('../src/runner.js');
 
 const {
-  addCommentMaterials, addPostMaterials, clearAccountRestrictions, clearAccountRestrictionsFromOpenJobs, clearAllDataForTests, createAccount, createActionLog, createJob, createMaterialGroup, migrateRefreshDefaults,
+  addCommentMaterials, addOriginalMaterials, addPostMaterials, clearAccountRestrictions, clearAccountRestrictionsFromOpenJobs, clearAllDataForTests, createAccount, createActionLog, createJob, createMaterialGroup, migrateRefreshDefaults,
   createTopic, getActionLog, getJob, hasCommented, listActionLogs, pickCommentMaterial, recordAccountRestriction, listActiveAccountRestrictions, seedAccountRestrictionsFromJobs, updateAccountAuth, updateActionLog
 } = dbModule;
 const { buildSteps, createSnapshot, TaskRunner, validateSnapshot } = runnerModule;
 const { decorateText } = runnerModule;
-const { db, getAccount, getSetting, setSetting, nextSequence, listAccounts, listTopics, listPostMaterials, recordComment } = dbModule;
+const { db, getAccount, getSetting, setSetting, nextSequence, listAccounts, listTopics, listOriginalMaterials, listPostMaterials, recordComment } = dbModule;
 const { migrateSharedMaterials } = await import('../src/migrations.js');
 const { normalizeTaskSettings, DEFAULT_EMOJIS } = await import('../public/defaults.js');
 const { LoginService } = await import('../src/login-service.js');
@@ -37,8 +37,11 @@ const { BODY_READ_TIMEOUT_MS, IdentityMismatchError, RateLimitError, Unsupported
 test('发帖验证卡和身份确认直接从主页打开，其他操作保留目标页', () => {
   const topic = { url: 'https://weibo.com/p/100808topic' };
   assert.equal(verificationPageUrl({ kind: 'post' }, topic), 'https://weibo.com/');
-  assert.equal(verificationPageUrl({ kind: 'post', url: 'https://weibo.com/77/abc' }, topic), 'https://weibo.com/77/abc');
+  assert.equal(verificationPageUrl({ kind: 'post', url: 'https://weibo.com/77/abc' }, topic), 'https://weibo.com/');
+  assert.equal(verificationPageUrl({ kind: 'original', url: 'https://weibo.com/77/stale' }, null), 'https://weibo.com/');
   assert.equal(verificationPageUrl({ kind: 'checkin' }, topic), topic.url);
+  assert.equal(verificationPageUrl({ kind: 'comment', forceTopic: true,
+    url: 'https://weibo.com/77/stale-target' }, topic), topic.url);
 });
 
 test.beforeEach(() => { clearAllDataForTests(); db.exec('DELETE FROM account_groups'); setSetting('task_defaults', defaultTaskConfig); setSetting('task_templates', []); });
@@ -138,6 +141,43 @@ test('可见验收窗口只首次前置且不最小化，普通任务仍无头',
   assert.equal(front, 1); assert.equal(minimized, 0); await visible.close();
   const normal = new BrowserManager(async ({ options }) => { calls.push(options); return context; }, { headless: true });
   await normal.page(account); assert.equal(calls[1].headless, true); await normal.close();
+});
+
+test('人工验证使用可视最大化窗口，并通过页面CDP激活持久化Chrome进程', async () => {
+  const account = createAccount('可视验证');
+  let manualOptions; let activated = null; let windowState = null;
+  let sessionCount = 0;
+  const session = {
+    send: async command => {
+      if (command === 'SystemInfo.getProcessInfo') return { processInfo: [{ type: 'browser', id: 4242 }] };
+      if (command === 'Browser.getWindowForTarget') return { windowId: 7 };
+      if (command === 'Browser.setWindowBounds') return {};
+      return {};
+    },
+    detach: async () => {},
+  };
+  const page = {
+    bringToFront: async () => {},
+    context: () => context,
+    isClosed: () => false,
+  };
+  const context = {
+    pages: () => [page], on() {}, close: async () => {},
+    browser: () => null,
+    newCDPSession: async () => { sessionCount += 1; return session; },
+  };
+  const manager = new BrowserManager(async ({ options }) => { manualOptions = options; return context; }, {
+    headless: true, activate: async pid => { activated = pid; return true; },
+  });
+  await manager.page(account, 'manual');
+  assert.equal(manualOptions.headless, false);
+  assert.ok(manualOptions.args.includes('--start-maximized'));
+  manager.setWindowState = async (_page, state) => { windowState = state; return true; };
+  await manager.foreground(page, { windowState: 'maximized' });
+  assert.equal(windowState, 'maximized');
+  assert.equal(activated, 4242);
+  assert.ok(sessionCount >= 1, '浏览器级CDP不可用时应回退到页面CDP');
+  await manager.close();
 });
 test.after(async () => {
   await new Promise(resolve => setTimeout(resolve, 300));
@@ -432,11 +472,12 @@ test('每日成功统计不受500条限制，签到同UID去重，待核对复�
   recordCheckin(account.id, topic.id, date); recordCheckin(duplicate.id, topic.id, date);
   for (let i = 0; i < 505; i++) createActionLog({ jobId: job.id, stepKey: `post-${i}`, kind: 'post', state: 'succeeded', accountId: account.id, topicId: topic.id });
   const actionId = createActionLog({ jobId: job.id, stepKey: 'comment', kind: 'comment', state: 'uncertain', accountId: account.id, topicId: topic.id });
-  assert.deepEqual(dailySuccess(), { date, checkin: 1, post: 505, comment: 0 });
+  assert.deepEqual(dailySuccess(), { date, checkin: 1, post: 505, original: 0, comment: 0 });
   updateActionLog(actionId, { state: 'succeeded' });
   assert.equal(dailySuccess().comment, 1);
-  db.prepare('UPDATE action_logs SET completed_at=? WHERE id=?').run('2026-10-28T16:01:00.000Z', actionId);
-  assert.equal(dailySuccess('2026-10-29').comment, 1);
+  const priorDate = shanghaiDate(new Date(Date.now() - 86400000));
+  db.prepare('UPDATE action_logs SET completed_at=? WHERE id=?').run(new Date(`${priorDate}T00:01:00+08:00`).toISOString(), actionId);
+  assert.equal(dailySuccess(priorDate).comment, 1);
 });
 
 test('每轮报告保存墙钟耗时、异常详情、确认状态和系统通知去重', async t => {
@@ -936,6 +977,37 @@ test('所有账号共享发帖库且快照不受后续编辑影响', () => {
   assert.equal(listPostMaterials().length, 3);
 });
 
+test('原创完全脱离超话调度，按账号和次数展开并允许不选超话', () => {
+  const account = createAccount();
+  addOriginalMaterials(['原创甲', '原创乙']);
+  const snapshot = createSnapshot({ rounds: 1, accountIds: [account.id], topicIds: [],
+    actionPlan: [{ type: 'original', count: 3 }] }, listAccounts(), listTopics());
+  assert.deepEqual(snapshot.topicIds, []);
+  assert.equal(snapshot.materials.originals.length, 2);
+  assert.deepEqual(validateSnapshot(snapshot), []);
+  const steps = buildSteps(snapshot);
+  assert.equal(steps.length, 3);
+  assert.ok(steps.every(step => step.kind === 'original' && step.topicId === ''));
+  assert.deepEqual(new Set(steps.map(step => step.accountId)), new Set([account.id]));
+
+  const multiTopic = buildSteps({ rounds: 1, accountIds: [account.id], topicIds: ['t1', 't2'],
+    actionPlan: [{ type: 'original', count: 2 }], segmentIds: ['seg_o'] });
+  assert.equal(multiTopic.length, 2, '多超话不能重复执行原创');
+});
+
+test('原创文案与发帖文案及分组完全隔离', () => {
+  const postGroup = createMaterialGroup('发帖组', 'post');
+  const originalGroup = createMaterialGroup('原创组', 'original');
+  addPostMaterials(['发帖原文'], undefined, postGroup.id);
+  addOriginalMaterials(['原创原文甲', '原创原文乙'], originalGroup.id);
+  assert.equal(listPostMaterials().length, 1);
+  assert.equal(listOriginalMaterials().length, 2);
+  const snapshot = createSnapshot({ accountIds: [], topicIds: [], originalGroupIds: [originalGroup.id],
+    actionPlan: [{ type: 'original', count: 1 }] }, listAccounts(), listTopics());
+  assert.deepEqual(new Set(snapshot.materials.originals.map(item => item.text)), new Set(['原创原文甲', '原创原文乙']));
+  assert.deepEqual(snapshot.materials.posts.map(item => item.text), ['发帖原文']);
+});
+
 test('重复导入原文不能绕过相邻不重复，旧库重复 ID 也不能绕过', () => {
   addCommentMaterials(['甲', '乙', '甲']);
   const fake = { config: { materials: { comments: [{ id: 'a', text: '甲' }, { id: 'b', text: '甲' }, { id: 'c', text: '乙' }] } } };
@@ -1073,6 +1145,12 @@ test('发帖复核以发布回执、作者和正文超话标识为准，不依�
   assert.equal(postReadbackMatches({ ...post, text_raw: '早安朋友 🌟', topic_struct: [{ title: '苏新皓超话' }] }, {
     receiptId: '5358752586012447', uid: '1001', content: '早安朋友 🌟', topicName: '苏新皓超话'
   }), true);
+});
+
+test('原创回执只核对作者与正文，不要求超话标识', () => {
+  const post = { idstr: '5359362629436098', user: { idstr: '1001' }, text_raw: '原创正文' };
+  assert.equal(postReadbackMatches(post, { receiptId: '5359362629436098', uid: '1001', content: '原创正文', requireTopic: false }), true);
+  assert.equal(postReadbackMatches(post, { receiptId: '5359362629436098', uid: '1001', content: '原创正文', requireTopic: true }), false);
 });
 
 test('发帖短链仅按该微博明确映射还原，正文作者ID超话仍严格核验', () => {

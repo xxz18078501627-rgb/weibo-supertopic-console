@@ -8,8 +8,15 @@ import { startRound, runningRounds, finishRound } from './task-reports.js';
 import { notifyVerification, resetVerificationNotifications } from './notifications.js';
 import { resultMetrics, migrateVerificationPending } from './result-state.js';
 import { engageStepCoupling } from './engage.js';
+import { randomUUID } from 'node:crypto';
 
 const MANUAL_RECEIPT_TIMEOUT_MS = 30_000;
+const MANUAL_OPEN_TIMEOUT_MS = 30_000;
+const MANUAL_PAGE_SETTLE_MS = 100;
+const MANUAL_ACTION_ATTEMPTS = 1;
+const MANUAL_CHECKIN_ATTEMPTS = 2;
+const POST_LIKE_KINDS = new Set(['post', 'original']);
+const RETRIGGER_VERIFICATION_KINDS = new Set(['checkin', 'post', 'original', 'comment', 'repost', 'like', 'comment_like']);
 
 db.exec(`CREATE TABLE IF NOT EXISTS task_step_state (
   job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, step_key TEXT NOT NULL,
@@ -46,17 +53,191 @@ export class VerificationWorkflow {
     this.runner = runner;
     this.buildSteps = buildSteps;
     this.session = null;
+    this.manualCleanupPromise = null;
     this.normalizeUnsubmittedPostVerifications();
   }
 
   time() { return new Date(this.runner.now()).toISOString(); }
   enabled(job) { return Number(job?.config?.schedulerVersion || 0) >= 2; }
-  busy() { return Boolean(this.session || this.runner.current()?.cursor?.manualVerification); }
+  // A cursor is durable display state, not proof that a browser still exists.
+  // Treating an orphaned cursor as busy permanently blocked every later click
+  // after a failed open or a service restart.
+  busy() { return Boolean(this.session); }
+
+  deferred() {
+    let resolve, reject;
+    const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
+    return { promise, resolve, reject, settled: false };
+  }
+
+  openError(message, cause = null) {
+    const error = conflict(message);
+    error.code = 'verification_open_failed';
+    if (cause) error.cause = cause;
+    return error;
+  }
+
+  sameManualTarget(session, jobId, identity, selectedStepKey) {
+    return Boolean(session && session.jobId === jobId && session.identity === identity
+      && (!selectedStepKey || session.stepKey === selectedStepKey));
+  }
+
+  noteActionTriggered(jobId, key, { kind = null, targetId = null } = {}) {
+    const session = this.session;
+    if (!session || session.jobId !== jobId || session.stepKey !== key || session.cancelled) return false;
+    session.actionTriggeredAt = session.actionTriggeredAt || this.time();
+    session.triggeredTargetId = targetId || session.triggeredTargetId || null;
+    session.lastAttemptError = null;
+    const extra = { actionTriggeredAt: session.actionTriggeredAt, attempt: session.attempt || 1, lastAttemptError: null };
+    if (kind || session.kind) extra.kind = kind || session.kind;
+    this.manualPhase(session, 'action_triggered', extra);
+    if (!session.armed.settled) {
+      session.armed.settled = true;
+      session.armed.resolve({ actionTriggeredAt: session.actionTriggeredAt, targetId: session.triggeredTargetId });
+    }
+    return true;
+  }
+
+  noteActionSucceeded(jobId, key) {
+    const session = this.session;
+    if (!session || session.jobId !== jobId || session.stepKey !== key) return false;
+    session.submitted = true;
+    session.lastAttemptError = null;
+    clearTimeout(session.timer);
+    session.timer = null;
+    session.wake?.();
+    if (!session.success?.settled) {
+      session.success.settled = true;
+      session.success.resolve(true);
+    }
+    if (!session.armed?.settled) {
+      session.armed.settled = true;
+      session.armed.resolve({ actionSucceeded: true });
+    }
+    this.manualPhase(session, 'action_succeeded');
+    return true;
+  }
+
+  noteChallengeSeen(session) {
+    if (!session || this.session !== session || session.cancelled) return;
+    session.challengeSeenAt = session.challengeSeenAt || this.time();
+    if (!session.armed.settled) {
+      session.armed.settled = true;
+      session.armed.resolve({ challengeSeenAt: session.challengeSeenAt });
+    }
+    this.manualPhase(session, 'waiting_challenge', {
+      challengeSeenAt: session.challengeSeenAt,
+      attempt: session.attempt || 1
+    });
+  }
+
+  noteManualAttemptFailure(session, error) {
+    if (!session || this.session !== session) return;
+    session.lastAttemptError = error?.message || String(error || '当前动作未触发');
+    this.manualPhase(session, 'retryable', {
+      attempt: session.attempt || 0,
+      attemptStartedAt: session.attemptStartedAt || null,
+      lastAttemptError: session.lastAttemptError,
+      actionTriggeredAt: session.actionTriggeredAt || null
+    });
+  }
+
+  failManualArmed(session, error) {
+    if (session && !session.armed.settled) {
+      session.openFailed = true;
+      session.closeReason = error.message;
+      session.armed.settled = true;
+      session.armed.reject(this.openError(error.message, error));
+    }
+  }
+
+  async waitForManualOpen(session) {
+    const waitWithTimeout = (promise, message) => {
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(this.openError(message)), MANUAL_OPEN_TIMEOUT_MS);
+        timer.unref?.();
+      });
+      return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+    };
+    try {
+      await waitWithTimeout(session.open.promise, '验证窗口在 30 秒内未完成打开，已恢复，请重试');
+      // Page opening is only preflight. Wait until the challenged action is
+      // actually triggered, or a manual challenge is already visible.
+      // Window preparation can legitimately take longer than 30 seconds, so the
+      // trigger budget starts only after the window is visibly open.
+      await waitWithTimeout(session.armed.promise, '验证窗口已打开，但 30 秒内未完成当前动作，已恢复，请重试');
+      await new Promise(resolve => setTimeout(resolve, MANUAL_PAGE_SETTLE_MS));
+      if (!session.completedNormally && (session.windowClosed || session.page?.isClosed?.())) {
+        throw this.openError('验证窗口打开后立即关闭了，已恢复，请重试');
+      }
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  async cleanupManualSession(session, reason, { rejectOpen = false } = {}) {
+    if (!session) return;
+    if (session.cleanupPromise) return session.cleanupPromise;
+    session.cleanupPromise = (async () => {
+      const closeReason = reason || session.closeReason || (session.cancelled ? '用户结束验证' : '当前验证步骤已收尾');
+      session.closeReason = closeReason;
+      if (rejectOpen) { session.cancelled = true; clearTimeout(session.timer); session.wake?.(); }
+      if (rejectOpen && !session.open.settled) {
+        session.open.settled = true;
+        session.open.reject(this.openError(closeReason));
+      }
+      const closing = Promise.resolve(this.runner.adapter.closeManual?.(session.browserContext)).catch(() => {});
+      this.manualCleanupPromise = closing;
+      const release = session.release || this.manualRelease;
+      session.release = null;
+      if (this.manualRelease === release) this.manualRelease = null;
+      const job = getJob(session.jobId);
+      if (job && job.status !== 'stopped') {
+        if (session.cancelled || !session.opened || session.openFailed) {
+          const cardReason = session.openFailed ? closeReason : '验证会话已结束，请再次进入完成验证';
+          db.prepare("UPDATE verification_cards SET status='pending',verification_result='pending',verified_at=NULL,source='manual_unconfirmed',reason=?,updated_at=? WHERE job_id=? AND identity=? AND status IN ('requested','validating')")
+            .run(cardReason, this.time(), session.jobId, session.identity);
+        }
+        const current = getJob(session.jobId);
+        if (current?.cursor?.manualVerification?.requestId === session.requestId) {
+          const cursor = { ...current.cursor, manualVerification: null,
+            verificationAutoPaused: false, verificationPauseReason: null,
+            verificationBarrier: true };
+          const updated = current.pausedByUser
+            ? updateJob(session.jobId, { waitReason: '验证已结束，请点击继续运行', cursor })
+            : updateJob(session.jobId, { status: 'waiting', pausedByUser: false,
+                waitReason: '验证已结束，请点击继续运行', cursor });
+          this.runner.emitUpdate(updated);
+        }
+      }
+      // Keep the session visible until the visible window and persisted cursor
+      // are both cleaned. The browser process itself may take several more
+      // seconds to exit; do not keep every verification button disabled while
+      // that background close finishes.
+      if (this.session === session) this.session = null;
+      release?.();
+      await closing;
+      if (this.manualCleanupPromise === closing) this.manualCleanupPromise = null;
+      log('info', `人工验证窗口关闭：${closeReason}`, {
+        jobId: session.jobId, accountId: session.account?.id, topicId: session.topic?.id,
+        requestId: session.requestId
+      });
+      if (session.backgroundRecheck && getJob(session.jobId)?.status !== 'stopped') {
+        void this.recheckAfterManualClose(session.backgroundRecheck);
+      }
+      const latest = getJob(session.jobId);
+      if (latest) this.runner.emitUpdate(latest);
+    })().catch(error => {
+      log('warning', `清理人工验证会话失败：${error.message}`, { jobId: session.jobId, requestId: session.requestId });
+    });
+    return session.cleanupPromise;
+  }
 
   normalizeUnsubmittedPostVerifications() {
     const rows = db.prepare(`SELECT c.job_id,c.round_index,c.identity,a.id action_id
       FROM verification_cards c JOIN action_logs a ON a.job_id=c.job_id AND a.account_id=c.account_id
-        AND a.kind='post' AND a.step_key IN (
+        AND a.kind IN ('post','original') AND a.step_key IN (
           SELECT step_key FROM task_step_state WHERE job_id=c.job_id AND round_index=c.round_index
             AND identity=c.identity AND state IN ('deferred','running','review','network_review'))
       WHERE c.verification_result='passed'
@@ -66,8 +247,8 @@ export class VerificationWorkflow {
     db.exec('BEGIN IMMEDIATE');
     try {
       for (const row of rows) {
-        db.prepare("UPDATE action_logs SET state='verification_wait',error='发帖未发送，验证尚未完成，可重新处理当前发帖' WHERE id=?").run(row.action_id);
-        db.prepare("UPDATE verification_cards SET status='pending',verification_result='pending',verified_at=NULL,reason='发帖未发送，本次验证尚未完成；请重新处理当前发帖',updated_at=? WHERE job_id=? AND round_index=? AND identity=?")
+        db.prepare("UPDATE action_logs SET state='verification_wait',error='原创或发帖未发送，验证尚未完成，可重新处理当前操作' WHERE id=?").run(row.action_id);
+        db.prepare("UPDATE verification_cards SET status='pending',verification_result='pending',verified_at=NULL,reason='原创或发帖未发送，本次验证尚未完成；请重新处理当前操作',updated_at=? WHERE job_id=? AND round_index=? AND identity=?")
           .run(this.time(), row.job_id, row.round_index, row.identity);
       }
       db.exec('COMMIT');
@@ -106,7 +287,8 @@ export class VerificationWorkflow {
         const segmentId = row.segment_id || oldSegment(row.action_index);
         const proposed = engageSteps?.get(row.step_key);
         const group = engageSteps ? proposed && { type: proposed.kind, count: Infinity, index: proposed.actionIndex } : bySegment.get(segmentId);
-        const stillIncluded = group && group.type === row.kind && nextConfig.accountIds.includes(row.account_id) && (nextConfig.kind === 'engage' ? nextConfig.links : nextConfig.topicIds)?.includes(row.topic_id) && row.unit_index < (row.kind === 'checkin' ? Math.min(1, group.count) : group.count);
+        const topicIncluded = row.kind === 'original' || (nextConfig.kind === 'engage' ? nextConfig.links : nextConfig.topicIds)?.includes(row.topic_id);
+        const stillIncluded = group && group.type === row.kind && nextConfig.accountIds.includes(row.account_id) && topicIncluded && row.unit_index < (row.kind === 'checkin' ? Math.min(1, group.count) : group.count);
         if (stillIncluded) {
           const newKey = stepKey({ round: row.round_index, topicId: row.topic_id, accountId: row.account_id, actionIndex: group.index, segmentId, unitIndex: row.unit_index });
           if (row.step_key !== newKey) {
@@ -225,6 +407,40 @@ export class VerificationWorkflow {
     }
   }
 
+  markActionVerificationPassed(jobId, stepKeyValue) {
+    const row = db.prepare('SELECT * FROM task_step_state WHERE job_id=? AND step_key=?').get(jobId, stepKeyValue);
+    const action = getStepAction(jobId, stepKeyValue);
+    if (!row || !action || action.state !== 'succeeded') return false;
+    const card = this.card(jobId, row.round_index, row.identity);
+    if (!card || card.verification_result === 'passed') return false;
+    const otherPending = db.prepare(`SELECT COUNT(*) n FROM task_step_state s
+      JOIN action_logs a ON a.job_id=s.job_id AND a.step_key=s.step_key
+      WHERE s.job_id=? AND s.round_index=? AND s.identity=? AND s.step_key<>?
+        AND a.verification_pending=1 AND a.state NOT IN ('succeeded','failed','skipped','cancelled')`).get(jobId, row.round_index, row.identity, stepKeyValue).n;
+    if (otherPending) return false;
+    const remaining = db.prepare(`SELECT COUNT(*) n FROM task_step_state
+      WHERE job_id=? AND round_index=? AND identity=? AND state IN ('deferred','running','pending','review','network_review')`).get(jobId, row.round_index, row.identity).n;
+    db.prepare(`UPDATE verification_cards SET status=?,verification_result='passed',verified_at=COALESCE(verified_at,?),
+      source='action_receipt',reason=?,updated_at=? WHERE job_id=? AND round_index=? AND identity=?`).run(
+      remaining ? 'ready' : 'resolved', this.time(),
+      `${kindLabel(action.kind)}已完成${remaining ? '，其余操作请点击继续运行' : ''}`,
+      this.time(), jobId, row.round_index, row.identity
+    );
+    this.refreshCard(jobId, row.round_index, row.identity);
+    return true;
+  }
+
+  reconcileSucceededVerificationActions(jobId) {
+    const rows = db.prepare(`SELECT DISTINCT s.step_key FROM task_step_state s
+      JOIN action_logs a ON a.job_id=s.job_id AND a.step_key=s.step_key
+      JOIN verification_cards v ON v.job_id=s.job_id AND v.round_index=s.round_index AND v.identity=s.identity
+      WHERE s.job_id=? AND a.state='succeeded' AND v.verification_result<>'passed'`).all(jobId);
+    let changed = 0;
+    for (const row of rows) if (this.markActionVerificationPassed(jobId, row.step_key)) changed += 1;
+    if (changed) this.updateProgress(jobId, { emit: false });
+    return changed;
+  }
+
   finishStep(jobId, step, state, reason = null, { mirror = true } = {}) {
     let job = getJob(jobId); if (job.status === 'stopped') return;
     const row = this.row(jobId, step); if (!row) return;
@@ -233,7 +449,10 @@ export class VerificationWorkflow {
       return;
     }
     const action = getStepAction(jobId, stepKey(step));
-    if (['post','comment','repost','like','comment_like'].includes(step.kind) && action?.state === 'succeeded') { state = 'succeeded'; reason = null; }
+    if (state === 'succeeded' && this.session?.jobId === jobId && this.session.stepKey === stepKey(step)) {
+      this.noteActionTriggered(jobId, stepKey(step), { kind: step.kind, targetId: action?.target_id || null });
+    }
+    if (['post','original','comment','repost','like','comment_like'].includes(step.kind) && action?.state === 'succeeded') { state = 'succeeded'; reason = null; }
     if (!action) createActionLog({ jobId, stepKey: stepKey(step), kind: step.kind, accountId: step.accountId, topicId: step.topicId, state, error: reason });
     else if (action.state !== state || reason) updateActionLog(action.id, { state, error: reason || action.error || '' });
     const nextState = state === 'uncertain' && row.ever_verification ? 'review' : 'done';
@@ -256,7 +475,7 @@ export class VerificationWorkflow {
     try {
     const job = getJob(jobId), row = this.row(jobId, step);
     const action = getStepAction(jobId, stepKey(step));
-    if (['post','comment','repost','like','comment_like'].includes(step.kind) && action?.state === 'succeeded') {
+    if (['post','original','comment','repost','like','comment_like'].includes(step.kind) && action?.state === 'succeeded') {
       db.prepare("UPDATE task_step_state SET state='done',outcome='succeeded' WHERE job_id=? AND step_key=?").run(jobId, stepKey(step));
       this.runner.confirmSequence(jobId, step);
       this.refreshCard(jobId, step.round, row.identity);
@@ -275,8 +494,8 @@ export class VerificationWorkflow {
       this.runner.confirmSequence(jobId, step);
       db.prepare("UPDATE task_step_state SET state='review',outcome='uncertain' WHERE job_id=? AND step_key=?").run(jobId, stepKey(step));
     } else {
-      const preserve = this.runner.workbenchVerification(job) && ['post','comment'].includes(step.kind)
-        && action?.sequence_number != null && (step.kind === 'post' || action.submitted_at);
+      const preserve = this.runner.workbenchVerification(job) && ['post','original','comment'].includes(step.kind)
+        && action?.sequence_number != null && (POST_LIKE_KINDS.has(step.kind) || action.submitted_at);
       if (!preserve) this.runner.releaseSequence(jobId, step);
       else this.runner.confirmSequence(jobId, step);
       if (action) updateActionLog(action.id, { state: 'verification_wait', ...(preserve ? {} : { sequenceNumber: null, sequenceConfirmed: false }), submittedAt: null, error: error.message, verificationPending: true });
@@ -369,7 +588,7 @@ export class VerificationWorkflow {
 
   restriction(job, row) {
     const active = this.runner.restrictionFor?.(row.account_id, row.kind, row.identity);
-    const speaks = ['post', 'comment', 'repost'].includes(row.kind);
+    const speaks = ['post', 'original', 'comment', 'repost'].includes(row.kind);
     if (active) {
       if (active.type === 'mute') {
         if (speaks) return '账号禁言，暂停发帖/评论/转发：' + active.reason;
@@ -419,7 +638,7 @@ export class VerificationWorkflow {
   }
 
   async handleError(jobId, step, error, options = {}) {
-    if (['post','comment','repost','like','comment_like'].includes(step.kind) && getStepAction(jobId, stepKey(step))?.state === 'succeeded') {
+    if (['post','original','comment','repost','like','comment_like'].includes(step.kind) && getStepAction(jobId, stepKey(step))?.state === 'succeeded') {
       this.finishStep(jobId, step, 'succeeded'); return 'succeeded';
     }
     if (error instanceof DailyStopError || this.runner.isExpired(jobId)) { this.runner.enforceDailyStop(); this.finalizeStop(jobId, '每日 23:59 自动停止'); return; }
@@ -473,7 +692,7 @@ export class VerificationWorkflow {
         log('warning', `本轮${label}频繁，继续执行${kindLabel(step.kind)}：${error.message}`, { accountId: step.accountId, topicId: step.topicId, jobId });
         return 'retry';
       }
-      const outcome = submitted ? 'uncertain' : error.rejected ? 'skipped' : 'uncertain';
+      const outcome = error.rejected ? 'skipped' : submitted ? 'uncertain' : 'uncertain';
       this.finishStep(jobId, step, outcome, error.message);
       log('warning', `本轮${label}频繁，仅跳过后续${label}：${error.message}`, { accountId: step.accountId, topicId: step.topicId, jobId });
       return outcome;
@@ -497,7 +716,7 @@ export class VerificationWorkflow {
     const isEngage = job.config.kind === 'engage';
     const topic = isEngage ? { id: null, url: step.topicId, name: '指定微博' } : listTopics().find(item => item.id === step.topicId);
     const reason = this.restriction(job, row);
-    if (reason || !account || (!isEngage && !topic)) { this.finishStep(jobId, step, reason ? 'skipped' : 'failed', reason || (isEngage ? '账号或链接已不存在' : '账号或超话不存在')); return; }
+    if (reason || !account || (!isEngage && step.kind !== 'original' && !topic)) { this.finishStep(jobId, step, reason ? 'skipped' : 'failed', reason || (isEngage ? '账号或链接已不存在' : '账号或超话不存在')); return; }
     if (isEngage) this.disableRestrictedCoupling(jobId, row, step, job);
     db.prepare("UPDATE task_step_state SET state='running',attempts=attempts+1 WHERE job_id=? AND step_key=?").run(jobId, row.step_key);
     this.setCursor(jobId, { current: { ...step, accountName: account.name, topicName: topic?.name || (isEngage ? step.topicId : '') }, workflowActiveStep: step });
@@ -508,7 +727,9 @@ export class VerificationWorkflow {
         this.runner.assertMaySubmit(jobId);
         return this.runner.execute(getJob(jobId), step, account, topic, { reuseVisiblePage: manual && step.kind === 'checkin' });
       };
-      const result = await this.runner.withAccountLease(job, account, () => this.runner.withDailyDeadline(job, step, () => this.runner.adapter.withChallengeMode ? this.runner.adapter.withChallengeMode(manual ? 'manual' : 'background', operation) : operation()), {step,manual});
+      const result = await this.runner.withAccountLease(job, account, () => this.runner.withDailyDeadline(job, step, () => this.runner.adapter.withChallengeMode
+        ? this.runner.adapter.withChallengeMode(manual ? 'manual' : 'background', operation, { maximizeWindow: manual })
+        : operation()), {step,manual});
       if (this.runner.isExpired(jobId)) { this.runner.enforceDailyStop(); this.finalizeStop(jobId, '每日 23:59 自动停止'); return; }
       if (result?.waiting) {
         db.prepare("UPDATE task_step_state SET state=? WHERE job_id=? AND step_key=?").run(manual ? 'deferred' : 'pending', jobId, row.step_key);
@@ -540,7 +761,7 @@ export class VerificationWorkflow {
           jobId, accountId: row.account_id, topicId: row.topic_id });
         return 'postponed';
       }
-      if (['post','comment','repost','like','comment_like'].includes(step.kind) && getStepAction(jobId, row.step_key)?.state === 'succeeded' && getJob(jobId)?.status !== 'stopped') {
+      if (['post','original','comment','repost','like','comment_like'].includes(step.kind) && getStepAction(jobId, row.step_key)?.state === 'succeeded' && getJob(jobId)?.status !== 'stopped') {
         this.runner.confirmSequence(jobId, step);
         this.finishStep(jobId, step, 'succeeded');
         return 'succeeded';
@@ -556,7 +777,7 @@ export class VerificationWorkflow {
         if (manual) { await this.runner.network.wait(jobId, () => this.session?.cancelled || this.session?.windowClosed); return 'network'; }
         return 'network';
       }
-      if (manual && step.kind === 'post' && error instanceof UnsupportedPageError
+      if (manual && POST_LIKE_KINDS.has(step.kind) && error instanceof UnsupportedPageError
         && !getStepAction(jobId, row.step_key)?.submitted_at) {
         const action = getStepAction(jobId, row.step_key);
         const reason = `发帖未发送，本次验证尚未完成；可重新处理当前发帖：${error.message}`;
@@ -586,7 +807,10 @@ export class VerificationWorkflow {
       if (!job || ['stopped', 'completed'].includes(job.status)) return;
       if (job.stopRequested) { this.finalizeStop(jobId, '已手动停止'); return; }
       if (job.status === 'paused') return;
-      if (job.cursor.manualVerification?.phase === 'requested') { this.startManual(jobId, job.cursor.manualVerification.identity); return; }
+      if (job.cursor.manualVerification && !this.session) {
+        this.recoverOrphanedManual(job);
+        return;
+      }
       if (this.session || job.cursor.verificationBarrier) return;
       const round = Number(job.cursor.workflowRound || 0);
       if (round >= job.config.rounds) { resetVerificationNotifications(jobId); this.runner.emitUpdate(updateJob(jobId, { status: 'completed', waitReason: null })); return; }
@@ -672,12 +896,13 @@ export class VerificationWorkflow {
       job = updateJob(jobId, { status: 'running', waitReason: null });
       const outcome = await this.executeRow(jobId, row);
       await this.runner.finishEngageGroupIfNeeded(jobId, row, outcome);
+      await this.runner.maybeReleaseWorkbenchCommentSession?.(jobId, row, outcome);
       if (getJob(jobId).status === 'stopped') return;
       if (outcome && !['verification', 'waiting', 'postponed', 'skipped', 'network', 'navigation'].includes(outcome)) {
         const nextPending = this.rows(jobId, round).some(item => item.state === 'pending');
         const seconds = nextPending ? this.runner.intervalFor(job.config, stepFrom(row)) : 0;
         const submitted = this.runner.lastSubmitted;
-        const elapsed = row.kind === 'post' && submitted?.jobId === jobId && submitted.stepKey === row.step_key ? Math.max(0, this.runner.now() - submitted.at) : 0;
+        const elapsed = POST_LIKE_KINDS.has(row.kind) && submitted?.jobId === jobId && submitted.stepKey === row.step_key ? Math.max(0, this.runner.now() - submitted.at) : 0;
         if (seconds * 1000 > elapsed) await this.runner.interruptibleWait(jobId, seconds * 1000 - elapsed, '等待下一项操作');
       }
     }
@@ -714,16 +939,16 @@ export class VerificationWorkflow {
     const candidates = db.prepare(`SELECT s.identity, s.step_key, a.id, a.attempt_id, a.submitted_at
       FROM task_step_state s JOIN action_logs a ON a.job_id=s.job_id AND a.step_key=s.step_key
       JOIN verification_cards v ON v.job_id=s.job_id AND v.round_index=s.round_index AND v.identity=s.identity
-      WHERE s.job_id=? AND s.round_index=? AND s.kind='post' AND s.state='review' AND s.attempts=1
+      WHERE s.job_id=? AND s.round_index=? AND s.kind IN ('post','original') AND s.state='review' AND s.attempts=1
         AND a.state='uncertain' AND a.submitted_at IS NOT NULL AND a.attempt_id IS NOT NULL
         AND a.receipt_id IS NULL AND a.receipt_url IS NULL AND a.success_source IS NULL
         AND v.status IN ('pending','ready')`).all(jobId, round);
     if (!candidates.length) return 0;
     const byAttempt = new Map(candidates.map(row => [row.attempt_id, { row, events: [] }]));
     const since = candidates.map(row => row.submitted_at).sort()[0];
-    for (const entry of db.prepare("SELECT message,created_at FROM system_logs WHERE created_at>=? AND message LIKE '发帖回执：{%'").iterate(since)) {
+    for (const entry of db.prepare("SELECT message,created_at FROM system_logs WHERE created_at>=? AND (message LIKE '发帖回执：{%' OR message LIKE '原创回执：{%')").iterate(since)) {
       let event;
-      try { event = JSON.parse(entry.message.slice('发帖回执：'.length)); } catch { continue; }
+      try { event = JSON.parse(entry.message.slice(entry.message.indexOf('：') + 1)); } catch { continue; }
       const match = byAttempt.get(event?.attemptId);
       if (match && entry.created_at >= match.row.submitted_at) match.events.push(event);
     }
@@ -737,7 +962,8 @@ export class VerificationWorkflow {
           || event.code !== '20067' || event.kind !== 'verification' || event.message !== 'Response classified') continue;
         const reason = '已确认原发帖被安全验证拦截，请点击验证触发原动作';
         const card = this.card(jobId, round, row.identity);
-        const blocked = [...new Set([...JSON.parse(card.blocked_kinds_json), 'post'])];
+        const actionKind = getStepAction(jobId, row.step_key)?.kind || 'post';
+        const blocked = [...new Set([...JSON.parse(card.blocked_kinds_json), actionKind])];
         updateActionLog(row.id, { state: 'verification_wait', verificationPending: true, error: reason });
         db.prepare("UPDATE task_step_state SET state='deferred',outcome=NULL WHERE job_id=? AND step_key=?").run(jobId, row.step_key);
         db.prepare("UPDATE verification_cards SET status='pending',verification_result='pending',verified_at=NULL,blocked_kinds_json=?,reason=?,updated_at=? WHERE job_id=? AND round_index=? AND identity=?")
@@ -757,8 +983,10 @@ export class VerificationWorkflow {
   status(job) {
     job = this.recoverOrphanedManual(job);
     if (!this.enabled(job)) return null;
+    job = this.repairManualUnconfirmed(job);
     job = this.repairMisclassifiedManualPosts(job);
     job = this.repairTransientPostSetupFailures(job);
+    this.reconcileSucceededVerificationActions(job.id);
     const round = Math.min(Number(job.cursor.workflowRound || 0), Math.max(0, Number(job.config.rounds || 1) - 1));
     const cards = db.prepare('SELECT * FROM verification_cards WHERE job_id=? AND round_index=? ORDER BY triggered_at').all(job.id, round).map(card => {
       const account = job.config.accountIdentities?.[card.account_id] || getAccount(card.account_id) || {};
@@ -783,8 +1011,40 @@ export class VerificationWorkflow {
     });
     return { jobId: job.id, round, jobStatus: job.status, cards, session: job.cursor.manualVerification || null, barrier: Boolean(job.cursor.verificationBarrier),
       mainlineBusy: Boolean(this.runner.promise || this.runner.currentExecution),
-      canContinue: !['completed','stopped'].includes(job.status) && !this.runner.isExpired(job.id) && !this.runner.promise && job.cursor.networkRecovery?.state !== 'offline' && !this.session && !job.cursor.manualVerification,
+      canContinue: !['completed','stopped'].includes(job.status) && !this.runner.isExpired(job.id) && !this.runner.promise && job.cursor.networkRecovery?.state !== 'offline' && !this.session && !this.manualCleanupPromise && !job.cursor.manualVerification,
       stepCounts: db.prepare('SELECT state,COUNT(*) count FROM task_step_state WHERE job_id=? GROUP BY state').all(job.id) };
+  }
+
+  repairManualUnconfirmed(job) {
+    if (!job || this.session || job.cursor?.manualVerification) return job;
+    const round = Number(job.cursor.workflowRound || 0);
+    const rows = db.prepare(`SELECT c.identity,c.account_id,c.round_index,s.step_key,a.id action_id,a.error
+      FROM verification_cards c
+      JOIN task_step_state s ON s.job_id=c.job_id AND s.round_index=c.round_index
+        AND s.identity=c.identity AND s.state='review'
+      JOIN action_logs a ON a.job_id=s.job_id AND a.step_key=s.step_key
+      WHERE c.job_id=? AND c.round_index=? AND a.state='uncertain'
+        AND (a.error LIKE '人工验证后仍未观察到%' OR a.error LIKE '%结果待核对%')
+      ORDER BY s.ordinal DESC`).all(job.id, round);
+    if (!rows.length) return job;
+    const seen = new Set();
+    let repaired = 0;
+    for (const row of rows) {
+      if (seen.has(row.identity)) continue;
+      seen.add(row.identity);
+      const reason = '发帖结果未确认，验证尚未完成，可再次验证';
+      updateActionLog(row.action_id, { state: 'uncertain', verificationPending: true, error: reason });
+      db.prepare(`UPDATE verification_cards SET status='pending',verification_result='pending',
+        verified_at=NULL,source='manual_unconfirmed',reason=?,updated_at=?
+        WHERE job_id=? AND round_index=? AND identity=?`)
+        .run(reason, this.time(), job.id, row.round_index, row.identity);
+      repaired += 1;
+    }
+    if (repaired) {
+      log('info', `已恢复 ${repaired} 张未确认成功的人工验证卡`, { jobId: job.id });
+      this.updateProgress(job.id);
+    }
+    return getJob(job.id);
   }
 
   blockingIdentitySet(jobId, round) {
@@ -798,13 +1058,18 @@ export class VerificationWorkflow {
   // has no such session, a persisted "validating" card cannot be acted on and
   // must become retryable again (for example after Chrome or the service exits).
   recoverOrphanedManual(job) {
-    if (!job || this.session || job.cursor?.manualVerification) return job;
-    const result = db.prepare(`UPDATE verification_cards
+    if (!job || this.session) return job;
+    if (!job.cursor?.manualVerification) return job;
+    const requestId = job.cursor.manualVerification.requestId || '';
+    db.prepare(`UPDATE verification_cards
       SET status='pending',reason=?,updated_at=?
       WHERE job_id=? AND status IN ('requested','validating')`).run(
       '验证会话已中断，请重新进入验证', this.time(), job.id
     );
-    return result.changes ? getJob(job.id) : job;
+    if (requestId) log('warning', '已清理没有浏览器会话的残留验证请求', { jobId: job.id, requestId });
+    this.setCursor(job.id, { manualVerification: null, verificationAutoPaused: false,
+      verificationPauseReason: null, verificationBarrier: true });
+    return getJob(job.id);
   }
 
   repairMisclassifiedManualPosts(job) {
@@ -814,7 +1079,7 @@ export class VerificationWorkflow {
     const rows = db.prepare(`SELECT vc.identity, vc.account_id, vc.round_index, s.step_key, a.id action_id, a.error
       FROM verification_cards vc
       JOIN task_step_state s ON s.job_id=vc.job_id AND s.round_index=vc.round_index
-        AND s.identity=vc.identity AND s.kind='post' AND s.ever_verification=1
+        AND s.identity=vc.identity AND s.kind IN ('post','original') AND s.ever_verification=1
       JOIN action_logs a ON a.job_id=s.job_id AND a.step_key=s.step_key
       WHERE vc.job_id=? AND vc.round_index=? AND vc.status='ready' AND vc.verification_result='passed'
         AND a.state='failed' AND a.submitted_at IS NULL`).all(job.id, round);
@@ -824,7 +1089,7 @@ export class VerificationWorkflow {
     db.exec('BEGIN IMMEDIATE');
     try {
       for (const row of rows) {
-        const reason = `${marker}：${row.error || '发帖准备失败'}`;
+        const reason = `${marker}：${row.error || '原创或发帖准备失败'}`;
         updateActionLog(row.action_id, { state: 'verification_wait', verificationPending: true,
           completedAt: null, error: reason });
         db.prepare("UPDATE task_step_state SET state='deferred',outcome=NULL WHERE job_id=? AND step_key=?").run(job.id, row.step_key);
@@ -867,71 +1132,118 @@ export class VerificationWorkflow {
     return getJob(job.id);
   }
 
-  requestManual(jobId, identity, requestedStepKey = '') {
+  async requestManual(jobId, identity, requestedStepKey = '') {
     this.runner.assertMaySubmit(jobId);
-    const job = getJob(jobId);
+    let job = getJob(jobId);
     if (!this.enabled(job) || ['completed', 'stopped'].includes(job.status)) throw conflict('当前任务不能进入验证');
     this.ensureSteps(job);
     const card = this.card(jobId, Number(job.cursor.workflowRound || 0), identity);
     if (!card) throw conflict('找不到待验证账号');
-    if (this.busy()) throw conflict('请先结束当前账号的验证');
     const row = this.manualRow(jobId, Number(job.cursor.workflowRound || 0), identity, requestedStepKey);
     if (!row) throw conflict('该账号没有可验证的当前操作');
+    if (this.session) {
+      if (!this.sameManualTarget(this.session, jobId, identity, row.step_key)) throw conflict('请先结束当前账号的验证');
+      if (this.session.opened && this.session.armed.settled) throw conflict('验证窗口已经打开，请在该窗口中完成验证');
+      try { await this.waitForManualOpen(this.session); } catch (error) {
+        await this.cleanupManualSession(this.session, error.message, { rejectOpen: true });
+        throw this.openError(error.message, error);
+      }
+      return this.status(getJob(jobId));
+    }
+    // A persisted request without a live session is stale. Clear it before the
+    // new request so neither the card nor the lease remains permanently busy.
+    if (job.cursor.manualVerification) job = this.recoverOrphanedManual(job);
     const action = getStepAction(jobId, row.step_key);
     if (card.status === 'ready' && card.verification_result === 'passed'
       && !action?.verification_pending && row.state !== 'review' && row.state !== 'network_review' && action?.error !== '用户确认未发布，允许补做') throw conflict('本次验证已完成，其余操作请点击继续运行');
+    let release = null;
     if (this.runner.leases) {
-      try { this.manualRelease = this.runner.leases.acquire(getAccount(row.account_id), this.runner.scope || jobId); }
+      try { release = this.runner.leases.acquire(getAccount(row.account_id), this.runner.scope || jobId); }
       catch { throw conflict('该账号正在另一任务中操作，请稍后进入验证'); }
     }
     // Opening a verification card always pauses this page's mainline first.
     // The selected account may then perform exactly the challenged operation,
     // while other accounts and operation types wait for an explicit continue.
     const autoPause = !job.pausedByUser;
+    const requestId = `vreq_${randomUUID()}`;
+    const session = {
+      jobId, identity, stepKey: row.step_key, kind: row.kind, requestId,
+      cancelled: false, submitted: false, timer: null, windowClosed: false,
+      opened: false, openedAt: null, openFailed: false, release,
+      open: this.deferred(), armed: this.deferred(), cleanupPromise: null,
+      attempt: 0, actionTriggeredAt: null, challengeSeenAt: null, lastAttemptError: null,
+      success: this.deferred(),
+      manualRetryAuthorized: card.source === 'manual_unconfirmed'
+    };
+    this.session = session;
+    this.manualRelease = release;
     const cursor = { ...job.cursor,
-      manualVerification: { identity, stepKey: row.step_key, kind: row.kind, phase: 'requested', requestedAt: this.time() },
+      manualVerification: { requestId, identity, stepKey: row.step_key, kind: row.kind,
+        phase: 'opening', requestedAt: this.time(), openedAt: null, openError: null,
+        actionTriggeredAt: null, challengeSeenAt: null, attempt: 0,
+        attemptStartedAt: null, lastAttemptError: null },
       verificationAutoPaused: autoPause,
       verificationPauseReason: autoPause ? 'manual_from_card' : null
     };
     const patch = { cursor };
     if (autoPause) Object.assign(patch, { status: 'paused', pausedByUser: false, waitReason: '已暂停主线，等待手动验证' });
-    this.runner.emitUpdate(updateJob(jobId, patch));
+    try { this.runner.emitUpdate(updateJob(jobId, patch)); }
+    catch (error) { release?.(); this.session = null; this.manualRelease = null; throw error; }
     // `runner.promise` may still be alive while it is only waiting between
     // steps.  Waiting for that promise used to leave a verification card in
     // "等待打开" indefinitely: the workflow loop had already reached its
     // verification barrier and would never get another turn.  Only an actual
     // browser operation is unsafe to interrupt, so start as soon as that has
     // completed.
-    if (!this.runner.promise && !this.runner.currentExecution) this.startManual(jobId, identity);
-    else this.startManualWhenSafe(jobId, identity);
+    if (!this.runner.promise && !this.runner.currentExecution) this.startManual(jobId, identity, { session });
+    else this.startManualWhenSafe(jobId, identity, session);
+    try { await this.waitForManualOpen(session); }
+    catch (error) {
+      await this.cleanupManualSession(session, error.message, { rejectOpen: true });
+      throw this.openError(error.message, error);
+    }
     return this.status(getJob(jobId));
   }
 
-  startManualWhenSafe(jobId, identity) {
+  startManualWhenSafe(jobId, identity, session = this.session) {
     const start = () => {
       const job = getJob(jobId);
-      if (!job || this.session || job.cursor.manualVerification?.identity !== identity || job.cursor.manualVerification?.phase !== 'requested') return;
+      if (!job || this.session !== session || job.cursor.manualVerification?.requestId !== session.requestId) return;
       if (this.runner.currentExecution || (this.runner.groupedEngage(job) && this.runner.promise)) {
         const timer = setTimeout(start, 50);
         timer.unref?.();
         return;
       }
-      this.startManual(jobId, identity);
+      this.startManual(jobId, identity, { session });
     };
     queueMicrotask(start);
   }
 
-  startManual(jobId, identity) {
-    if (this.session) return;
+  startManual(jobId, identity, { session: supplied = null } = {}) {
+    if (this.session && this.session !== supplied) return this.session;
     const selected = getJob(jobId).cursor.manualVerification;
-    const session = { jobId, identity, stepKey: selected?.stepKey, cancelled: false, submitted: false, timer: null, windowClosed: false };
+    const session = supplied || { jobId, identity, stepKey: selected?.stepKey, requestId: selected?.requestId,
+      cancelled: false, submitted: false, timer: null, windowClosed: false, opened: false,
+      openedAt: null, openFailed: false, open: this.deferred(), armed: this.deferred(), cleanupPromise: null,
+      attempt: 0, actionTriggeredAt: null, challengeSeenAt: null, lastAttemptError: null,
+      manualRetryAuthorized: selected?.source === 'manual_unconfirmed' };
     this.session = session;
+    if (session.promise) return session;
     const operation = async () => {
       if (this.runner.groupedEngage(getJob(jobId))) await this.runner.releaseEngageSession();
       return this.manualOperation(session);
     };
     session.promise = Promise.resolve().then(() => this.runner.adapter.withChallengeMode
-      ? this.runner.adapter.withChallengeMode('manual', operation) : operation()).catch(error => {
+      ? this.runner.adapter.withChallengeMode('manual', operation, { maximizeWindow: true }) : operation()).catch(error => {
+      if (!session.open.settled) {
+        session.openFailed = true;
+        session.open.settled = true;
+        session.open.reject(this.openError(`无法打开或保持验证窗口：${error.message}`, error));
+      } else if (!session.armed.settled) {
+        session.openFailed = true;
+        session.armed.settled = true;
+        session.armed.reject(this.openError(`当前动作未触发：${error.message}`, error));
+      }
       if (!(error instanceof DailyStopError) && getJob(jobId)?.status !== 'stopped') {
         if (error.code === 'receipt_persistence_failed') {
           const action = getStepAction(jobId, session.stepKey);
@@ -948,32 +1260,20 @@ export class VerificationWorkflow {
         const job = getJob(jobId);
         const message = `无法打开或保持验证窗口：${error.message}`;
         session.closeReason = message;
-        db.prepare("UPDATE verification_cards SET status='pending',reason=?,updated_at=? WHERE job_id=? AND round_index=? AND identity=?").run(message, this.time(), jobId, job.cursor.workflowRound || 0, identity);
+        if (getJob(jobId)?.cursor?.manualVerification?.requestId === session.requestId) {
+          db.prepare("UPDATE verification_cards SET status='pending',verification_result='pending',verified_at=NULL,source='manual_unconfirmed',reason=?,updated_at=? WHERE job_id=? AND round_index=? AND identity=?").run(message, this.time(), jobId, job.cursor.workflowRound || 0, identity);
+        }
         log('warning', message, { accountId: this.card(jobId, Number(job.cursor.workflowRound || 0), identity)?.account_id });
       }
     }).finally(async () => {
       clearTimeout(session.timer);
       if (this.session !== session) return;
       const closeReason = session.closeReason || (session.cancelled ? '用户结束验证' : '当前验证步骤已收尾');
-      log('info', `人工验证窗口关闭：${closeReason}`, { jobId, accountId: session.account?.id, topicId: session.topic?.id });
-      await Promise.resolve(this.runner.adapter.closeManual?.(session.browserContext)).catch(() => {});
-      this.session = null;
-      this.manualRelease?.(); this.manualRelease = null;
-      const job = getJob(jobId);
-      if (job?.status !== 'stopped') {
-        if (session.cancelled) db.prepare("UPDATE verification_cards SET status='pending',reason='验证会话已结束，请再次进入完成验证' WHERE job_id=? AND identity=? AND status='validating'").run(jobId, identity);
-        const cursor = { ...getJob(jobId).cursor, manualVerification: null,
-          verificationAutoPaused: false, verificationPauseReason: null,
-          verificationBarrier: true };
-        const updated = job.pausedByUser
-          ? updateJob(jobId, { waitReason: '验证已结束，请点击继续运行', cursor })
-          : updateJob(jobId, { status: 'waiting', pausedByUser: false,
-              waitReason: '验证已结束，请点击继续运行', cursor });
-        this.runner.emitUpdate(updated);
-      }
+      await this.cleanupManualSession(session, closeReason);
       // The visible browser belongs exclusively to this manual session.  Do
       // not leave it minimized in the Dock after the user ends verification.
     });
+    return session;
   }
 
   manualRow(jobId, round, identity, requestedStepKey = '') {
@@ -999,8 +1299,44 @@ export class VerificationWorkflow {
       session.lastLoggedPhase = phase;
       log('info', `人工验证阶段：${phase}`, { jobId: session.jobId, accountId: session.account?.id, topicId: session.topic?.id });
     }
+    const current = getJob(session.jobId)?.cursor?.manualVerification || {};
     this.runner.emitUpdate(this.setCursor(session.jobId, { manualVerification: {
-      identity: session.identity, stepKey: session.stepKey, kind: session.step?.kind, phase, ...extra } }));
+      ...current, requestId: session.requestId, identity: session.identity, stepKey: session.stepKey,
+      kind: session.step?.kind || current.kind, phase, ...extra } }));
+  }
+
+  prepareManualRetry(session, row, reason, { force = false } = {}) {
+    const action = getStepAction(session.jobId, row.step_key);
+    if (!action || action.state === 'succeeded' || (action.submitted_at && !force)) return false;
+    if (action) updateActionLog(action.id, {
+      state: 'prepared', submittedAt: null, completedAt: null,
+      verificationPending: true, error: reason
+    });
+    if (action && (row.kind === 'comment_like'
+      || (row.kind === 'comment' && this.runner.workbenchVerification(getJob(session.jobId))))) {
+      db.prepare('UPDATE action_logs SET target_id=NULL,url=NULL WHERE id=?').run(action.id);
+    }
+    db.prepare("UPDATE task_step_state SET state='deferred',outcome=NULL WHERE job_id=? AND step_key=?")
+      .run(session.jobId, row.step_key);
+    session.lastAttemptError = reason;
+    return true;
+  }
+
+  markManualUnconfirmed(jobId, round, identity, row, reason = '结果未确认，验证尚未完成，可再次验证') {
+    const action = getStepAction(jobId, row.step_key);
+    if (action && action.state !== 'succeeded') {
+      updateActionLog(action.id, { state: 'uncertain', verificationPending: true, error: reason });
+    }
+    if (action) {
+      db.prepare("UPDATE task_step_state SET state='review',outcome='uncertain' WHERE job_id=? AND step_key=?")
+        .run(jobId, row.step_key);
+    }
+    db.prepare(`UPDATE verification_cards SET status='pending',verification_result='pending',
+      verified_at=NULL,source='manual_unconfirmed',reason=?,updated_at=?
+      WHERE job_id=? AND round_index=? AND identity=?`)
+      .run(reason, this.time(), jobId, round, identity);
+    this.refreshCard(jobId, round, identity);
+    this.updateProgress(jobId);
   }
 
   async manualOperation(session) {
@@ -1012,10 +1348,41 @@ export class VerificationWorkflow {
     session.stepKey = row.step_key; session.step = stepFrom(row);
     db.prepare("UPDATE verification_cards SET status='validating',updated_at=? WHERE job_id=? AND round_index=? AND identity=?").run(this.time(), jobId, round, identity);
     updateJob(jobId, { status: 'waiting', waitReason: '正在手动验证当前' + kindLabel(row.kind) });
-    this.manualPhase(session, 'validating');
     const account = getAccount(row.account_id), topic = job.config.kind === 'engage' ? { url: row.topic_id, name: '指定微博' } : listTopics().find(topic => topic.id === row.topic_id);
     let action = getStepAction(jobId, row.step_key);
-    session.page = await this.runner.adapter.openVerification?.(account, topic, action);
+    if (session.manualRetryAuthorized && action && action.state !== 'succeeded') {
+      this.prepareManualRetry(session, row, '用户点击再次验证，准备发起新的动作尝试', { force: true });
+      row = db.prepare('SELECT * FROM task_step_state WHERE job_id=? AND step_key=?').get(jobId, row.step_key) || row;
+      action = getStepAction(jobId, row.step_key);
+      db.prepare("UPDATE verification_cards SET source='manual_retry',updated_at=? WHERE job_id=? AND round_index=? AND identity=?")
+        .run(this.time(), jobId, round, identity);
+      session.manualRetryAuthorized = true;
+    }
+    // A verification_wait row means the previous attempt was explicitly held
+    // for a challenge. The verification card must now retry that operation with
+    // a fresh attempt.
+    if (action?.state === 'verification_wait' && action.verification_pending) {
+      updateActionLog(action.id, { state: 'prepared', submittedAt: null, completedAt: null,
+        verificationPending: true, error: action.error || '等待人工验证后重试当前操作' });
+      db.prepare("UPDATE task_step_state SET state='deferred',outcome=NULL WHERE job_id=? AND step_key=?").run(jobId, row.step_key);
+      row = db.prepare('SELECT * FROM task_step_state WHERE job_id=? AND step_key=?').get(jobId, row.step_key) || row;
+      action = getStepAction(jobId, row.step_key);
+    }
+    // Every verification card opens visibly and retriggers its current action.
+    // A historical submitted flag never turns the first card click into a
+    // read-only check. Idempotent operations still use their normal readback
+    // before deciding whether a second mutating click is necessary.
+    if (!session.manualRetryAuthorized && RETRIGGER_VERIFICATION_KINDS.has(row.kind)
+      && action && action.state !== 'succeeded') {
+      this.prepareManualRetry(session, row,
+        `${kindLabel(row.kind)}进入验证，准备重新执行当前操作`, { force: true });
+      row = db.prepare('SELECT * FROM task_step_state WHERE job_id=? AND step_key=?').get(jobId, row.step_key) || row;
+      action = getStepAction(jobId, row.step_key);
+    }
+    const verificationAction = { ...action, forceTopic: this.runner.workbenchVerification(job) && row.kind === 'comment' };
+    session.page = await this.runner.adapter.openVerification?.(account, topic, verificationAction, {
+      maximizeWindow: true
+    });
     session.browserContext = session.page?.context?.();
     session.account = account; session.topic = topic; session.action = action;
     session.page?.once?.('close', () => {
@@ -1023,66 +1390,91 @@ export class VerificationWorkflow {
       session.windowClosed = true; session.closeReason = '验证窗口已关闭，请重新进入验证'; session.wake?.();
     });
     await this.assertSession(session);
+    if (POST_LIKE_KINDS.has(row.kind) && typeof session.page?.url === 'function') {
+      let home = false;
+      try { const url = new URL(session.page.url()); home = url.origin === 'https://weibo.com' && (url.pathname === '/' || url.pathname === ''); } catch {}
+      if (!home) throw this.openError(`${row.kind === 'original' ? '原创' : '发帖'}验证窗口未停留在微博主页，已恢复，请重试`);
+    }
+    session.opened = true;
+    session.openedAt = this.time();
+    if (!session.open.settled) {
+      session.open.settled = true;
+      session.open.resolve(session.page);
+    }
+    this.manualPhase(session, 'opened', { openedAt: session.openedAt, openError: null });
     const continuation = this.runner.adapter.currentSubmission?.(action);
-    if (action?.submitted_at) {
+    if (action?.submitted_at && action.state !== 'verification_wait') {
       session.submitted = true; session.attemptId = action.attempt_id;
+      this.noteActionTriggered(jobId, row.step_key, { kind: row.kind, targetId: action.target_id });
     }
     // A cleared captcha is not proof that a submitted operation failed.
     // Only an unsubmitted verification_wait action may be prepared here.
-    if (['post','comment','repost','like','comment_like'].includes(row.kind) && !session.submitted && action?.state === 'verification_wait') {
+    if (['post','original','comment','repost','like','comment_like'].includes(row.kind) && !session.submitted && action?.state === 'verification_wait') {
       updateActionLog(action.id, { state: 'prepared' });
     }
-    let challenge = Boolean(await this.runner.adapter.hasTaskChallenge?.(account));
-    while (challenge) {
-      await this.waitForManualChallenge(session);
-      challenge = !await this.probeManualSession(session);
-    }
+    // A freshly opened manual window has no completed challenge to preserve.
+    // Trigger the operation immediately; if the click itself raises a captcha,
+    // the outcome path below observes and waits for it then.
+    this.manualPhase(session, 'processing_' + row.kind);
     await this.assertSession(session);
     if (row.kind === 'checkin') {
       this.markVerificationPassed(jobId, round, identity);
       await this.completeManualCheckins(session, account, round, identity);
-    } else if (row.kind !== 'post' && ['review','network_review'].includes(row.state) && !session.submitted) {
-      const rechecked = await this.recheckRow(jobId, row);
-      if (row.kind === 'comment_like' && rechecked?.notLiked && !session.submitted) {
-        const action = getStepAction(jobId, row.step_key);
-        if (action) updateActionLog(action.id, { state: 'prepared', submittedAt: null,
-          verificationPending: false, completedAt: null, error: '人工验证后确认原评论未赞，补点同一目标一次' });
-        db.prepare("UPDATE task_step_state SET state='deferred',outcome=NULL WHERE job_id=? AND step_key=?").run(jobId, row.step_key);
-        const outcome = await this.executeRow(jobId, this.row(jobId, session.step), true);
-        await this.assertSession(session);
-        if (outcome === 'verification') {
-          do { await this.waitForManualChallenge(session); } while (!await this.probeManualSession(session));
-        }
-        const fresh = getStepAction(jobId, row.step_key);
-        if (fresh?.state === 'succeeded') this.finishStep(jobId, session.step, 'succeeded');
-        else if (session.submitted && !['failed','skipped','cancelled'].includes(fresh?.state)) await this.waitForManualSubmission(session, row);
-      }
     } else {
-      while (!session.submitted) {
+      while (!session.submitted && !session.actionTriggeredAt && session.attempt < MANUAL_ACTION_ATTEMPTS) {
+        session.attempt += 1;
+        session.attemptStartedAt = this.time();
         await this.assertSession(session);
-        this.manualPhase(session, 'submitting_' + row.kind);
+        this.manualPhase(session, 'triggering_' + row.kind, {
+          attempt: session.attempt, attemptStartedAt: session.attemptStartedAt,
+          actionTriggeredAt: session.actionTriggeredAt || null
+        });
         const outcome = await this.executeRow(jobId, this.row(jobId, session.step), true);
         await this.assertSession(session);
         const fresh = getStepAction(jobId, row.step_key);
-        if (outcome === 'manual_retry_needed') {
-          session.closeReason = fresh?.error || '发帖未发送，本次验证尚未完成，可重新处理当前发帖';
-          this.markReady(jobId, round, identity);
-          if (fresh) updateActionLog(fresh.id, { state: 'verification_wait', verificationPending: true, error: fresh.error });
-          db.prepare("UPDATE verification_cards SET reason=?,updated_at=? WHERE job_id=? AND round_index=? AND identity=?")
-            .run(fresh?.error || '发帖未发送，本次验证尚未完成，可重新处理当前发帖', this.time(), jobId, round, identity);
-          this.refreshCard(jobId, round, identity);
-          this.updateProgress(jobId);
-          return;
-        }
-        if (outcome === 'waiting' && this.runner.workbenchVerification(job) && !session.submitted) {
-          throw conflict('原操作尚未触发，请重新进入验证');
-        }
-        if (['succeeded','failed','skipped','cancelled'].includes(fresh?.state) || outcome === 'waiting') break;
-        if (session.submitted) break;
-        if (outcome !== 'verification' && !['network','navigation'].includes(outcome)) break;
         if (outcome === 'verification') {
-          do { await this.waitForManualChallenge(session); } while (!await this.probeManualSession(session));
+          if (await this.runner.adapter.hasTaskChallenge?.(account)) {
+            this.noteChallengeSeen(session);
+            while (true) {
+              await this.waitForManualChallenge(session);
+              if (getStepAction(jobId, row.step_key)?.state === 'succeeded') break;
+              const probe = await Promise.race([
+                this.probeManualSession(session).then(resolved => ({ resolved })),
+                session.success?.promise.then(() => ({ succeeded: true })) || Promise.resolve({}),
+              ]);
+              if (probe.succeeded || getStepAction(jobId, row.step_key)?.state === 'succeeded') break;
+              if (probe.resolved) break;
+            }
+          }
+          if (session.submitted || session.actionTriggeredAt || fresh?.submitted_at || fresh?.state === 'succeeded') break;
+          continue;
         }
+        if (session.submitted || session.actionTriggeredAt
+          || fresh?.submitted_at || fresh?.state === 'succeeded') break;
+        if (['network','navigation'].includes(outcome)) break;
+        if (outcome === 'manual_retry_needed' || outcome === 'waiting') {
+          const reason = fresh?.error || (outcome === 'waiting' ? '当前动作未触发，页面未找到可执行目标' : '当前动作未触发');
+          this.noteManualAttemptFailure(session, new Error(reason));
+          this.prepareManualRetry(session, row, reason);
+          continue;
+        }
+        if (['failed','skipped'].includes(fresh?.state) && !fresh?.submitted_at
+          && session.attempt < MANUAL_ACTION_ATTEMPTS
+          && !/(频繁|禁言|登录|身份|网络|截止|停止)/.test(fresh?.error || '')) {
+          const reason = fresh?.error || '当前动作未触发';
+          this.noteManualAttemptFailure(session, new Error(reason));
+          this.prepareManualRetry(session, row, reason);
+          continue;
+        }
+        if (['failed','skipped','cancelled'].includes(fresh?.state)) break;
+      }
+      if (!session.submitted && !session.actionTriggeredAt
+        && getStepAction(jobId, row.step_key)?.state !== 'succeeded') {
+        const reason = session.lastAttemptError || '当前动作没有触发';
+        const message = `当前动作未触发（已尝试 ${session.attempt}/${MANUAL_ACTION_ATTEMPTS} 次）：${reason}`;
+        const pendingRow = db.prepare('SELECT * FROM task_step_state WHERE job_id=? AND step_key=?').get(jobId, row.step_key) || row;
+        this.markManualUnconfirmed(jobId, round, identity, pendingRow, message);
+        throw conflict(message);
       }
       const fresh = getStepAction(jobId, row.step_key);
       if (fresh?.state === 'succeeded') this.finishStep(jobId, session.step, 'succeeded');
@@ -1090,9 +1482,16 @@ export class VerificationWorkflow {
       this.markVerificationPassed(jobId, round, identity);
     }
     await this.assertSession(session);
+    if (POST_LIKE_KINDS.has(row.kind)) {
+      const currentAction = getStepAction(jobId, row.step_key);
+      if (currentAction?.submitted_at && currentAction.state !== 'succeeded') {
+        session.backgroundRecheck = { jobId, row: { ...row } };
+      }
+    }
     this.markReady(jobId, round, identity);
     this.refreshCard(jobId, round, identity);
     this.updateProgress(jobId);
+    session.completedNormally = true;
   }
 
   async waitForManualSubmission(session, row) {
@@ -1102,34 +1501,63 @@ export class VerificationWorkflow {
     const ownsContinuation = continuation && (!continuation.actionId || continuation.actionId === action?.id)
       && (!continuation.attemptId || continuation.attemptId === action?.attempt_id)
       && continuation.page === session.page;
-    if (['post','comment','repost'].includes(row.kind) && !ownsContinuation) return;
+    // Keep the visible window alive even when the adapter did not expose a
+    // receipt handle. A submitted write still needs its page notice/URL state
+    // observed before we close the window and fall back to read-only checks.
     let until = this.runner.now() + MANUAL_RECEIPT_TIMEOUT_MS;
     while (this.runner.now() < until) {
       await this.assertSession(session);
       action = getStepAction(jobId, row.step_key);
       if (action?.state === 'succeeded') { this.finishStep(jobId, session.step, 'succeeded'); return; }
       const handle = this.runner.adapter.currentSubmission?.(action)
-        || (this.runner.workbenchVerification(getJob(jobId)) && this.runner.adapter.currentSubmission ? null : row.kind === 'post' ? this.runner.adapter.manualPostReceipt : row.kind === 'comment' ? this.runner.adapter.manualCommentReceipt : null);
+        || (this.runner.workbenchVerification(getJob(jobId)) && this.runner.adapter.currentSubmission ? null
+          : POST_LIKE_KINDS.has(row.kind) ? this.runner.adapter.manualPostReceipt
+            : row.kind === 'comment' ? this.runner.adapter.manualCommentReceipt : null);
       if (handle && (!handle.actionId || handle.actionId === action?.id)
         && (!handle.attemptId || handle.attemptId === action?.attempt_id) && handle.page === session.page) await handle.read?.();
       if (['like','comment_like'].includes(row.kind) && !await this.runner.adapter.hasTaskChallenge?.(session.account)) await this.recheckRow(jobId, row);
       action = getStepAction(jobId, row.step_key);
       if (action?.state === 'succeeded') { this.finishStep(jobId, session.step, 'succeeded'); return; }
-      if (await this.runner.adapter.hasTaskChallenge?.(session.account)) {
-        do { await this.waitForManualChallenge(session); } while (!await this.probeManualSession(session));
+      const challengeState = await Promise.race([
+        Promise.resolve(this.runner.adapter.hasTaskChallenge?.(session.account)).then(challenge => ({ challenge })),
+        session.success?.promise.then(() => ({ succeeded: true })) || Promise.resolve({}),
+      ]);
+      if (challengeState.succeeded || getStepAction(jobId, row.step_key)?.state === 'succeeded') {
+        this.finishStep(jobId, session.step, 'succeeded');
+        return;
+      }
+      if (challengeState.challenge) {
+        while (true) {
+          await this.waitForManualChallenge(session);
+          if (getStepAction(jobId, row.step_key)?.state === 'succeeded') break;
+          const probe = await Promise.race([
+            this.probeManualSession(session).then(resolved => ({ resolved })),
+            session.success?.promise.then(() => ({ succeeded: true })) || Promise.resolve({}),
+          ]);
+          if (probe.succeeded || getStepAction(jobId, row.step_key)?.state === 'succeeded') break;
+          if (probe.resolved) break;
+        }
+        if (getStepAction(jobId, row.step_key)?.state === 'succeeded') {
+          this.finishStep(jobId, session.step, 'succeeded');
+          return;
+        }
         this.markVerificationPassed(jobId, row.round_index, session.identity);
         until = this.runner.now() + MANUAL_RECEIPT_TIMEOUT_MS;
         continue;
       }
       this.manualPhase(session, 'awaiting_' + row.kind + '_receipt');
-      await new Promise(resolve => {
-        session.wake = resolve; session.timer = setTimeout(resolve, 200);
-      });
+      await Promise.race([
+        new Promise(resolve => {
+          session.wake = resolve; session.timer = setTimeout(resolve, 200);
+        }),
+        session.success?.promise || Promise.resolve(),
+      ]);
+      if (session.timer) clearTimeout(session.timer);
       session.wake = null; session.timer = null;
     }
     await this.assertSession(session);
     action = getStepAction(jobId, row.step_key);
-    if (action?.state !== 'succeeded' && row.kind !== 'post') {
+    if (action?.state !== 'succeeded' && !POST_LIKE_KINDS.has(row.kind)) {
       try { await this.recheckRow(jobId, row); } catch { /* keep the committed submission uncertain */ }
       action = getStepAction(jobId, row.step_key);
     }
@@ -1142,7 +1570,11 @@ export class VerificationWorkflow {
     session.challengeSeen = true;
     if (session.step?.kind === 'checkin') this.observeCheckinChallenge(session.jobId, session.stepKey);
     this.manualPhase(session, 'challenge');
-    await new Promise(resolve => { session.wake = resolve; session.timer = setTimeout(resolve, 2000); });
+    await Promise.race([
+      new Promise(resolve => { session.wake = resolve; session.timer = setTimeout(resolve, 2000); }),
+      session.success?.promise || Promise.resolve(),
+    ]);
+    if (session.timer) clearTimeout(session.timer);
     session.wake = null; session.timer = null;
     await this.assertSession(session);
   }
@@ -1170,15 +1602,17 @@ export class VerificationWorkflow {
     if (session) session.challengeSeen = false;
     const selected = session?.stepKey ? getStepAction(jobId, session.stepKey) : null;
     const operationStarted = session?.step?.kind === 'checkin' || Boolean(session?.submitted || selected?.submitted_at || selected?.state === 'succeeded');
+    const mustConfirmBeforePassed = RETRIGGER_VERIFICATION_KINDS.has(session?.step?.kind);
+    const verificationPassed = mustConfirmBeforePassed ? selected?.state === 'succeeded' : operationStarted;
     db.prepare(`UPDATE verification_cards SET status='validating',verification_result=?,verified_at=?,
       checkin_result=CASE WHEN checkin_result='succeeded' THEN 'succeeded' ELSE 'pending' END,
       reason=?,updated_at=?
-      WHERE job_id=? AND round_index=? AND identity=?`).run(operationStarted ? 'passed' : 'pending', operationStarted ? this.time() : null,
-        operationStarted ? '验证已通过，正在确认' + kindLabel(this.session?.step?.kind || 'checkin') + '结果'
+      WHERE job_id=? AND round_index=? AND identity=?`).run(verificationPassed ? 'passed' : 'pending', verificationPassed ? this.time() : null,
+        verificationPassed ? '验证已通过，正在确认' + kindLabel(this.session?.step?.kind || 'checkin') + '结果'
           : '验证码已解除，正在执行' + kindLabel(this.session?.step?.kind || 'checkin') + '；完成前不计验证通过',
         this.time(), jobId, round, identity);
     if (this.session?.jobId === jobId) {
-      const phase = { checkin: 'signing_checkin', post: 'awaiting_post_receipt', comment: 'awaiting_comment_receipt',
+      const phase = { checkin: 'signing_checkin', post: 'awaiting_post_receipt', original: 'awaiting_post_receipt', comment: 'awaiting_comment_receipt',
         repost: 'awaiting_repost_receipt', like: 'awaiting_like_receipt', comment_like: 'awaiting_comment_like_receipt' }[this.session.step?.kind]
         || 'awaiting_post_receipt';
       this.manualPhase(this.session, phase);
@@ -1230,7 +1664,9 @@ export class VerificationWorkflow {
         // openVerification navigates the existing manual page; it does not
         // create a second visible context.  Only changing supertopics needs
         // this navigation.
-        session.page = await this.runner.adapter.openVerification?.(account, topic, getStepAction(jobId, row.step_key));
+        session.page = await this.runner.adapter.openVerification?.(account, topic, getStepAction(jobId, row.step_key), {
+          maximizeWindow: true
+        });
         session.browserContext = session.page?.context?.() || session.browserContext;
         session.topic = topic;
         await this.assertSession(session);
@@ -1239,7 +1675,7 @@ export class VerificationWorkflow {
       const remaining = rows.length;
       db.prepare("UPDATE verification_cards SET status='validating',checkin_result='pending',reason=?,updated_at=? WHERE job_id=? AND round_index=? AND identity=?")
         .run('请在当前 Chrome 窗口完成签到（剩余 ' + remaining + ' 项）', this.time(), jobId, round, identity);
-      this.runner.emitUpdate(this.setCursor(jobId, { manualVerification: { identity, phase: 'signing_checkin', topicId: topic.id, remainingCheckins: remaining } }));
+      this.manualPhase(session, 'signing_checkin', { topicId: topic.id, remainingCheckins: remaining });
       let readback;
       try { readback = await this.runner.adapter.verifyCheckin?.(account, topic); }
       catch (error) {
@@ -1266,7 +1702,8 @@ export class VerificationWorkflow {
       // sign-in gets one automatic click in this same window.
       const budgets = getJob(jobId).cursor.checkinVerificationCycles || {};
       const clickState = budgets[row.step_key] || { cycle: 0, usedCycle: 0 };
-      if (clickState.usedCycle >= clickState.cycle) {
+      const mayRetryUntriggered = !session.actionTriggeredAt && session.attempt < MANUAL_CHECKIN_ATTEMPTS;
+      if (clickState.usedCycle >= clickState.cycle && !mayRetryUntriggered) {
         await pause(2000);
         continue;
       }
@@ -1277,6 +1714,12 @@ export class VerificationWorkflow {
       }
       // 页面在等待期间可能又弹出验证码：先切回手动验证，别把这次当成签到点击。
       if (await this.settleChallenge(session, account, jobId, round, identity)) continue;
+      session.attempt += 1;
+      session.attemptStartedAt = this.time();
+      this.manualPhase(session, 'triggering_checkin', {
+        attempt: session.attempt, attemptStartedAt: session.attemptStartedAt,
+        actionTriggeredAt: session.actionTriggeredAt || null
+      });
       this.setCursor(jobId, { checkinVerificationCycles: { ...getJob(jobId).cursor.checkinVerificationCycles, [row.step_key]: { ...clickState, usedCycle: clickState.cycle, at: this.runner.now() } } });
       // 已提交过的签到要先放回可提交状态，否则 runner 会以「可能已经提交」拒绝再点一次。
       const before = getStepAction(jobId, row.step_key);
@@ -1284,7 +1727,13 @@ export class VerificationWorkflow {
       const outcome = await this.executeRow(jobId, row, true);
       // 仍没确认成功就恢复待核对，计数不会因为这次尝试消失。
       const after = getStepAction(jobId, row.step_key);
-      if (after && after.state === 'prepared') updateActionLog(after.id, { state: 'uncertain', error: after.error || '签到结果仍未确认，请在当前窗口完成' });
+      if (!session.actionTriggeredAt && after?.state !== 'succeeded') {
+        const reason = after?.error || '签到点击未触发';
+        this.noteManualAttemptFailure(session, new Error(reason));
+        this.prepareManualRetry(session, row, reason);
+      } else if (after && after.state === 'prepared') {
+        updateActionLog(after.id, { state: 'uncertain', error: after.error || '签到结果仍未确认，请在当前窗口完成' });
+      }
       log('info', '人工验证后补做签到：' + (outcome === 'succeeded' ? '成功' : '未确认（' + outcome + '）：' + (getStepAction(jobId, row.step_key)?.error || '')), { accountId: account.id, topicId: topic.id });
       lastSubmitAt = this.runner.now();
       await this.assertSession(session);
@@ -1296,6 +1745,9 @@ export class VerificationWorkflow {
           while (!await this.probeManualSession(session)) await this.waitForManualChallenge(session);
           this.markVerificationPassed(jobId, round, identity);
         }
+      }
+      if (!session.actionTriggeredAt && session.attempt >= MANUAL_CHECKIN_ATTEMPTS) {
+        throw conflict(`签到连续 ${MANUAL_CHECKIN_ATTEMPTS} 次未触发：${session.lastAttemptError || '签到按钮没有被点击'}`);
       }
       await pause(2000);
     }
@@ -1350,7 +1802,7 @@ export class VerificationWorkflow {
       return Boolean(resolved);
     };
     session.probePromise = Promise.resolve().then(() => this.runner.adapter.withChallengeMode
-      ? this.runner.adapter.withChallengeMode('manual', probe) : probe());
+      ? this.runner.adapter.withChallengeMode('manual', probe, { maximizeWindow: true }) : probe());
     try { return await session.probePromise; } finally { session.probePromise = null; }
   }
 
@@ -1360,8 +1812,55 @@ export class VerificationWorkflow {
     if (!session || session.jobId !== jobId || !session.wake) throw conflict('请先打开验证窗口并等待检测');
     const resolved = await this.probeManualSession(session);
     if (resolved) session.wake?.();
-    else this.runner.emitUpdate(this.setCursor(jobId, { manualVerification: { identity: session.identity, phase: 'challenge', message: '仍检测到验证或尚未确认身份，请在 Chrome 完成后重新检测' } }));
+    else this.manualPhase(session, 'challenge', { message: '仍检测到验证或尚未确认身份，请在 Chrome 完成后重新检测' });
     return { ...this.status(getJob(jobId)), detectionResolved: resolved };
+  }
+
+  async recheckAfterManualClose({ jobId, row }) {
+    let action = getStepAction(jobId, row.step_key);
+    if (!action?.submitted_at || action.state === 'succeeded') return;
+    log('info', `关闭验证窗口后的后台只读核对开始：${kindLabel(row.kind)}`, {
+      jobId, accountId: row.account_id, topicId: row.topic_id,
+      scope: this.runner.scope || getJob(jobId)?.scope
+    });
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        // Run outside the just-finished manual AsyncLocalStorage scope. Otherwise
+        // adapter helpers still resolve `taskOwner()` to the visible context that
+        // has already been closed and the read-only check fails immediately.
+        await (this.runner.adapter.withChallengeMode
+          ? this.runner.adapter.withChallengeMode('background', () => this.recheckRow(jobId, row))
+          : this.recheckRow(jobId, row));
+        break;
+      } catch (error) {
+        action = getStepAction(jobId, row.step_key);
+        if (action?.state === 'succeeded') break;
+        const browser = this.runner.adapter.browserManager?.status?.() || {};
+        log('warning', `关闭验证窗口后的后台只读核对失败（第 ${attempt} 次，owner=${browser.owner || 'none'}）：${error.message}`, {
+          jobId, accountId: row.account_id, topicId: row.topic_id
+        });
+        if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+    action = getStepAction(jobId, row.step_key);
+    log('info', `关闭验证窗口后的后台只读核对完成：${action?.state || 'missing'}`, {
+      jobId, accountId: row.account_id, topicId: row.topic_id
+    });
+    if (action?.state !== 'succeeded') {
+      this.markManualUnconfirmed(jobId, row.round_index, row.identity, row,
+        `${kindLabel(row.kind)}结果未确认，验证尚未完成，可再次验证`);
+      return;
+    }
+    const remaining = db.prepare(`SELECT COUNT(*) n FROM task_step_state
+      WHERE job_id=? AND round_index=? AND identity=? AND state IN ('deferred','running','pending','review','network_review')`)
+      .get(jobId, row.round_index, row.identity).n;
+    db.prepare(`UPDATE verification_cards SET status=?,reason=?,verification_result='passed',
+      verified_at=COALESCE(verified_at,?),source='manual_retry',updated_at=?
+      WHERE job_id=? AND round_index=? AND identity=?`)
+      .run(remaining ? 'ready' : 'resolved', remaining ? '验证与操作已完成，其余操作请点击继续运行' : '验证与操作已完成',
+        this.time(), this.time(), jobId, row.round_index, row.identity);
+    this.refreshCard(jobId, row.round_index, row.identity);
+    this.updateProgress(jobId);
   }
 
   markReady(jobId, round, identity) {
@@ -1373,12 +1872,12 @@ export class VerificationWorkflow {
     const done = checkinResult === 'succeeded' && remaining === 0;
     const selectedKind = this.session?.step?.kind;
     const selected = this.session?.stepKey && getStepAction(jobId, this.session.stepKey);
-    const operationStarted = selectedKind === 'checkin' || Boolean(selected?.submitted_at || selected?.state === 'succeeded');
-    if (selectedKind && !operationStarted) {
-      db.prepare("UPDATE verification_cards SET status='pending',verification_result='pending',verified_at=NULL,reason=?,updated_at=? WHERE job_id=? AND round_index=? AND identity=?")
-        .run(kindLabel(selectedKind) + '未发送，本次验证尚未完成；请重新处理当前' + kindLabel(selectedKind), this.time(), jobId, round, identity);
-      this.refreshCard(jobId, round, identity);
-      this.updateProgress(jobId);
+    if (selectedKind && selected?.state !== 'succeeded') {
+      const reason = selectedKind === 'checkin'
+        ? '签到结果未确认，验证尚未完成，可再次验证'
+        : kindLabel(selectedKind) + '结果未确认，验证尚未完成，可再次验证';
+      this.markManualUnconfirmed(jobId, round, identity,
+        this.rows(jobId, round).find(row => row.step_key === this.session?.stepKey) || { step_key: this.session?.stepKey }, reason);
       return;
     }
     const label = selectedKind ? kindLabel(selectedKind) : '';
@@ -1406,6 +1905,14 @@ export class VerificationWorkflow {
     const account = getAccount(row.account_id);
     let result = { state: 'uncertain' };
     if (row.kind === 'comment' && action.url && action.target_id) result = await this.runner.adapter.verifyComment?.(account, { id: action.target_id, url: action.url.split('?')[0] }, action.content, { delays: [0] }) || result;
+    else if (row.kind === 'original') {
+      result = await this.runner.adapter.verifyOriginal?.(account, action) || result;
+      if (result.state !== 'succeeded' && !action.receipt_id && this.runner.adapter.findPublishedOriginal) {
+        result = await this.runner.adapter.findPublishedOriginal(account, { content: action.content,
+          startedAt: action.started_at, submittedAt: action.submitted_at, completedAt: action.completed_at });
+        if (result.state === 'succeeded' && !this.runner.postClaimIsUnique(action, result)) result = { state: 'uncertain' };
+      }
+    }
     else if (row.kind === 'post') {
       const topic = listTopics().find(topic => topic.id === row.topic_id);
       result = await this.runner.adapter.verifyPost?.(account, action, { topicName: topic?.name }) || result;
@@ -1423,7 +1930,7 @@ export class VerificationWorkflow {
     this.runner.assertExecutionAlive();
     this.runner.assertMaySubmit(jobId);
     if (result.state === 'succeeded') {
-      if (row.kind === 'post') this.runner.settlePostAction(action.id, { state: 'succeeded', receiptId: result.receiptId,
+      if (POST_LIKE_KINDS.has(row.kind)) this.runner.settlePostAction(action.id, { state: 'succeeded', receiptId: result.receiptId,
         receiptUrl: result.receiptUrl, url: result.url || action.url, error: '', attemptId: action.attempt_id });
       else updateActionLog(action.id, { state: 'succeeded', url: result.url || action.url, error: '' });
       if (row.kind === 'comment') recordComment(row.account_id, action.target_id, result.url || action.url);
@@ -1436,8 +1943,7 @@ export class VerificationWorkflow {
     const session = this.session;
     if (session?.jobId === jobId) {
       session.cancelled = true; clearTimeout(session.timer); session.wake?.();
-      await this.runner.adapter.cancelTask?.();
-      await session.promise;
+      await this.cleanupManualSession(session, '用户结束验证', { rejectOpen: true });
     }
     const job = getJob(jobId);
     if (job?.cursor.manualVerification) this.setCursor(jobId, { manualVerification: null });
@@ -1509,7 +2015,10 @@ export class VerificationWorkflow {
     let job = getJob(jobId); if (!job || job.status === 'stopped') return job;
     this.ensureSteps(job);
     if (!this.session) { this.manualRelease?.(); this.manualRelease = null; }
-    if (this.session?.jobId === jobId) { this.session.cancelled = true; clearTimeout(this.session.timer); this.session.wake?.(); }
+    if (this.session?.jobId === jobId) {
+      this.session.cancelled = true; clearTimeout(this.session.timer); this.session.wake?.();
+      void this.cleanupManualSession(this.session, reason, { rejectOpen: true });
+    }
     for (const row of db.prepare("SELECT * FROM task_step_state WHERE job_id=? AND state IN ('pending','running','deferred','network_review')").all(jobId)) {
       const action = getStepAction(jobId, row.step_key);
       if (['succeeded','failed','skipped'].includes(action?.state)) {

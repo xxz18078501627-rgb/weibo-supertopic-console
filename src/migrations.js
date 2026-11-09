@@ -126,15 +126,16 @@ export function migrateMaterialGroupIntegrity(db, dataDir) {
   db.exec('BEGIN IMMEDIATE');
   try {
     const original = read('material_groups') || [];
-    const groups = original.map(group => ({...group,type:['post','comment','repost'].includes(group.type) ? group.type : 'post'}));
-    const mapping = {post:{},comment:{},repost:{}};
-    const configKeys = {post:'postGroupIds',comment:'commentGroupIds',repost:'repostGroupIds'};
+    const groups = original.map(group => ({...group,type:['post','original','comment','repost'].includes(group.type) ? group.type : 'post'}));
+    const mapping = {post:{},original:{},comment:{},repost:{}};
+    const configKeys = {post:'postGroupIds',original:'originalGroupIds',comment:'commentGroupIds',repost:'repostGroupIds'};
     const defaults = ['task_defaults','engage_defaults'].map(key=>[key,read(key)]);
     const templates = read('task_templates') || [];
     const engageTemplates = read('engage_templates') || [];
     const configs = [...defaults.map(([,value])=>value),...templates.map(t=>t.config),...engageTemplates.map(t=>t.config)].filter(Boolean);
-    const tables = {post:'shared_post_materials',comment:'comment_materials',repost:'repost_materials'};
+    const tables = {post:'shared_post_materials',original:'shared_original_materials',comment:'comment_materials',repost:'repost_materials'};
     for (const type of Object.keys(tables)) {
+      if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(tables[type])) continue;
       const referenced = new Set(db.prepare('SELECT DISTINCT group_id FROM ' + tables[type] + " WHERE group_id IS NOT NULL AND group_id<>''").all().map(row=>row.group_id));
       for (const cfg of configs) for (const groupId of cfg[configKeys[type]] || []) referenced.add(groupId);
       // Untyped legacy groups were shared, even when currently empty.

@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS repost_materials (
   group_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS shared_original_materials (
+  id TEXT PRIMARY KEY,
+  text TEXT NOT NULL UNIQUE,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  group_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
   status TEXT NOT NULL,
@@ -286,6 +293,7 @@ migrateSharedMaterials(db, config.dataDir);
 migrateAccountDeletion(db, config.dataDir);
 
 if (getSetting('post_sequence') == null) setSetting('post_sequence', 0);
+if (getSetting('original_sequence') == null) setSetting('original_sequence', 0);
 
 export function listAccounts(enabledOnly = false) {
   const sql = `SELECT * FROM accounts WHERE deleted_at IS NULL ${enabledOnly ? "AND enabled = 1 AND cleanup_state IS NULL" : ''} ORDER BY sort_order, created_at`;
@@ -413,8 +421,8 @@ try { db.exec("ALTER TABLE shared_post_materials ADD COLUMN group_id TEXT NOT NU
 migrateMaterialGroupsV2(db, config.dataDir);
 migrateMaterialGroupIntegrity(db, config.dataDir);
 
-export const MATERIAL_GROUP_TYPES = ['post', 'comment', 'repost'];
-export const MATERIAL_TABLES = { post: 'shared_post_materials', comment: 'comment_materials', repost: 'repost_materials' };
+export const MATERIAL_GROUP_TYPES = ['post', 'original', 'comment', 'repost'];
+export const MATERIAL_TABLES = { post: 'shared_post_materials', original: 'shared_original_materials', comment: 'comment_materials', repost: 'repost_materials' };
 
 export function listMaterialGroups(type = null) {
   const groups = getSetting('material_groups', []);
@@ -454,15 +462,15 @@ export function deleteMaterialGroup(groupId) {
   const engage = getSetting('engage_defaults', {});
   setSetting('engage_defaults', { ...engage, commentGroupIds: clean(engage.commentGroupIds), repostGroupIds: clean(engage.repostGroupIds) });
   const defaults = getSetting('task_defaults', {});
-  if (['postGroupIds', 'commentGroupIds', 'repostGroupIds'].some(key => Array.isArray(defaults[key]))) {
-    setSetting('task_defaults', { ...defaults, postGroupIds: clean(defaults.postGroupIds), commentGroupIds: clean(defaults.commentGroupIds), repostGroupIds: clean(defaults.repostGroupIds) });
+  if (['postGroupIds', 'originalGroupIds', 'commentGroupIds', 'repostGroupIds'].some(key => Array.isArray(defaults[key]))) {
+    setSetting('task_defaults', { ...defaults, postGroupIds: clean(defaults.postGroupIds), originalGroupIds: clean(defaults.originalGroupIds), commentGroupIds: clean(defaults.commentGroupIds), repostGroupIds: clean(defaults.repostGroupIds) });
   }
   const templates = getSetting('task_templates', []);
   const nextTemplates = templates.map(template => {
     const configValue = template.config || {};
-    if (!['postGroupIds', 'commentGroupIds', 'repostGroupIds'].some(key => Array.isArray(configValue[key]))) return template;
+    if (!['postGroupIds', 'originalGroupIds', 'commentGroupIds', 'repostGroupIds'].some(key => Array.isArray(configValue[key]))) return template;
     const next = { ...configValue };
-    for (const key of ['postGroupIds', 'commentGroupIds', 'repostGroupIds']) if (Array.isArray(next[key])) next[key] = clean(next[key]);
+    for (const key of ['postGroupIds', 'originalGroupIds', 'commentGroupIds', 'repostGroupIds']) if (Array.isArray(next[key])) next[key] = clean(next[key]);
     return { ...template, config: next };
   });
   setSetting('task_templates', nextTemplates);
@@ -478,7 +486,8 @@ export function setMaterialsGroup(type, ids, groupId) {
   db.exec('BEGIN');
   try { for (const materialId of ids) update.run(groupId || '', materialId); db.exec('COMMIT'); }
   catch (error) { db.exec('ROLLBACK'); throw error; }
-  return type === 'post' ? listPostMaterials() : type === 'repost' ? listRepostMaterials() : listCommentMaterials();
+  return type === 'post' ? listPostMaterials() : type === 'original' ? listOriginalMaterials()
+    : type === 'repost' ? listRepostMaterials() : listCommentMaterials();
 }
 
 export function addPostMaterials(accountOrTexts, legacyTexts, groupId = '') {
@@ -499,6 +508,35 @@ export function deletePostMaterial(materialId) {
 
 export function deletePostMaterials(materialIds) {
   return deleteMany(db.prepare('DELETE FROM shared_post_materials WHERE id=?'), materialIds);
+}
+
+export function listOriginalMaterials() {
+  return db.prepare('SELECT * FROM shared_original_materials ORDER BY created_at,id').all()
+    .map(row => ({ ...row, enabled: Boolean(row.enabled) }));
+}
+
+export function addOriginalMaterials(texts, groupId = '') {
+  assertMaterialGroup('original', groupId);
+  const insert = db.prepare('INSERT OR IGNORE INTO shared_original_materials(id,text,group_id,created_at) VALUES(?,?,?,?)');
+  db.exec('BEGIN');
+  try {
+    for (const text of texts) if (String(text).trim()) insert.run(id('original_'), String(text).trim(), groupId || '', now());
+    db.exec('COMMIT');
+  } catch (error) { db.exec('ROLLBACK'); throw error; }
+  return listOriginalMaterials();
+}
+
+export function deleteOriginalMaterial(materialId) {
+  return db.prepare('DELETE FROM shared_original_materials WHERE id=?').run(materialId).changes > 0;
+}
+
+export function deleteOriginalMaterials(materialIds) {
+  return deleteMany(db.prepare('DELETE FROM shared_original_materials WHERE id=?'), materialIds);
+}
+
+export function pickOriginalMaterial() {
+  const rows = listOriginalMaterials().filter(item => item.enabled);
+  return rows.length ? rows[Math.floor(Math.random() * rows.length)] : null;
 }
 
 export function listCommentMaterials() {
@@ -599,7 +637,8 @@ export function nextCommentSequence() {
 }
 
 export function nextSequence(kind) {
-  const key = kind === 'post' ? 'post_sequence' : kind === 'repost' ? 'repost_sequence' : 'comment_sequence';
+  const key = kind === 'post' ? 'post_sequence' : kind === 'original' ? 'original_sequence'
+    : kind === 'repost' ? 'repost_sequence' : 'comment_sequence';
   db.exec('BEGIN IMMEDIATE');
   try {
     const next = Number(getSetting(key, 0)) + 1;
@@ -673,7 +712,7 @@ export function updateActionLog(actionId, patch) {
   // An attempt token fences old asynchronous callbacks, including after a
   // user explicitly confirms that an earlier attempt was not published.
   if (patch.attemptId && patch.attemptId !== row.attempt_id) return row;
-  if (['post','comment','repost','like','comment_like'].includes(row.kind) && row.state === 'succeeded') {
+  if (['post','original','comment','repost','like','comment_like'].includes(row.kind) && row.state === 'succeeded') {
     if (patch.state && patch.state !== 'succeeded') return row;
     if (patch.sequenceConfirmed === false) return row;
   }
@@ -691,7 +730,7 @@ export function updateActionLog(actionId, patch) {
 }
 
 export function beginPostAttempt(actionId, attemptId) {
-  db.prepare("UPDATE action_logs SET attempt_id=?,submitted_at=NULL WHERE id=? AND kind IN ('post','comment','repost','like','comment_like') AND state IN ('prepared','verification_wait')").run(attemptId, actionId);
+  db.prepare("UPDATE action_logs SET attempt_id=?,submitted_at=NULL WHERE id=? AND kind IN ('post','original','comment','repost','like','comment_like') AND state IN ('prepared','verification_wait')").run(attemptId, actionId);
   return getActionLog(actionId);
 }
 
@@ -786,7 +825,7 @@ export function countActionsByJob(date, scope = null) {
 }
 
 export function clearAllDataForTests() {
-  db.exec('DELETE FROM action_logs; DELETE FROM jobs; DELETE FROM checkins; DELETE FROM comment_history; DELETE FROM post_materials; DELETE FROM shared_post_materials; DELETE FROM comment_materials; DELETE FROM repost_materials; DELETE FROM topics; DELETE FROM accounts; DELETE FROM account_restrictions; DELETE FROM system_logs;');
+  db.exec('DELETE FROM action_logs; DELETE FROM jobs; DELETE FROM checkins; DELETE FROM comment_history; DELETE FROM post_materials; DELETE FROM shared_post_materials; DELETE FROM shared_original_materials; DELETE FROM comment_materials; DELETE FROM repost_materials; DELETE FROM topics; DELETE FROM accounts; DELETE FROM account_restrictions; DELETE FROM system_logs;');
   setSetting('last_comment_material_id', '');
   setSetting('comment_sequence', 0);
   setSetting('post_sequence', 0);

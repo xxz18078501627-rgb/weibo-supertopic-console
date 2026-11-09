@@ -27,7 +27,7 @@ const meta = {
   overview: ["超话工作台", "配置下一次任务，或查看正在运行的任务。"],
   accounts: ["账号", "管理登录、启停与执行顺序。"],
   engage: ["转赞评", "转发、评论、点赞指定微博。"],
-  materials: ["文案", "准备发帖和评论内容。"],
+  materials: ["文案", "准备发帖、原创和评论内容。"],
   logs: ["记录", "查看任务、结果和待核对项目。"],
 };
 const defaults = {
@@ -51,7 +51,7 @@ let state,
   page = "overview",
   toastTimer,
   selectedAccounts = new Set(),
-  selectedMaterials = { post: new Set(), comment: new Set(), repost: new Set() },
+  selectedMaterials = { post: new Set(), original: new Set(), comment: new Set(), repost: new Set() },
   selectedTemplate = "",
   editingJob = null,
   editingBaseline = null,
@@ -481,7 +481,7 @@ document.addEventListener('change', (event) => {
 function renderPlan() {
   $("#action-plan").innerHTML = config.actionPlan
     .map((x, i) => {
-      return `<article class="action-card" data-index="${i}"><span class="drag-handle" data-drag-action="${i}" title="按住拖动排序">⠿</span><label class="card-field">操作<select data-plan-type="${i}"><option value="checkin" ${x.type === "checkin" ? "selected" : ""}>签到</option><option value="comment" ${x.type === "comment" ? "selected" : ""}>评论</option><option value="post" ${x.type === "post" ? "selected" : ""}>发帖</option></select></label><label class="card-field">次数<input data-plan-count="${i}" type="number" min="1" max="100" value="${x.count}" aria-label="执行次数"></label><label class="card-field">间隔（秒）<input data-plan-interval="${i}" type="number" min="0" max="3600" value="${x.intervalSeconds ?? DEFAULT_ACTION_INTERVALS[x.type]}" aria-label="间隔秒数"></label><button class="card-delete" data-plan-action="delete" data-index="${i}" aria-label="删除">×</button></article>`;
+      return `<article class="action-card" data-index="${i}"><span class="drag-handle" data-drag-action="${i}" title="按住拖动排序">⠿</span><label class="card-field">操作<select data-plan-type="${i}"><option value="checkin" ${x.type === "checkin" ? "selected" : ""}>签到</option><option value="comment" ${x.type === "comment" ? "selected" : ""}>评论</option><option value="post" ${x.type === "post" ? "selected" : ""}>发帖</option><option value="original" ${x.type === "original" ? "selected" : ""}>原创</option></select></label><label class="card-field">次数<input data-plan-count="${i}" type="number" min="1" max="100" value="${x.count}" aria-label="执行次数"></label><label class="card-field">间隔（秒）<input data-plan-interval="${i}" type="number" min="0" max="3600" value="${x.intervalSeconds ?? DEFAULT_ACTION_INTERVALS[x.type]}" aria-label="间隔秒数"></label><button class="card-delete" data-plan-action="delete" data-index="${i}" aria-label="删除">×</button></article>`;
     })
     .join("");
 }
@@ -554,12 +554,13 @@ function renderSettings() {
   if (picks) {
     const groups = state.materialGroups || [];
     const ids = groups.map(group => group.id);
-    for (const key of ['postGroupIds', 'commentGroupIds']) {
+    for (const key of ['postGroupIds', 'originalGroupIds', 'commentGroupIds']) {
       const selected = (config[key] || []).filter(id => ids.includes(id));
       config[key] = selected.length === ids.length && ids.length && ids.every(id => selected.includes(id)) ? [] : selected;
     }
-    const row = (key, label) => '<span class="hint">' + label + '</span>' + (groups.filter(group => group.type === (key === 'postGroupIds' ? 'post' : 'comment')).length ? groups.filter(group => group.type === (key === 'postGroupIds' ? 'post' : 'comment')).map(group => '<label class="check-inline"><input type="checkbox" data-material-group-pick="' + key + '" value="' + esc(group.id) + '" ' + (config[key].includes(group.id) ? 'checked' : '') + '>' + esc(group.name) + '</label>').join('') : '<span class="hint">没有分组，默认全部</span>');
-    picks.innerHTML = '<div class="pick-row">' + row('postGroupIds', '发帖') + '</div><div class="pick-row">' + row('commentGroupIds', '评论') + '</div>';
+    const groupType = key => ({ postGroupIds: 'post', originalGroupIds: 'original', commentGroupIds: 'comment' })[key];
+    const row = (key, label) => '<span class="hint">' + label + '</span>' + (groups.filter(group => group.type === groupType(key)).length ? groups.filter(group => group.type === groupType(key)).map(group => '<label class="check-inline"><input type="checkbox" data-material-group-pick="' + key + '" value="' + esc(group.id) + '" ' + (config[key].includes(group.id) ? 'checked' : '') + '>' + esc(group.name) + '</label>').join('') : '<span class="hint">没有分组，默认全部</span>');
+    picks.innerHTML = '<div class="pick-row">' + row('postGroupIds', '发帖') + '</div><div class="pick-row">' + row('originalGroupIds', '原创') + '</div><div class="pick-row">' + row('commentGroupIds', '评论') + '</div>';
   }
   renderSummary();
 }
@@ -605,7 +606,7 @@ function sync() {
   config.candidateRefreshSeconds = num("#refresh-seconds", 3, 3600, 3);
   config.syncToHome = $("#sync-to-home").checked;
   const allGroupIds = (state.materialGroups || []).map(group => group.id);
-  for (const key of ['postGroupIds', 'commentGroupIds']) {
+  for (const key of ['postGroupIds', 'originalGroupIds', 'commentGroupIds']) {
     const picked = [...document.querySelectorAll('[data-material-group-pick="' + key + '"]:checked')].map(node => node.value);
     config[key] = picked;
   }
@@ -621,14 +622,14 @@ function sync() {
   renderSummary();
 }
 function selectedMaterialCount(kind) {
-  const list = kind === 'post' ? state.posts : state.comments;
-  const groupIds = new Set(config[kind === 'post' ? 'postGroupIds' : 'commentGroupIds'] || []);
+  const list = kind === 'post' ? state.posts : kind === 'original' ? state.originals : state.comments;
+  const groupIds = new Set(config[{ post: 'postGroupIds', original: 'originalGroupIds', comment: 'commentGroupIds' }[kind]] || []);
   const rows = (list || []).filter(item => item.enabled !== false && (!groupIds.size || groupIds.has(item.group_id || '')));
   return new Set(rows.map(item => String(item.text || '').trim()).filter(Boolean)).size;
 }
 function materialShortages() {
   const shortages = [];
-  for (const [kind, label] of [['post', '发帖文案'], ['comment', '评论文案']]) {
+  for (const [kind, label] of [['post', '发帖文案'], ['original', '原创文案'], ['comment', '评论文案']]) {
     if (!config.actionPlan.some(item => item.type === kind && Number(item.count) > 0)) continue;
     const count = selectedMaterialCount(kind);
     if (count < 2) shortages.push({ kind, label, count });
@@ -645,8 +646,8 @@ function showMaterialShortage(shortages) {
 }
 function renderSummary() {
   const accounts = config.accountIds?.length || 0, topics = config.topicIds?.length || 0;
-  const each = config.actionPlan.reduce((n, x) => n + Number(x.count || 0), 0);
-  const total = accounts * topics * config.rounds * each;
+  const total = accounts * config.rounds * config.actionPlan.reduce((n, x) =>
+    n + Number(x.count || 0) * (x.type === 'original' ? 1 : topics), 0);
   document.querySelector('#task-summary').innerHTML = '<b>' + accounts + '</b> 账号 · 预计 <b>' + total + '</b> 项';
   const errors = [];
   if (!accounts) errors.push("至少选择一个登录有效的账号");
@@ -697,7 +698,10 @@ function renderAccounts() {
     const restriction = restrictions.get(String(a.id));
     const groupName = groups.get(a.group_id || '') || '未分组';
     const restrictionTip = restriction ? [restriction.type, restriction.expiresAt ? '至 ' + time(restriction.expiresAt, true) : '', restriction.reason].filter(Boolean).join(' · ') : '';
-    return '<article class="list-row account-row" data-account-id="' + a.id + '" data-enabled="' + (a.enabled ? '1' : '0') + '" data-group-id="' + esc(a.group_id || '') + '" data-uid="' + esc(a.uid || '') + '" data-invalid="' + (a.auth_status === 'invalid' ? '1' : '0') + '"><span class="drag-handle" data-drag-account="' + a.id + '" title="按住拖动排序">⠿</span><label class="check-inline"><input data-select-account="' + a.id + '" type="checkbox" ' + (selectedAccounts.has(a.id) ? 'checked' : '') + ' aria-label="选择 ' + esc(a.nickname || a.name) + '"></label><span class="ord">' + String(i + 1).padStart(2, '0') + '</span><div class="row-main"><strong>' + esc(a.nickname || a.name || a.uid || '等待扫码') + '</strong><span>' + (a.uid ? 'UID ' + esc(a.uid) : '未识别 UID') + '</span></div><span class="group-cell">' + esc(groupName) + '</span><span class="status-pill ' + a.auth_status + '">' + (a.auth_status === 'valid' ? '已登录' : a.auth_status === 'invalid' ? '需重登' : '未检查') + '</span><span class="row-tags">' + (restriction ? '<span class="result warning" title="' + esc(restrictionTip) + '">' + esc(restriction.type) + '</span>' : '') + (!a.enabled ? '<span class="status-pill account-disabled-pill">已停用</span>' : '') + '</span><div class="row-actions">' + (restriction ? '<button class="quiet" data-account-action="clear-restriction" data-id="' + a.id + '">解除限制</button>' : '') + '<button class="quiet" data-account-action="login" data-id="' + a.id + '">扫码登录</button><button class="' + (a.enabled ? 'danger' : 'quiet') + '" data-account-action="toggle" data-id="' + a.id + '">' + (a.enabled ? '停用' : '启用') + '</button><button class="danger" data-account-action="delete" data-id="' + a.id + '">删除</button></div></article>';
+    const restrictionAction = restriction
+      ? '<button class="quiet" data-account-action="clear-restriction" data-id="' + a.id + '">解除限制</button>'
+      : '<button class="quiet row-action-reserve" type="button" tabindex="-1" aria-hidden="true" disabled>解除限制</button>';
+    return '<article class="list-row account-row" data-account-id="' + a.id + '" data-enabled="' + (a.enabled ? '1' : '0') + '" data-group-id="' + esc(a.group_id || '') + '" data-uid="' + esc(a.uid || '') + '" data-invalid="' + (a.auth_status === 'invalid' ? '1' : '0') + '"><span class="drag-handle" data-drag-account="' + a.id + '" title="按住拖动排序">⠿</span><label class="check-inline"><input data-select-account="' + a.id + '" type="checkbox" ' + (selectedAccounts.has(a.id) ? 'checked' : '') + ' aria-label="选择 ' + esc(a.nickname || a.name) + '"></label><span class="ord">' + String(i + 1).padStart(2, '0') + '</span><div class="row-main"><strong>' + esc(a.nickname || a.name || a.uid || '等待扫码') + '</strong><span>' + (a.uid ? 'UID ' + esc(a.uid) : '未识别 UID') + '</span></div><span class="group-cell">' + esc(groupName) + '</span><span class="status-pill ' + a.auth_status + '">' + (a.auth_status === 'valid' ? '已登录' : a.auth_status === 'invalid' ? '需重登' : '未检查') + '</span><span class="row-tags">' + (restriction ? '<span class="result warning" title="' + esc(restrictionTip) + '">' + esc(restriction.type) + '</span>' : '') + (!a.enabled ? '<span class="status-pill account-disabled-pill">已停用</span>' : '') + '</span><div class="row-actions">' + restrictionAction + '<button class="quiet" data-account-action="login" data-id="' + a.id + '">扫码登录</button><button class="' + (a.enabled ? 'danger' : 'quiet') + '" data-account-action="toggle" data-id="' + a.id + '">' + (a.enabled ? '停用' : '启用') + '</button><button class="danger" data-account-action="delete" data-id="' + a.id + '">删除</button></div></article>';
   }).join('') : '<div class="empty">添加一个账号后，在本机 Chrome 窗口扫码登录。</div>';
   groupUI?.renderAccounts();
   renderAccountFilters();
@@ -706,8 +710,9 @@ function renderAccounts() {
 let materialTab = 'post';
 let materialGroupFilter = '';
 let materialGroupsOpen = false;
-const materialDrafts = { post:{}, comment:{}, repost:{} };
-function materialsFor(type) { return ({ post: state?.posts, comment: state?.comments, repost: state?.reposts })[type] || []; }
+const materialDrafts = { post:{}, original:{}, comment:{}, repost:{} };
+function materialsFor(type) { return ({ post: state?.posts, original: state?.originals, comment: state?.comments, repost: state?.reposts })[type] || []; }
+function materialEndpoint(type) { return ({ post: 'post-materials', original: 'original-materials', comment: 'comment-materials', repost: 'repost-materials' })[type]; }
 function materialItems() { return materialsFor(materialTab); }
 function materialGroupsFor(type) { return (state?.materialGroups || []).filter(group => group.type === type); }
 function renderMaterialGroupOptions() {
@@ -753,7 +758,10 @@ function updateMaterialSelectionUi() {
 function renderMaterials() {
   const subtitle = document.querySelector('.brand-sub');
   if (subtitle) subtitle.hidden = page !== 'overview';
+  const tabsRoot = $('#material-tabs');
+  if (tabsRoot && !tabsRoot.querySelector('[data-material-tab="original"]')) tabsRoot.querySelector('[data-material-tab="post"]')?.insertAdjacentHTML('afterend', '<button type="button" data-material-tab="original">原创文案 <b id="original-count">0</b></button>');
   $('#post-count').textContent = state.posts.length;
+  $('#original-count').textContent = (state.originals || []).length;
   $('#comment-count').textContent = state.comments.length;
   $('#repost-count').textContent = (state.reposts || []).length;
   for (const tab of document.querySelectorAll('#material-tabs [data-material-tab]')) tab.classList.toggle('on', tab.dataset.materialTab === materialTab);
@@ -774,7 +782,7 @@ function addMaterialTexts() {
   const texts = single ? [raw.trim()] : raw.split(/\r?\n/).map(text => text.trim()).filter(Boolean);
   if (!texts.length) { toast('请输入文案'); return; }
   const groupId = document.querySelector('#material-add-group')?.value || '';
-  request('/api/' + (type === 'post' ? 'post-materials' : type === 'repost' ? 'repost-materials' : 'comment-materials'), { method: 'POST', body: { texts, groupId } })
+  request('/api/' + materialEndpoint(type), { method: 'POST', body: { texts, groupId } })
     .then(() => { if (materialTab === type && document.querySelector('#material-texts').value === raw) document.querySelector('#material-texts').value = ''; if (materialDrafts[type].text === raw) materialDrafts[type].text = ''; return load({ keep: true }); })
     .catch(error => toast(error.message));
 }
@@ -835,7 +843,7 @@ document.addEventListener('click', event => {
     if (!ids.length) { toast('请先选择文案'); return; }
     if (!confirm('删除所选 ' + ids.length + ' 条文案？')) return;
     const type = materialTab;
-    request('/api/' + (type === 'post' ? 'post-materials' : type === 'repost' ? 'repost-materials' : 'comment-materials') + '/bulk-delete', { method: 'POST', body: { ids } }).then(() => { selectedMaterials[type].clear(); return load({ keep: true }); }).catch(error => toast(error.message));
+    request('/api/' + materialEndpoint(type) + '/bulk-delete', { method: 'POST', body: { ids } }).then(() => { selectedMaterials[type].clear(); return load({ keep: true }); }).catch(error => toast(error.message));
     return;
   }
   if (event.target.closest('#material-add')) { addMaterialTexts(); return; }
@@ -874,7 +882,7 @@ function action(x) {
   return `<article class="activity"><time>${time(x.started_at)}</time><div><strong>${esc(x.account_name || "")} · ${esc(x.topic_name || "")}</strong><div>${kind(x.kind)}${x.content ? ` · ${esc(x.content)}` : ""}</div>${x.url ? `<a href="${esc(x.url)}" target="_blank" rel="noreferrer">打开目标帖</a>` : ""}</div><span class="result ${shownState}">${stateName(shownState)}</span></article>`;
 }
 function kind(x) {
-  return { checkin: "签到", post: "发帖", comment: "评论", repost: "转发", like: "外赞", comment_like: "内赞" }[x] || x;
+  return { checkin: "签到", post: "发帖", original: "原创", comment: "评论", repost: "转发", like: "外赞", comment_like: "内赞" }[x] || x;
 }
 function stateName(x) {
   return (
@@ -1029,7 +1037,7 @@ document.addEventListener('click', event => {
   document.querySelector('#material-dialog-body').textContent = item.text;
   const groups = state.materialGroups || [];
   const group = groups.find(entry => entry.id === item.group_id);
-  document.querySelector('#material-dialog-meta').textContent = (group ? group.name : '未分组') + ' · ' + item.text.length + ' 字 · ' + ({ post: '发帖文案', comment: '评论文案', repost: '转发文案' }[type]);
+  document.querySelector('#material-dialog-meta').textContent = (group ? group.name : '未分组') + ' · ' + item.text.length + ' 字 · ' + ({ post: '发帖文案', original: '原创文案', comment: '评论文案', repost: '转发文案' }[type]);
   dialog.dataset.materialId = item.id;
   dialog.dataset.materialType = type;
   dialog.showModal();
@@ -1265,7 +1273,7 @@ document.addEventListener("click", async (e) => {
       if (!set.size) throw new Error("请先选择文案");
       if (confirm(`删除所选 ${set.size} 条文案？`)) {
         await request(
-          `/api/${type === "post" ? "post-materials" : "comment-materials"}/bulk-delete`,
+          `/api/${materialEndpoint(type)}/bulk-delete`,
           { method: "POST", body: { ids: [...set] } },
         );
         set.clear();
@@ -1585,7 +1593,7 @@ function renderLogSummary() {
   const view = recordData.recordView;
   const stats = recordData.dailyStats;
   const daily = recordData.dailySuccess || (recordScope === 'engage' ? recordData.engageDailySuccess : recordData.workbenchDailySuccess) || {};
-  const kinds = recordScope === 'engage' ? ['repost', 'comment', 'comment_like', 'like'] : ['checkin', 'post', 'comment'];
+  const kinds = recordScope === 'engage' ? ['repost', 'comment', 'comment_like', 'like'] : ['checkin', 'post', 'original', 'comment'];
   const perKind = Object.fromEntries(kinds.map(k => [k, {}]));
   for (const a of recordData.actions || []) {
     if (!perKind[a.kind]) continue;
@@ -1618,7 +1626,7 @@ function renderLogSummary() {
     .join("");
   const columnCount = kinds.length + 1;
   node.innerHTML =
-    '<header><h2>当日汇总</h2><span>' + (view?.archived ? "归档记录" : "北京时间") + '</span></header><div class="log-summary-grid" data-columns="' + columnCount + '" style="grid-template-columns:repeat(' + columnCount + ',minmax(0,1fr))">' +
+    '<header><h2>当日汇总</h2><span>' + (view?.archived ? "归档记录" : "北京时间") + '</span></header><div class="log-summary-grid" data-columns="' + columnCount + '">' +
     columns +
     '<div class="log-summary-meta"><span>任务</span><strong>' +
     Number(stats?.jobCount ?? recordData.jobs.length ?? 0) +

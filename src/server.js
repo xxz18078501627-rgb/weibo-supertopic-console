@@ -9,9 +9,9 @@ import { URL } from 'node:url';
 import { config } from './config.js';
 import { resolveBlacklist, resolveEngageSettings } from './engage-profile-resolver.js';
 import {
-  addCommentMaterials, addPostMaterials, addRepostMaterials, clearAccountRestrictions, clearAccountRestrictionsFromOpenJobs, createAccount, createTopic, deleteCommentMaterial, deleteCommentMaterials, deletePostMaterial, deletePostMaterials, deleteRepostMaterial, deleteRepostMaterials,
+  addCommentMaterials, addOriginalMaterials, addPostMaterials, addRepostMaterials, clearAccountRestrictions, clearAccountRestrictionsFromOpenJobs, createAccount, createTopic, deleteCommentMaterial, deleteCommentMaterials, deleteOriginalMaterial, deleteOriginalMaterials, deletePostMaterial, deletePostMaterials, deleteRepostMaterial, deleteRepostMaterials,
   deleteTopic, deleteTopics, deleteAccount, getAccount, getActiveJob, getJob, getSetting, listAccounts, listActionLogs, listCommentMaterials, listRepostMaterials, listMaterialGroups, createMaterialGroup, deleteMaterialGroup, renameMaterialGroup, setMaterialsGroup,
-  listActiveAccountRestrictions, listJobs, listPostMaterials, listRecordsByShanghaiDate, listSystemLogs, listTopics, log, reorderAccounts, seedAccountRestrictionsFromJobs, setSetting, updateAccount, updateAccountAuth, updateTopic
+  listActiveAccountRestrictions, listJobs, listOriginalMaterials, listPostMaterials, listRecordsByShanghaiDate, listSystemLogs, listTopics, log, reorderAccounts, seedAccountRestrictionsFromJobs, setSetting, updateAccount, updateAccountAuth, updateTopic
 } from './db.js';
 import { BrowserManager, browserManager } from './browser.js';
 import { createRunner } from './runner.js';
@@ -143,7 +143,7 @@ function cleanTexts(input) {
   return [...new Set(texts.map(value => String(value || '').trim()).filter(Boolean))];
 }
 
-const TEMPLATE_FIELDS = ['actionPlan', 'segmentIds', 'rounds', 'roundIntervalSeconds', 'syncToHome', 'commentStrategy', 'commentSection', 'scanLimit', 'commentMaxCountEnabled', 'commentMaxCount', 'candidateRefreshSeconds', 'readRetryCount', 'postDecoration', 'commentDecoration', 'postGroupIds', 'commentGroupIds'];
+const TEMPLATE_FIELDS = ['actionPlan', 'segmentIds', 'rounds', 'roundIntervalSeconds', 'syncToHome', 'commentStrategy', 'commentSection', 'scanLimit', 'commentMaxCountEnabled', 'commentMaxCount', 'candidateRefreshSeconds', 'readRetryCount', 'postDecoration', 'commentDecoration', 'postGroupIds', 'originalGroupIds', 'commentGroupIds'];
 function templateConfig(input = {}) {
   const picked = {};
   for (const key of TEMPLATE_FIELDS) if (input[key] !== undefined) picked[key] = input[key];
@@ -172,6 +172,7 @@ function state() {
     topics: config.topicMode === 'fixed' ? listTopics().filter(isFixedTopic).slice(0, 1) : listTopics(),
     comments: listCommentMaterials(),
     posts: listPostMaterials(),
+    originals: listOriginalMaterials(),
     reposts: listRepostMaterials(),
     defaultEmojis: DEFAULT_EMOJIS,
     taskDefaults: normalizeTaskSettings(getSetting('task_defaults', {})),
@@ -206,7 +207,7 @@ function state() {
     browser: browserManager.status(),
     loginBrowser: loginBrowserManager.status(),
     verificationVersion,
-    features: { engageV2: true, typedMaterialGroups: true, concurrentTasks: true },
+    features: { engageV2: true, typedMaterialGroups: true, originalPost: true, concurrentTasks: true },
     service: serviceIdentity
   };
 }
@@ -347,7 +348,7 @@ async function api(req, res, url) {
     if (!job || !runner.workflow.enabled(job)) return send(res, 404, { error: '该任务不支持验证队列' });
     if (loginService.active) return send(res, 409, { error: '请先完成或取消扫码登录' });
     let result;
-    if (action === 'open') result = runner.workflow.requestManual(jobId, String(input.identity || ''), String(input.stepKey || ''));
+    if (action === 'open') result = await runner.workflow.requestManual(jobId, String(input.identity || ''), String(input.stepKey || ''));
     if (action === 'end') result = await runner.workflow.endManual(jobId);
     if (action === 'recheck') result = await runner.workflow.recheckManual(jobId);
     if (action === 'continue') result = runner.workflow.continue(jobId);
@@ -478,6 +479,29 @@ async function api(req, res, url) {
     return send(res, 200, { results });
   }
 
+  if (url.pathname === '/api/original-materials' && req.method === 'GET') return send(res, 200, listOriginalMaterials());
+  if (url.pathname === '/api/original-materials' && req.method === 'POST') {
+    const input = await body(req);
+    const texts = cleanTexts(input.texts);
+    if (!texts.length) return send(res, 400, { error: '请输入至少一条原创文案' });
+    const materials = addOriginalMaterials(texts, String(input.groupId || ''));
+    broadcast('state', state());
+    return send(res, 201, materials);
+  }
+  if (url.pathname === '/api/original-materials/bulk-delete' && req.method === 'POST') {
+    const input = await body(req);
+    if (!Array.isArray(input.ids) || !input.ids.length) return send(res, 400, { error: '请选择要删除的文案' });
+    const results = deleteOriginalMaterials(input.ids);
+    broadcast('state', state());
+    return send(res, 200, { results });
+  }
+  match = url.pathname.match(/^\/api\/original-materials\/([^/]+)$/);
+  if (match && req.method === 'DELETE') {
+    deleteOriginalMaterial(match[1]);
+    broadcast('state', state());
+    return send(res, 200, { ok: true });
+  }
+
   if (url.pathname === '/api/topics' && req.method === 'POST') {
     const input = await body(req);
     if (!input.name?.trim() || !/^https:\/\//.test(input.url || '')) return send(res, 400, { error: '请输入超话名称和 https 链接' });
@@ -570,7 +594,7 @@ async function api(req, res, url) {
   if (url.pathname === '/api/material-groups' && req.method === 'GET') return send(res, 200, listMaterialGroups());
   if (url.pathname === '/api/material-groups' && req.method === 'POST') {
     const input = await body(req);
-    if (!['post','comment','repost'].includes(input.type)) return send(res, 400, { error: '请选择文案类型' });
+    if (!['post','original','comment','repost'].includes(input.type)) return send(res, 400, { error: '请选择文案类型' });
     try { const group = createMaterialGroup(input.name, input.type); broadcast('state', state()); return send(res, 201, group); }
     catch (error) { return send(res, 400, { error: error.message }); }
   }
@@ -579,7 +603,7 @@ async function api(req, res, url) {
     if (groupMatch && req.method === 'DELETE') { deleteMaterialGroup(groupMatch[1]); broadcast('state', state()); return send(res, 200, { ok: true }); } }
   if (url.pathname === '/api/materials/group' && req.method === 'POST') {
     const input = await body(req);
-    if (!['post','comment','repost'].includes(input.type) || !Array.isArray(input.ids)) return send(res, 400, { error: '参数不正确' });
+    if (!['post','original','comment','repost'].includes(input.type) || !Array.isArray(input.ids)) return send(res, 400, { error: '参数不正确' });
     const materials = setMaterialsGroup(input.type, input.ids, String(input.groupId || ''));
     broadcast('state', state()); return send(res, 200, { materials });
   }
@@ -716,7 +740,8 @@ function serveStatic(req, res, url) {
   }
   const ext = path.extname(file);
   const mime = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png' }[ext] || 'application/octet-stream';
-  res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'no-cache' });
+  const applicationAsset = ['.html', '.css', '.js'].includes(ext);
+  res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': applicationAsset ? 'no-store, max-age=0' : 'no-cache' });
   fs.createReadStream(file).pipe(res);
 }
 

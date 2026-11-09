@@ -25,7 +25,12 @@ test.before(async()=>{
  await context.request.post(url+'/api/comment-materials',{data:{texts:['示例评论文案一','示例评论文案二']}});await context.close();
 });
 test.after(async()=>{await browser?.close();if(server){const stopped=new Promise(r=>server.once('exit',r));server.kill('SIGTERM');await stopped;}fs.rmSync(dir,{recursive:true,force:true});});
-async function page(){const p=await browser.newPage({viewport:{width:1440,height:900}});p.setDefaultTimeout(7000);await p.request.post(url+'/api/login',{data:{token}});await p.goto(url);await p.locator('#connection-text').getByText('实时连接',{exact:true}).waitFor();return p;}
+async function page(){
+ const p=await browser.newPage({viewport:{width:1440,height:900}});
+ const close=p.close.bind(p);
+ p.close=async(...args)=>{await p.unrouteAll({behavior:'ignoreErrors'}).catch(()=>{});return close(...args);};
+ p.setDefaultTimeout(7000);await p.request.post(url+'/api/login',{data:{token}});await p.goto(url);await p.locator('#connection-text').getByText('实时连接',{exact:true}).waitFor();return p;
+}
 async function engage(p){await p.locator('#nav [data-page="engage"]').click();}
 async function tab(p,name){await p.locator(`[data-engage-tab="${name}"]`).click();}
 async function add(p,type){await p.locator('#engage-add-action').click();await p.locator(`[data-engage-add="${type}"]`).click();}
@@ -160,19 +165,33 @@ test('记录沿用四宫格和原有筛选，转赞评明细接入且每日评�
 });
 
 const { WeiboAdapter } = await import('../src/weibo-adapter.js');
-test('点赞 toggle 先读后点、只点目标；黑名单与未知状态不点击，复核只读',async()=>{
+test('点赞 toggle 先读后点、只点目标；缺 liked 时灰色可点、已赞跳过',async()=>{
  const p=await browser.newPage();p.setDefaultTimeout(1500);let postLiked=false,commentLiked=false,unknown=false,clicks=[],gates=0;
  const target='https://weibo.com/77/12345';
  const html=`<article data-mid="999"><footer><button title="赞" onclick="fetch('/fixture/like?kind=wrong')">广告赞</button></footer></article><article data-mid="12345"><a href="/77/12345">时间</a><p>目标正文</p><blockquote><footer><button title="赞" onclick="fetch('/fixture/like?kind=nested-wrong')">嵌套微博赞</button></footer></blockquote><footer><button title="赞" onclick="this.style.color='rgb(255,130,0)';fetch('/fixture/like?kind=post')">赞</button></footer></article><div data-commentid="c1"><button title="赞" onclick="this.style.color='rgb(255,130,0)';fetch('/fixture/like?kind=comment')">评论赞</button></div>`;
  await p.route('https://weibo.com/**',async route=>{const u=new URL(route.request().url());if(u.pathname==='/ajax/statuses/show')return route.fulfill({json:{idstr:'12345',user:{idstr:'77'},text_raw:'目标正文',liked:unknown?null:postLiked}});if(u.pathname==='/ajax/statuses/buildComments')return route.fulfill({json:{data:[{idstr:'c1',user:{idstr:'88'},text:'支持目标',like_status:unknown?undefined:commentLiked?1:0}]}});if(u.pathname==='/fixture/like'){const kind=u.searchParams.get('kind');clicks.push(kind);if(kind==='post')postLiked=true;if(kind==='comment')commentLiked=true;return route.fulfill({json:{ok:1}});}return route.fulfill({contentType:'text/html; charset=utf-8',body:html});});
  const adapter=new WeiboAdapter({page:async()=>p}),account={id:'fake',uid:'123'};const onSubmit=()=>gates++;
  assert.equal((await adapter.likeWeibo(account,target,{onSubmit,blacklistUids:['77']})).state,'skipped');assert.deepEqual(clicks,[]);
- unknown=true;await assert.rejects(adapter.likeWeibo(account,target,{onSubmit}),/已赞状态/);await assert.rejects(adapter.likeComment(account,target,'c1',{onSubmit}),/已赞状态/);assert.equal(gates,0);
- unknown=false;await assert.rejects(adapter.likeWeibo(account,target,{onSubmit,beforeSubmit:async()=>{await Promise.resolve();throw Error('fixture offline before click');}}),/fixture offline/);assert.equal(gates,0);assert.deepEqual(clicks,[]);assert.equal((await adapter.likeWeibo(account,target,{onSubmit})).state,'succeeded');assert.equal((await adapter.likeWeibo(account,target,{onSubmit})).alreadyDone,true);assert.deepEqual(clicks,['post']);assert.equal(gates,1);
- assert.equal((await adapter.verifyLike(account,target)).state,'succeeded');assert.deepEqual(clicks,['post']);
- assert.equal((await adapter.likeComment(account,target,'c1',{onSubmit})).state,'succeeded');assert.equal((await adapter.likeComment(account,target,'c1',{onSubmit})).alreadyDone,true);assert.deepEqual(clicks,['post','comment']);assert.equal(gates,2);
- assert.equal((await adapter.verifyCommentLike(account,target,'c1')).state,'succeeded');assert.deepEqual(clicks,['post','comment']);
+ unknown=true;assert.equal((await adapter.likeWeibo(account,target,{onSubmit})).state,'succeeded');assert.equal(gates,1);assert.deepEqual(clicks,['post']);assert.equal((await adapter.likeWeibo(account,target,{onSubmit})).alreadyDone,true);assert.equal(gates,1);await assert.rejects(adapter.likeComment(account,target,'c1',{onSubmit}),/已赞状态/);
+ unknown=false;postLiked=false;commentLiked=false;await p.locator('[data-engage-control="engage-like"]').evaluate(button=>button.style.color='rgb(147,147,147)');await assert.rejects(adapter.likeWeibo(account,target,{onSubmit,beforeSubmit:async()=>{await Promise.resolve();throw Error('fixture offline before click');}}),/fixture offline/);assert.equal(gates,1);assert.deepEqual(clicks,['post']);assert.equal((await adapter.likeWeibo(account,target,{onSubmit})).state,'succeeded');assert.equal((await adapter.likeWeibo(account,target,{onSubmit})).alreadyDone,true);assert.deepEqual(clicks,['post','post']);assert.equal(gates,2);
+ assert.equal((await adapter.verifyLike(account,target)).state,'succeeded');assert.deepEqual(clicks,['post','post']);
+ assert.equal((await adapter.likeComment(account,target,'c1',{onSubmit})).state,'succeeded');assert.equal((await adapter.likeComment(account,target,'c1',{onSubmit})).alreadyDone,true);assert.deepEqual(clicks,['post','post','comment']);assert.equal(gates,3);
+ assert.equal((await adapter.verifyCommentLike(account,target,'c1')).state,'succeeded');assert.deepEqual(clicks,['post','post','comment']);
  await p.close();
+});
+
+test('外赞缺少 liked 且目标卡片无法唯一定位时不点击',async()=>{
+ const p=await browser.newPage();p.setDefaultTimeout(1500);let gates=0,clicks=0;
+ const target='https://weibo.com/77/67890';
+ await p.route('https://weibo.com/**',async route=>{
+  const u=new URL(route.request().url());
+  if(u.pathname==='/ajax/statuses/show')return route.fulfill({json:{idstr:'67890',user:{idstr:'77'},text_raw:'目标正文'}});
+  if(u.pathname==='/fixture/wrong'){clicks+=1;return route.fulfill({json:{ok:1}});}
+  return route.fulfill({contentType:'text/html; charset=utf-8',body:`<article data-mid="999"><footer><button title="赞" onclick="fetch('/fixture/wrong')">广告赞</button></footer></article>`});
+ });
+ const adapter=new WeiboAdapter({page:async()=>p}),account={id:'fake',uid:'123'};
+ await assert.rejects(adapter.likeWeibo(account,target,{onSubmit:()=>gates++}),/没有唯一识别到目标微博的点赞入口/);
+ assert.equal(gates,0);assert.equal(clicks,0);await p.close();
 });
 
 test('内赞关键词和UID/关键词黑名单先筛选，跳过已赞和状态未知，不借用外赞按钮',async()=>{
