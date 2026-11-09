@@ -41,8 +41,12 @@ function copyTree(from, to, { skipData = true } = {}) {
   for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
     if (skipData && entry.name === 'data') continue;
     const source = path.join(from, entry.name), destination = path.join(to, entry.name);
-    if (entry.isDirectory()) copyTree(source, destination, { skipData });
-    else { fs.mkdirSync(path.dirname(destination), { recursive: true }); fs.copyFileSync(source, destination); }
+    if (entry.isSymbolicLink()) {
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.rmSync(destination, { recursive: true, force: true });
+      fs.symlinkSync(fs.readlinkSync(source), destination);
+    } else if (entry.isDirectory()) copyTree(source, destination, { skipData });
+    else if (entry.isFile()) { fs.mkdirSync(path.dirname(destination), { recursive: true }); fs.copyFileSync(source, destination); }
   }
 }
 
@@ -112,9 +116,18 @@ try {
   } else {
     if (restart) { stopService(); serviceNeedsRecovery = true; }
     backup = path.join(updatesDir, `backup-app-${version}-${stamp}`);
-    copyTree(root, backup, { skipData: true });
-    for (const entry of fs.readdirSync(source)) {
-      if (entry === 'data') continue;
+    fs.mkdirSync(backup, { recursive: true });
+    const replacingEntries = fs.readdirSync(source).filter(entry => entry !== 'data');
+    // Source-tree installations only need a backup of files the update will
+    // replace. Never walk .git, dist, caches or Playwright's browser bundle:
+    // those can contain large trees and special files that are not copyable.
+    for (const entry of replacingEntries) {
+      const current = path.join(root, entry);
+      if (!fs.existsSync(current)) continue;
+      if (fs.statSync(current).isDirectory()) copyTree(current, path.join(backup, entry), { skipData: true });
+      else fs.copyFileSync(current, path.join(backup, entry));
+    }
+    for (const entry of replacingEntries) {
       const target = path.join(root, entry);
       fs.rmSync(target, { recursive: true, force: true });
       const item = fs.statSync(path.join(source, entry));
@@ -133,8 +146,9 @@ try {
       if (previousVersion) serviceEnv.WEIBO_CONSOLE_EXPECTED_VERSION = previousVersion;
     }
     if (!installRoot && backup && fs.existsSync(backup)) copyTree(backup, root);
-    restartService();
   } catch (rollback) { log('回滚失败：' + rollback.message); }
+  try { restartService(); }
+  catch (restartError) { log('恢复服务失败：' + (restartError.stderr?.toString() || restartError.message)); }
   process.exitCode = 1;
 } finally {
   try { if (staging) fs.rmSync(staging, { recursive: true, force: true }); } catch {}

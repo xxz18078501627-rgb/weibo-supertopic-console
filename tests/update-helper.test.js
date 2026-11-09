@@ -84,3 +84,43 @@ test('新版重启健康检查失败时恢复旧版本指针', () => {
     assert.match(fs.readFileSync(path.join(installRoot, 'data', 'updates', 'update.log'), 'utf8'), /更新失败/);
   } finally { fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
+
+test('源码目录更新只备份即将替换的文件，不复制 .git 与构建目录', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'weibo-update-source-'));
+  try {
+    const root = path.join(base, 'app');
+    const data = path.join(root, 'data');
+    const newPackage = path.join(base, 'weibo-console-1.2.0');
+    fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(root, '.git', 'objects'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'dist', 'platform'), { recursive: true });
+    fs.mkdirSync(data, { recursive: true });
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ version: '1.1.0' }));
+    fs.writeFileSync(path.join(root, 'src', 'server.js'), 'old');
+    fs.writeFileSync(path.join(root, '.git', 'objects', 'keep'), 'git-data');
+    fs.writeFileSync(path.join(root, 'dist', 'platform', 'build.bin'), 'build-data');
+    fs.writeFileSync(path.join(data, 'keep.txt'), '用户数据');
+
+    fs.mkdirSync(path.join(newPackage, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(newPackage, 'node_modules', 'playwright'), { recursive: true });
+    fs.writeFileSync(path.join(newPackage, 'package.json'), JSON.stringify({ version: '1.2.0' }));
+    fs.writeFileSync(path.join(newPackage, 'src', 'server.js'), 'new');
+    const archive = path.join(base, 'update.zip');
+    zipFolder(newPackage, archive);
+
+    execFileSync(process.execPath, [path.resolve(import.meta.dirname, '..', 'scripts', 'update-helper.mjs'),
+      '--package', archive, '--version', '1.2.0', '--root', root, '--data', data, '--no-restart'
+    ], { stdio: 'pipe' });
+
+    assert.equal(fs.readFileSync(path.join(root, 'src', 'server.js'), 'utf8'), 'new');
+    assert.equal(fs.readFileSync(path.join(root, '.git', 'objects', 'keep'), 'utf8'), 'git-data');
+    assert.equal(fs.readFileSync(path.join(root, 'dist', 'platform', 'build.bin'), 'utf8'), 'build-data');
+    assert.equal(fs.readFileSync(path.join(data, 'keep.txt'), 'utf8'), '用户数据');
+    const backups = fs.readdirSync(path.join(data, 'updates')).filter(name => name.startsWith('backup-app-'));
+    assert.equal(backups.length, 1);
+    const backup = path.join(data, 'updates', backups[0]);
+    assert.equal(fs.existsSync(path.join(backup, '.git')), false);
+    assert.equal(fs.existsSync(path.join(backup, 'dist')), false);
+    assert.equal(fs.readFileSync(path.join(backup, 'src', 'server.js'), 'utf8'), 'old');
+  } finally { fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+});
