@@ -14,7 +14,7 @@ const challengeModeState = () => {
 const isManualChallengeMode = () => challengeModeState().mode === 'manual';
 const challengeWindowOptions = () => ({ windowState: challengeModeState().maximizeWindow ? 'maximized' : 'normal' });
 
-async function submitBeforeDeadline(button, onSubmit, deadlineAt) {
+async function submitBeforeDeadline(button, onSubmit, deadlineAt, { coordinateClick = false, page = null } = {}) {
   const deadline = Number(deadlineAt);
   if (!Number.isFinite(deadline)) { await onSubmit(); await button.click(); return; }
   // Playwright may wait for actionability after a click request. A capture-phase
@@ -33,8 +33,19 @@ async function submitBeforeDeadline(button, onSubmit, deadlineAt) {
     for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) document.addEventListener(type, guard.listener, true);
   }, deadline);
   try {
+    let point = null;
+    if (coordinateClick && page?.mouse?.click) {
+      await button.scrollIntoViewIfNeeded?.().catch(() => {});
+      point = await button.evaluate(element => {
+        const rect = element.getBoundingClientRect();
+        const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+        const hit = document.elementFromPoint(x, y);
+        return hit && (hit === element || element.contains(hit)) ? { x, y } : null;
+      }).catch(() => null);
+    }
     await onSubmit();
-    await button.click({ timeout: Math.max(1, Math.min(5000, deadline - Date.now())) });
+    if (point) await page.mouse.click(point.x, point.y);
+    else await button.click({ timeout: Math.max(1, Math.min(5000, deadline - Date.now())) });
     if (await handle.evaluate(element => element.__workbenchSubmitGuard?.blocked).catch(() => false)) {
       const error = new DailyStopError(); error.unsubmitted = true; throw error;
     }
@@ -1584,40 +1595,10 @@ export class WeiboAdapter {
       await submitBeforeDeadline(publish, async () => {
         await notice.begin(); await onSubmit(); collector.begin();
         this.log('info', `${kind === 'original' ? '原创' : '发帖'}已点击提交`, { accountId: account.id, topicId: topicId || '' });
-      }, deadlineAt);
-      // Playwright can report a successful click after the component has been
-      // replaced, leaving the click on a detached handler. In that case there
-      // is no publish request at all. Only this zero-request case is safe to
-      // replay: no request means the first click could not have published.
-      for (let attempt = 0; attempt < 8 && !collector.requestObserved && !collector.accepted; attempt += 1) {
-        await page.waitForTimeout(100);
-      }
-      if (!collector.requestObserved && !collector.accepted) {
-        // A captcha or navigation change after the first click must take over.
-        await detectChallenge(page, this.browserManager);
-        const freshPublish = prepared.dialog.getByRole('button', { name: /^(发送|发布)$/ });
-        if (await freshPublish.count().catch(() => 0) === 1
-          && await freshPublish.first().isVisible().catch(() => false)
-          && await freshPublish.first().isEnabled().catch(() => false)) {
-          await freshPublish.first().scrollIntoViewIfNeeded().catch(() => {});
-          const target = await freshPublish.first().evaluate(button => {
-            const rect = button.getBoundingClientRect();
-            const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2,
-              hit: Boolean(hit && (hit === button || button.contains(hit))) };
-          }).catch(() => null);
-          if (target?.hit) {
-            this.log('info', `${kind === 'original' ? '原创' : '发帖'}首次点击未产生发布请求，重新命中原发送按钮`, {
-              accountId: account.id, topicId: topicId || ''
-            });
-            await page.mouse.click(target.x, target.y);
-          } else {
-            this.log('warning', `${kind === 'original' ? '原创' : '发帖'}首次点击未产生发布请求，发送按钮当前被其他页面元素遮挡`, {
-              accountId: account.id, topicId: topicId || ''
-            });
-          }
-        }
-      }
+      }, deadlineAt, { coordinateClick: true, page });
+      // The first click is sent once at the verified button coordinates. Never
+      // click again when a request is merely slow to appear: a delayed HTTP 400
+      // or success can still arrive for the first submission.
       for (let attempt = 0; attempt < 8 && !collector.requestObserved && !collector.accepted; attempt += 1) {
         await page.waitForTimeout(100);
       }
