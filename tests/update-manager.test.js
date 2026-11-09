@@ -7,6 +7,7 @@ import test from 'node:test';
 import { UpdateManager, compareVersions } from '../src/update-manager.js';
 
 const api = 'https://api.github.com/repos/example/project/releases?per_page=30';
+const atom = 'https://github.com/xxz18078501627-rgb/weibo-supertopic-console/releases.atom';
 
 function release(version, key, { minVersion = '1.0.0', hash = 'a'.repeat(64), size = 4, notes = '更新说明', host = 'github.com' } = {}) {
   const updateName = `weibo-console-${version}-${key}-update.zip`;
@@ -87,12 +88,33 @@ test('当前已是最新版本时不再提示可更新', async () => {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('GitHub 限流或网络错误会返回明确失败状态', async () => {
+test('GitHub API 限流时通过 Releases Atom 获取最新版本', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'weibo-update-atom-'));
+  try {
+    const latest = release('1.1.2', 'windows-x64');
+    const manifestName = Object.keys(latest.manifests)[0];
+    const fetchImpl = async url => {
+      url = String(url);
+      if (url === api) return new Response('rate limited', { status: 403 });
+      if (url === atom) return new Response(`<feed><entry><updated>2026-11-09T15:00:00Z</updated><link href="https://github.com/example/project/releases/tag/v1.1.2"/></entry></feed>`);
+      if (url.endsWith(manifestName)) return new Response(JSON.stringify(latest.manifests[manifestName]));
+      throw new Error('unexpected ' + url);
+    };
+    const update = manager(dir, fetchImpl, { platform: 'win32', arch: 'x64' });
+    const status = await update.check({ force: true });
+    assert.equal(status.latestVersion, '1.1.2');
+    assert.equal(status.available, true);
+    assert.equal(status.release.assetName, 'weibo-console-1.1.2-windows-x64-update.zip');
+    assert.equal(status.release.installerName, 'weibo-console-1.1.2-windows-x64.exe');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('GitHub API 与 Releases 页面都无法连接时返回用户可读错误', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'weibo-update-rate-limit-'));
   try {
-    const update = manager(dir, async () => new Response('rate limited', { status: 429 }));
-    await assert.rejects(update.check({ force: true }), /HTTP 429/);
-    assert.match(update.snapshot().lastError, /HTTP 429/);
+    const update = manager(dir, async () => { throw new TypeError('fetch failed'); });
+    await assert.rejects(update.check({ force: true }), /无法连接 GitHub/);
+    assert.match(update.snapshot().lastError, /无法连接 GitHub/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

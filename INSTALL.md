@@ -1,14 +1,14 @@
 # 制饼工坊安装说明
 
-适用版本：`v1.1.1`
+适用版本：`v1.1.2`
 
 ## 先选对安装包
 
 | 电脑 | 下载文件 |
 | --- | --- |
-| Apple 芯片 Mac（M1/M2/M3/M4） | `weibo-console-1.1.1-mac-arm64.dmg` |
-| Intel 芯片 Mac | `weibo-console-1.1.1-mac-x64.dmg` |
-| Windows 10/11 x64 | `weibo-console-1.1.1-windows-x64.exe` |
+| Apple 芯片 Mac（M1/M2/M3/M4） | `weibo-console-1.1.2-mac-arm64.dmg` |
+| Intel 芯片 Mac | `weibo-console-1.1.2-mac-x64.dmg` |
+| Windows 10/11 x64 | `weibo-console-1.1.2-windows-x64.exe` |
 
 Release 下载页：<https://github.com/xxz18078501627-rgb/weibo-supertopic-console/releases/latest>
 
@@ -62,13 +62,13 @@ Release 同时提供对应的 `.manifest.json`。
 Mac：
 
 ```bash
-shasum -a 256 weibo-console-1.1.1-mac-arm64.dmg
+shasum -a 256 weibo-console-1.1.2-mac-arm64.dmg
 ```
 
 Windows PowerShell：
 
 ```powershell
-Get-FileHash .\weibo-console-1.1.1-windows-x64.exe -Algorithm SHA256
+Get-FileHash .\weibo-console-1.1.2-windows-x64.exe -Algorithm SHA256
 ```
 
 输出值应与清单中的 `installerSha256` 完全一致。

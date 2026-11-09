@@ -1825,6 +1825,7 @@ function renderUpdateEntry() {
       : updateState?.available ? "available" : updateState?.checkedAt ? "current" : "idle";
   const text = updateState?.switched ? "v" + updateState.activatedVersion + " · 待重启"
     : updateState?.available ? "v" + updateState.currentVersion + " · 有新版本"
+    : updateState?.lastError ? current + " · 检查失败"
     : updateState?.checkedAt ? current + " · 已是最新" : current;
   label.textContent = text; dot.className = "update-dot " + tone;
   if (!dialog) return;
@@ -1833,7 +1834,8 @@ function renderUpdateEntry() {
   $("#update-platform").textContent = updateState?.platformKey || "不支持";
   $("#update-state").textContent = updateState?.switched ? "已切换，重启后生效" : updateState?.applying ? "正在更新" : updateState?.download?.state === "downloading"
     ? "下载 " + Number(updateState.download.percent || 0) + "%"
-    : updateState?.downloaded ? "已下载，可更新" : updateState?.available ? "有可用更新" : updateState?.checkedAt ? "已是最新" : "尚未检查";
+    : updateState?.downloaded ? "已下载，可更新" : updateState?.available ? "有可用更新"
+      : updateState?.lastError ? "检查失败" : updateState?.checkedAt ? "已是最新" : "尚未检查";
   $("#update-notes").textContent = updateState?.release?.notes || "暂无更新说明";
   const restart = $("#update-restart-toggle").checked;
   $("#update-command").value = restart ? (updateState?.command || "") : (updateState?.commandNoRestart || "");

@@ -129,6 +129,26 @@ test('更新弹窗展示平台版本和只读命令，关闭重启开关可切�
   await page.close();
 });
 
+test('更新检查失败时显示检查失败而不是误报已是最新', async () => {
+  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  await page.route('**/api/update/status*', route => route.fulfill({ json: {
+    currentVersion: '1.1.0', latestVersion: '', platformKey: 'windows-x64', available: false,
+    downloaded: false, checkedAt: new Date().toISOString(), blockedReason: '',
+    lastError: '无法连接 GitHub，请检查网络或代理后重试', release: null,
+    command: 'node "C:\\ZhibingStudio\\bootstrap.mjs" update --platform windows-x64 --version <最新版本> --restart',
+    commandNoRestart: 'node "C:\\ZhibingStudio\\bootstrap.mjs" update --platform windows-x64 --version <最新版本> --no-restart'
+  } }));
+  await page.goto(`http://127.0.0.1:${port}`);
+  await page.locator('#token').fill(token);
+  await page.getByRole('button', { name: '进入工坊' }).click();
+  await page.locator('#update-entry').click();
+  await page.waitForFunction(() => document.querySelector('#update-state')?.textContent === '检查失败');
+  assert.match(await page.locator('#update-entry-version').textContent(), /检查失败/);
+  assert.equal(await page.locator('#update-error').textContent(), '无法连接 GitHub，请检查网络或代理后重试');
+  assert.notEqual(await page.locator('#update-state').textContent(), '已是最新');
+  await page.close();
+});
+
 test('发帖拒绝后延迟验证码进入验证，人工完成后原窗口自动回执且只点一次发送', async () => {
   const page = await browser.newPage();
   let sends = 0, posted = null;

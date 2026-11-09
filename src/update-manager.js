@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 
 const OFFICIAL_HOSTS = new Set(['github.com', 'api.github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com']);
 const MAX_UPDATE_BYTES = 2 * 1024 * 1024 * 1024;
+const DEFAULT_REPO = 'xxz18078501627-rgb/weibo-supertopic-console';
 const DEFAULT_API = 'https://api.github.com/repos/xxz18078501627-rgb/weibo-supertopic-console/releases?per_page=30';
 
 function versionParts(value) {
@@ -36,10 +37,11 @@ function safeVersion(value) {
 
 export class UpdateManager {
   constructor({
-    rootDir, dataDir, currentVersion, repo = 'xxz18078501627-rgb/weibo-supertopic-console',
+    rootDir, dataDir, currentVersion, repo = DEFAULT_REPO,
     platform = process.platform, arch = process.arch, fetchImpl = fetch, spawnImpl = spawn,
     idleCheck = async () => null, helperPath = path.join(rootDir, 'scripts', 'update-helper.mjs'),
-    apiUrl = process.env.WEIBO_CONSOLE_RELEASE_API || DEFAULT_API, now = Date.now,
+    apiUrl = process.env.WEIBO_CONSOLE_RELEASE_API || DEFAULT_API,
+    atomUrl = process.env.WEIBO_CONSOLE_RELEASE_ATOM || `https://github.com/${repo}/releases.atom`, now = Date.now,
     installRoot = process.env.WEIBO_CONSOLE_INSTALL_ROOT || ''
   } = {}) {
     this.rootDir = rootDir;
@@ -56,6 +58,7 @@ export class UpdateManager {
     this.idleCheck = idleCheck;
     this.helperPath = helperPath;
     this.apiUrl = apiUrl;
+    this.atomUrl = atomUrl;
     this.now = now;
     this.releases = null;
     this.checkedAt = 0;
@@ -122,10 +125,20 @@ export class UpdateManager {
 
   async #check() {
     try {
-      const response = await this.fetch(this.apiUrl, { headers: { 'User-Agent': 'weibo-console', Accept: 'application/vnd.github+json' }, signal: AbortSignal.timeout(15000) });
-      if (!response.ok) throw new Error(`获取 GitHub 更新失败：HTTP ${response.status}`);
-      const releases = await response.json();
-      if (!Array.isArray(releases)) throw new Error('GitHub 更新响应格式不正确');
+      let releases = null, apiError = null;
+      try {
+        const response = await this.fetch(this.apiUrl, { headers: { 'User-Agent': 'weibo-console', Accept: 'application/vnd.github+json' }, signal: AbortSignal.timeout(15000) });
+        if (!response.ok) throw new Error(`GitHub API HTTP ${response.status}`);
+        releases = await response.json();
+        if (!Array.isArray(releases)) throw new Error('GitHub 更新响应格式不正确');
+        if (!releases.length) releases = null;
+      } catch (error) { apiError = error; }
+      // The anonymous API is commonly rate-limited. The public Releases Atom
+      // feed uses github.com itself and still provides the exact version tags.
+      if (!releases) {
+        try { releases = await this.#atomReleases(); }
+        catch (atomError) { throw this.#checkError(apiError, atomError); }
+      }
       const manifests = [];
       for (const release of releases) {
         const assets = Array.isArray(release.assets) ? release.assets : [];
@@ -167,6 +180,44 @@ export class UpdateManager {
       this.checkedAt = this.now();
       throw error;
     }
+  }
+
+  async #atomReleases() {
+    const response = await this.fetch(this.atomUrl, { headers: { 'User-Agent': 'weibo-console', Accept: 'application/atom+xml' }, signal: AbortSignal.timeout(15000) });
+    if (!response.ok) throw new Error(`GitHub Releases HTTP ${response.status}`);
+    const text = await response.text();
+    const releases = [];
+    for (const match of text.matchAll(/<entry>([\s\S]*?)<\/entry>/g)) {
+      const entry = match[1];
+      const tag = entry.match(/releases\/tag\/(v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/)?.[1]
+        || entry.match(/Repository\/\d+\/(v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/)?.[1] || '';
+      const version = safeVersion(tag);
+      if (!version) continue;
+      const releaseTag = tag.startsWith('v') ? tag : `v${version}`;
+      const updated = entry.match(/<updated>([^<]+)<\/updated>/)?.[1] || '';
+      const base = `https://github.com/${this.repo}/releases/download/${releaseTag}`;
+      const manifestName = `weibo-console-${version}-${this.key}.manifest.json`;
+      const updateName = `weibo-console-${version}-${this.key}-update.zip`;
+      const installerName = `weibo-console-${version}-${this.key}.${this.key === 'windows-x64' ? 'exe' : 'dmg'}`;
+      releases.push({ tag_name: releaseTag, published_at: updated, body: '', assets: [
+        { name: manifestName, browser_download_url: `${base}/${manifestName}` },
+        { name: updateName, browser_download_url: `${base}/${updateName}` },
+        { name: installerName, browser_download_url: `${base}/${installerName}` }
+      ] });
+    }
+    if (!releases.length) throw new Error('GitHub Releases 中没有可识别版本');
+    return releases;
+  }
+
+  #checkError(apiError, atomError) {
+    const details = [apiError?.message, atomError?.message].filter(Boolean).join('；');
+    const text = details.toLowerCase();
+    const message = /fetch failed|econn|enotfound|etimedout|timeout|network|socket|tls/.test(text)
+      ? '无法连接 GitHub，请检查网络或代理后重试'
+      : /http 403|rate limit/.test(text)
+        ? 'GitHub 暂时限制更新检查，请稍后重试'
+        : `检查更新失败：${details || '未知错误'}`;
+    return Object.assign(new Error(message), { code: 'update_check_failed' });
   }
 
   startDownload() {
