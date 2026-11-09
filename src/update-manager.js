@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 
 const OFFICIAL_HOSTS = new Set(['github.com', 'api.github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com']);
 const MAX_UPDATE_BYTES = 2 * 1024 * 1024 * 1024;
@@ -35,6 +35,15 @@ function safeVersion(value) {
   return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(clean) ? clean : '';
 }
 
+function runFile(command, args, options) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, options, (error, stdout, stderr) => {
+      if (error) return reject(Object.assign(error, { stderr }));
+      resolve(String(stdout || ''));
+    });
+  });
+}
+
 export class UpdateManager {
   constructor({
     rootDir, dataDir, currentVersion, repo = DEFAULT_REPO,
@@ -42,7 +51,9 @@ export class UpdateManager {
     idleCheck = async () => null, helperPath = path.join(rootDir, 'scripts', 'update-helper.mjs'),
     apiUrl = process.env.WEIBO_CONSOLE_RELEASE_API || DEFAULT_API,
     atomUrl = process.env.WEIBO_CONSOLE_RELEASE_ATOM || `https://github.com/${repo}/releases.atom`, now = Date.now,
-    installRoot = process.env.WEIBO_CONSOLE_INSTALL_ROOT || ''
+    installRoot = process.env.WEIBO_CONSOLE_INSTALL_ROOT || '',
+    nativeNetworkFallback = fetchImpl === globalThis.fetch,
+    nativeTextImpl = null, nativeDownloadImpl = null
   } = {}) {
     this.rootDir = rootDir;
     this.installRoot = installRoot ? path.resolve(installRoot) : '';
@@ -68,6 +79,9 @@ export class UpdateManager {
     this.downloadProgress = null;
     this.lastError = '';
     this.applyState = null;
+    this.nativeNetworkFallback = nativeNetworkFallback;
+    this.nativeTextImpl = nativeTextImpl;
+    this.nativeDownloadImpl = nativeDownloadImpl;
   }
 
   command(restart = true) {
@@ -127,9 +141,9 @@ export class UpdateManager {
     try {
       let releases = null, apiError = null;
       try {
-        const response = await this.fetch(this.apiUrl, { headers: { 'User-Agent': 'weibo-console', Accept: 'application/vnd.github+json' }, signal: AbortSignal.timeout(15000) });
-        if (!response.ok) throw new Error(`GitHub API HTTP ${response.status}`);
-        releases = await response.json();
+        releases = JSON.parse(await this.#requestText(this.apiUrl, {
+          headers: { 'User-Agent': 'weibo-console', Accept: 'application/vnd.github+json' }, timeout: 15000
+        }));
         if (!Array.isArray(releases)) throw new Error('GitHub 更新响应格式不正确');
         if (!releases.length) releases = null;
       } catch (error) { apiError = error; }
@@ -151,9 +165,9 @@ export class UpdateManager {
       manifests.sort((a, b) => String(b.release.published_at || '').localeCompare(String(a.release.published_at || '')));
       let selected = null;
       for (const candidate of manifests) {
-        const response = await this.fetch(candidate.asset.browser_download_url, { headers: { 'User-Agent': 'weibo-console' }, signal: AbortSignal.timeout(15000) });
-        if (!response.ok) continue;
-        const manifest = await response.json();
+        let manifest;
+        try { manifest = JSON.parse(await this.#requestText(candidate.asset.browser_download_url, { timeout: 15000 })); }
+        catch { continue; }
         if (manifest.platformKey !== this.key || !safeVersion(manifest.version)) continue;
         const minimum = safeVersion(manifest.minVersion);
         if (minimum && compareVersions(this.currentVersion, minimum) < 0) continue;
@@ -183,9 +197,7 @@ export class UpdateManager {
   }
 
   async #atomReleases() {
-    const response = await this.fetch(this.atomUrl, { headers: { 'User-Agent': 'weibo-console', Accept: 'application/atom+xml' }, signal: AbortSignal.timeout(15000) });
-    if (!response.ok) throw new Error(`GitHub Releases HTTP ${response.status}`);
-    const text = await response.text();
+    const text = await this.#requestText(this.atomUrl, { headers: { Accept: 'application/atom+xml' }, timeout: 15000 });
     const releases = [];
     for (const match of text.matchAll(/<entry>([\s\S]*?)<\/entry>/g)) {
       const entry = match[1];
@@ -220,6 +232,50 @@ export class UpdateManager {
     return Object.assign(new Error(message), { code: 'update_check_failed' });
   }
 
+  async #requestText(url, { headers = {}, timeout = 15000 } = {}) {
+    try {
+      const response = await this.fetch(url, { headers, signal: AbortSignal.timeout(timeout) });
+      if (!response.ok) throw new Error(`GitHub HTTP ${response.status}`);
+      return await response.text();
+    } catch (fetchError) {
+      if (!this.nativeNetworkFallback) throw fetchError;
+      try {
+        const text = this.nativeTextImpl ? await this.nativeTextImpl(url, timeout) : await this.#nativeText(url, timeout);
+        return String(text).replace(/^\uFEFF/, '');
+      }
+      catch (nativeError) {
+        throw Object.assign(new Error(`${fetchError.message}；${nativeError.message}`), { cause: nativeError });
+      }
+    }
+  }
+
+  async #nativeText(url, timeout) {
+    if (!officialUrl(url)) throw new Error('更新地址不是官方 GitHub 域名');
+    if (process.platform === 'win32') {
+      return runFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+        "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; (Invoke-WebRequest -UseBasicParsing -Uri $env:WEIBO_UPDATE_URL -Headers @{'User-Agent'='weibo-console'} -TimeoutSec 30).Content"
+      ], { env: { ...process.env, WEIBO_UPDATE_URL: url }, timeout: timeout + 15000, maxBuffer: 16 * 1024 * 1024, windowsHide: true });
+    }
+    return runFile('/usr/bin/curl', ['--proto', '=https', '--tlsv1.2', '-fsSL', '--max-time', String(Math.ceil(timeout / 1000)), '-A', 'weibo-console', url], {
+      timeout: timeout + 5000, maxBuffer: 16 * 1024 * 1024
+    });
+  }
+
+  async #nativeDownload(url, target, timeout) {
+    if (!officialUrl(url)) throw new Error('更新下载地址不是官方 GitHub 域名');
+    if (process.platform === 'win32') {
+      await runFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+        "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing -Uri $env:WEIBO_UPDATE_URL -Headers @{'User-Agent'='weibo-console'} -TimeoutSec 600 -OutFile $env:WEIBO_UPDATE_OUT"
+      ], { env: { ...process.env, WEIBO_UPDATE_URL: url, WEIBO_UPDATE_OUT: target }, timeout: timeout + 15000, windowsHide: true });
+    } else {
+      await runFile('/usr/bin/curl', ['--proto', '=https', '--tlsv1.2', '-fL', '--max-time', String(Math.ceil(timeout / 1000)), '-A', 'weibo-console', '--output', target, url], {
+        timeout: timeout + 5000
+      });
+    }
+    const size = fs.statSync(target).size;
+    if (!size || size > MAX_UPDATE_BYTES) throw new Error('更新包大小无效');
+  }
+
   startDownload() {
     if (this.downloading) return this.snapshot();
     const release = this.latest;
@@ -238,27 +294,36 @@ export class UpdateManager {
         return target;
       }
       if (!officialUrl(release.assetUrl)) throw new Error('更新下载地址不是官方 GitHub 域名');
-      const response = await this.fetch(release.assetUrl, { headers: { 'User-Agent': 'weibo-console' }, redirect: 'follow', signal: AbortSignal.timeout(5 * 60 * 1000) });
-      if (!response.ok) throw new Error(`下载更新失败：HTTP ${response.status}`);
-      if (response.url && !officialUrl(response.url)) throw new Error('更新下载被重定向到非官方域名');
-      const declaredSize = Number(response.headers?.get?.('content-length') || release.size || 0);
-      if (declaredSize > MAX_UPDATE_BYTES) throw new Error('更新包超过允许的大小');
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('更新下载响应不可读取');
-      const handle = fs.openSync(part, 'w', 0o600);
       let received = 0;
       try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (received + value.byteLength > MAX_UPDATE_BYTES) throw new Error('更新包超过允许的大小');
-          fs.writeSync(handle, value);
-          received += value.byteLength;
-          const total = Number(release.size || 0);
-          this.downloadProgress = { state: 'downloading', percent: total ? Math.min(99, Math.floor(received * 100 / total)) : 0,
-            received, total, error: '' };
-        }
-      } finally { fs.closeSync(handle); }
+        const response = await this.fetch(release.assetUrl, { headers: { 'User-Agent': 'weibo-console' }, redirect: 'follow', signal: AbortSignal.timeout(5 * 60 * 1000) });
+        if (!response.ok) throw new Error(`下载更新失败：HTTP ${response.status}`);
+        if (response.url && !officialUrl(response.url)) throw new Error('更新下载被重定向到非官方域名');
+        const declaredSize = Number(response.headers?.get?.('content-length') || release.size || 0);
+        if (declaredSize > MAX_UPDATE_BYTES) throw new Error('更新包超过允许的大小');
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error('更新下载响应不可读取');
+        const handle = fs.openSync(part, 'w', 0o600);
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (received + value.byteLength > MAX_UPDATE_BYTES) throw new Error('更新包超过允许的大小');
+            fs.writeSync(handle, value);
+            received += value.byteLength;
+            const total = Number(release.size || 0);
+            this.downloadProgress = { state: 'downloading', percent: total ? Math.min(99, Math.floor(received * 100 / total)) : 0,
+              received, total, error: '' };
+          }
+        } finally { fs.closeSync(handle); }
+      } catch (fetchError) {
+        if (!this.nativeNetworkFallback) throw fetchError;
+        if (this.nativeDownloadImpl) await this.nativeDownloadImpl(release.assetUrl, part, 5 * 60 * 1000);
+        else await this.#nativeDownload(release.assetUrl, part, 5 * 60 * 1000);
+        received = fs.statSync(part).size;
+        if (received > MAX_UPDATE_BYTES) throw new Error('更新包超过允许的大小');
+        this.downloadProgress = { state: 'downloading', percent: 99, received, total: release.size, error: '' };
+      }
       const digest = createHash('sha256').update(fs.readFileSync(part)).digest('hex');
       if (digest !== release.sha256) throw new Error('更新包 SHA256 校验失败，已删除下载');
       fs.renameSync(part, target);

@@ -3,6 +3,11 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and test packages without creating a GitHub Release
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -143,6 +148,7 @@ jobs:
 
   publish:
     needs: package
+    if: github.event_name == 'push' || inputs.dry_run == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -109,6 +109,27 @@ test('GitHub API 限流时通过 Releases Atom 获取最新版本', async () => 
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('Node 完全无法连接 GitHub 时通过系统网络回退检查更新', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'weibo-update-native-fallback-'));
+  try {
+    const latest = release('1.1.2', 'windows-x64');
+    const manifestName = Object.keys(latest.manifests)[0];
+    const nativeTextImpl = async url => {
+      if (url === api) throw new Error('GitHub HTTP 403');
+      if (url === atom) return '<feed><entry><updated>2026-11-09T15:00:00Z</updated><link href="https://github.com/example/project/releases/tag/v1.1.2"/></entry></feed>';
+      if (url.endsWith(manifestName)) return JSON.stringify(latest.manifests[manifestName]);
+      throw new Error('unexpected ' + url);
+    };
+    const update = manager(dir, async () => { throw new TypeError('fetch failed'); }, {
+      platform: 'win32', arch: 'x64', nativeNetworkFallback: true, nativeTextImpl
+    });
+    const status = await update.check({ force: true });
+    assert.equal(status.latestVersion, '1.1.2');
+    assert.equal(status.available, true);
+    assert.equal(status.lastError, '');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('GitHub API 与 Releases 页面都无法连接时返回用户可读错误', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'weibo-update-rate-limit-'));
   try {

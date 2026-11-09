@@ -126,8 +126,31 @@ OutputBaseFilename=weibo-console-${version}-windows-x64
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+UsePreviousAppDir=yes
+DisableDirPage=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+  NodeExe: String;
+  ServiceScript: String;
+begin
+  Result := '';
+  NodeExe := ExpandConstant('{app}\\runtime\\node\\node.exe');
+  ServiceScript := ExpandConstant('{app}\\service.mjs');
+  if FileExists(NodeExe) and FileExists(ServiceScript) then
+  begin
+    if not Exec(NodeExe, '"' + ServiceScript + '" stop', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    begin
+      Result := '无法停止旧版服务，请关闭程序后重新安装。';
+      Exit;
+    end;
+    if ResultCode <> 0 then
+      Result := '旧版服务仍在运行。请先打开工作台暂停任务、结束验证，再重新安装。';
+  end;
+end;
 [Files]
 Source: "${escapedRoot}\\*\"; DestDir: "{app}\\versions\\{#AppVersion}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "${runtimeRoot}\\node\\node.exe"; DestDir: "{app}\\runtime\\node"; Flags: ignoreversion

@@ -80,6 +80,14 @@ try {
   fs.writeFileSync(path.join(installRoot, 'data', 'installer-preserve.txt'), '用户数据必须保留');
   console.log('Native EXE install, shortcut, autostart and health passed');
 
+  // Reinstall the same EXE while the service is running. The installer must
+  // stop portable Node before replacing it and keep the user data directory.
+  run(installer, ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', `/DIR=${installRoot}`], { timeout: 300000 });
+  await waitVersion(version);
+  assert.equal(fs.readFileSync(path.join(installRoot, 'data', 'installer-preserve.txt'), 'utf8'), '用户数据必须保留');
+  assert.ok(fs.existsSync(path.join(installRoot, 'data', 'console.sqlite')));
+  console.log('Second EXE install stopped the old service and preserved data');
+
   const parts = version.split('.').map(Number);
   const nextVersion = `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
   const packageFolder = path.join(temp, 'update', `weibo-console-${nextVersion}`);
