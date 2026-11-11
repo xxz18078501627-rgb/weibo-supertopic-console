@@ -20,6 +20,13 @@ test('转发数字/图标入口、div详情卡、页内编辑器，成功提示�
  assert.equal(result.state,'succeeded');assert.equal(result.successSource,'page_notice');assert.equal(saved.length,1);assert.equal(submitted,1);assert.equal(saved[0].receiptId,null);await p.close();});
 test('engage评论使用原微博图标入口、正确编辑器，评论成功即可',async()=>{const p=await fixture();const a=new WeiboAdapter({page:async()=>p});let saved=[];
  const r=await a.comment(account,{url:link,id:'12345'},'支持目标',{engage:true,onReceipt:r=>saved.push(r)});assert.equal(r.state,'succeeded');assert.equal(r.successSource,'page_notice');assert.equal(saved.length,1);await p.close();});
+test('数字 mid 链接在正文页渲染成短编号时仍能定位目标卡片',async()=>{const p=await browser.newPage();p.setDefaultTimeout(1800);
+ await p.route('https://weibo.com/**',r=>r.fulfill({contentType:'text/html;charset=utf-8',body:
+  '<article class="woo-panel-main"><div><a href="/77/RquazFEBs">26-11-8</a><p>目标原微博</p></div><div class="toolbar_main"><button title="赞">1</button></div></article>'}));
+ await p.goto('https://weibo.com/77/5363125039927530');
+ const a=new WeiboAdapter({page:async()=>p});const started=Date.now();
+ const card=await a.engagePostCard(p,'5363125039927530');
+ assert.ok(card);assert.equal(await p.locator('[data-engage-toolbar]').count(),1);assert.ok(Date.now()-started<5000);await p.close();});
 test('转发按配置勾选同时评论，评论不再操作同时转发',async()=>{
  for(const coupled of [true,false]){
   const p=await fixture(),a=new WeiboAdapter({page:async()=>p});

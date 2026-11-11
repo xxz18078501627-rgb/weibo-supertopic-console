@@ -307,6 +307,20 @@ export function weiboShortIdToNumeric(shortId) {
   }).join('');
 }
 
+// 纯数字 mid 与详情页短编号互换。微博正文页只把短编号写进链接，
+// 用户粘贴 /账号/纯数字 形式的链接时需要用它来定位同一张卡片。
+export function weiboNumericToShortId(mid) {
+  const digits = String(mid ?? '').trim();
+  if (!/^\d+$/.test(digits)) throw new Error('微博数字编号无效');
+  const chunks = [];
+  for (let end = digits.length; end > 0; end -= 7) chunks.unshift(digits.slice(Math.max(0, end - 7), end));
+  return chunks.map(chunk => {
+    let value = BigInt(chunk), encoded = '';
+    do { encoded = BASE62[Number(value % 62n)] + encoded; value /= 62n; } while (value > 0n);
+    return encoded;
+  }).join('');
+}
+
 export function weiboLinkStatusId(link) {
   try {
     const url = new URL(String(link || ''));
@@ -2067,11 +2081,15 @@ export class WeiboAdapter {
   }
 
   async engagePostCard(page, id) {
-    const numeric = /^\d+$/.test(id) ? id : weiboShortIdToNumeric(id);
-    await page.locator('a[href*="'+id+'"], [data-mid="'+numeric+'"]').first().waitFor({state:'visible',timeout:10000}).catch(()=>{});
+    const raw = String(id || '');
+    const numeric = /^\d+$/.test(raw) ? raw : weiboShortIdToNumeric(raw);
+    let short = /^\d+$/.test(raw) ? '' : raw;
+    if (!short) { try { short = weiboNumericToShortId(numeric); } catch { short = raw; } }
+    const forms = [...new Set([short, raw, numeric].filter(Boolean))];
+    await page.locator(forms.map(value => 'a[href*="' + value + '"]').join(', ') + ', [data-mid="'+numeric+'"]').first().waitFor({state:'visible',timeout:10000}).catch(()=>{});
     // Scope every toolbar to the exact detail card. A recommended post or a
     // nested retweet's toolbar is never a substitute for the requested post.
-    const marked = await markEngagePost(page, id, numeric);
+    const marked = await markEngagePost(page, short || raw, numeric);
     return marked ? page.locator('[data-engage-target="true"]') : null;
   }
 
