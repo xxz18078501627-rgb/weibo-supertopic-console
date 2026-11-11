@@ -73,6 +73,7 @@ for (const legacy of [false, true]) test(`未提交恢复沿用原文/编号，�
   const action = d.listActionLogs(f.job.id)[0]; assert.equal(action.state, 'prepared');
   await f.tick(); assert.equal(calls, 1);
   await f.tick(); await until(() => d.getJob(f.job.id).status === 'completed');
+  if (f.runner.promise) await f.runner.promise;
   assert.deepEqual(texts, [texts[0], texts[0]]); assert.equal(calls, 2);
   const final = d.listActionLogs(f.job.id)[0]; assert.equal(final.id, action.id); assert.equal(final.sequence_number, action.sequence_number);
   assert.equal(d.getJob(f.job.id).metrics.success, 1); assert.equal(d.getJob(f.job.id).metrics.failed, 0);
@@ -84,6 +85,7 @@ for (const legacy of [false, true]) for (const confirmed of [false, true]) test(
     verifyPost: async () => { reads++; return { state: confirmed ? 'succeeded' : 'uncertain' }; } }, { legacy });
   await f.runner.run(f.job.id); assert.equal(d.listActionLogs(f.job.id)[0].state, 'uncertain');
   await f.tick(); await f.tick(); await until(() => d.getJob(f.job.id).status === 'completed');
+  if (f.runner.promise) await f.runner.promise;
   assert.equal(sends, 1); assert.equal(reads, 1);
   const metrics = d.getJob(f.job.id).metrics; assert.equal(metrics.success, confirmed ? 1 : 0); assert.equal(metrics.uncertain, confirmed ? 0 : 1);
 });
