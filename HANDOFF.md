@@ -267,10 +267,10 @@
 | 项 | 值 |
 | --- | --- |
 | 代码版本 | `1.1.4`（未发布，工作区） |
-| 服务 | 运行中，`http://localhost:4178`；1.1.4 尚未重启加载，重启后以 health 为准 |
+| 服务 | 运行中，`http://localhost:4178`，v1.1.4，pid 49919，supervised=true，2026-11-14 00:26 启动 |
 | 启动方式 | launchd `com.local.weibo-super-topic-console`，`runs = 5`，`last exit code = 0` |
-| 代码 HEAD | `5c25f02 test: await navigation recovery cleanup`（2026-11-11） |
-| 工作区 | **有未提交改动**，含 11-12 停止语义、11-13 签到卡修复和 1.1.4 新改动 |
+| 代码 HEAD | `c7d711e docs: prepare the 1.1.4 release notes and handoff` |
+| 工作区 | 干净；仅 `license-server/`（独立云端签发服务）未跟踪 |
 | 数据规模 | 95 个账号、154 个任务、21,891 条动作流水、1 个超话、1,042 张验证卡；库约 124 MB |
 | 运行中任务 | 当前无；昨晚任务已在 23:59 日停时停止 |
 
@@ -282,7 +282,7 @@
 - 浏览器定时重开：`settings.browser_recycle_v1`，默认 20 次/10 分钟，高级页可改。
 - 左侧栏“重启服务”：`POST /api/service/restart`；非零退出，launchd/监督器自动拉起，页面轮询健康后刷新。
 - `scripts/service-runner.mjs` 增加监督重启（1/5/15/60 秒）；server 增加未捕获异常/未处理拒绝处理，退出后由监督器拉起。
-- 全量 `npm test` 387 通过、1 跳过；`npm run test:e2e` 77 通过。
+- 全量 `npm test` 387 通过、1 跳过；`npm run test:e2e` 77 通过；代码提交 `6852f26`，文档提交 `c7d711e`，尚未推送/发版。
 
 ### 未提交改动（2026-11-12，尚未发布）
 
