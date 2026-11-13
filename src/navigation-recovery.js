@@ -38,7 +38,9 @@ export class NavigationRecovery {
     this.flight = null;
     this.jobId = null;
     this.watchdogTimer = null;
-    this.startWatchdog();
+    // Unit tests construct throw-away runners without a scope and close the
+    // database at the end; a live 30 s watchdog would then query a closed DB.
+    if (this.runner.scope) this.startWatchdog();
   }
   manual(jobId) { return this.runner.workflow.session?.jobId === jobId; }
   waiting(job) { return job?.cursor?.navigationRecovery?.state === 'waiting'; }
