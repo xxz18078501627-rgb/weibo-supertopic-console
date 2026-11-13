@@ -709,6 +709,11 @@ export function createActionLog(data) {
 export function updateActionLog(actionId, patch) {
   const row = db.prepare('SELECT * FROM action_logs WHERE id=?').get(actionId);
   if (!row) return null;
+  // Stop is terminal for unfinished work. A browser callback that finishes
+  // after the user pressed Stop may still record a confirmed success, but it
+  // must not turn the durable "skipped" result back into failed/uncertain.
+  if (row.state === 'skipped' && patch.state && patch.state !== 'succeeded'
+    && db.prepare('SELECT status FROM jobs WHERE id=?').get(row.job_id)?.status === 'stopped') return row;
   // An attempt token fences old asynchronous callbacks, including after a
   // user explicitly confirms that an earlier attempt was not published.
   if (patch.attemptId && patch.attemptId !== row.attempt_id) return row;

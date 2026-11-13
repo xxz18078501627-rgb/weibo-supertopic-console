@@ -97,7 +97,12 @@ test('重启保持nextCheckAt和成功次数，手动暂停不恢复，继续后
   const other = new TaskRunner(f.runner.adapter, { now: f.runner.now }); runners.push(other); await other.recover();
   assert.ok(other.navigation.timer); assert.deepEqual(d.getJob(f.job.id).cursor.navigationRecovery, before);
   other.pause(f.job.id); await other.navigation.tick(f.job.id); assert.equal(d.getJob(f.job.id).pausedByUser, true);
-  other.resume(f.job.id); assert.equal(d.getJob(f.job.id).status, 'paused'); assert.ok(other.navigation.timer);
+  other.resume(f.job.id);
+  await until(() => d.getJob(f.job.id).status === 'paused');
+  const resumed = d.getJob(f.job.id);
+  assert.equal(resumed.pausedByUser, false);
+  assert.equal(resumed.cursor.navigationRecovery.state, 'waiting');
+  assert.ok(other.navigation.timer);
 });
 
 for (const end of ['pause', 'stop', 'deadline']) test(`探测期间${end}优先，迟到成功不能恢复`, async () => {
@@ -156,8 +161,12 @@ test('手动暂停后编辑导致故障步骤被撤销，不自动执行旧配�
   const f = fixture({ ensureIdentity: async () => { throw fault(); } }); await f.runner.run(f.job.id);
   f.runner.pause(f.job.id);
   const job = d.getJob(f.job.id); d.updateJob(job.id, { cursor: { ...job.cursor, configVersion: 1 } });
-  f.runner.resume(job.id); await f.tick(); await f.tick();
-  const changed = d.getJob(job.id); assert.equal(changed.pausedByUser, true); assert.equal(changed.cursor.navigationRecovery.state, 'cancelled');
+  f.runner.resume(job.id);
+  await until(() => d.getJob(job.id).status === 'paused');
+  const changed = d.getJob(job.id);
+  assert.equal(changed.pausedByUser, false);
+  assert.equal(changed.cursor.navigationRecovery.state, 'waiting');
+  assert.equal(changed.cursor.navigationRecovery.configVersion, 1);
   assert.equal(changed.metrics.failed, 0);
 });
 
@@ -170,12 +179,14 @@ test('人工窗口就地恢复连续两次通过，不关闭上下文、不接�
   assert.ok(f.runner.workflow.session); f.runner.workflow.session = null;
 });
 
-test('已提交故障停止后仍计待核对，不留network_review非终态', async () => {
+test('已提交故障停止后直接跳过剩余操作，不留待核对或后台复核', async () => {
   const f = fixture({ post: async (_a,_t,_text,o) => { o.onSubmit(); throw fault(); } });
   await f.runner.run(f.job.id); f.runner.stop(f.job.id); await until(() => d.getJob(f.job.id).status === 'stopped');
-  assert.equal(d.getJob(f.job.id).metrics.uncertain, 1);
-  assert.equal(f.runner.workflow.rows(f.job.id, 0)[0].state, 'review');
-  assert.equal(d.listActionLogs(f.job.id)[0].state, 'uncertain');
+  assert.equal(d.getJob(f.job.id).metrics.uncertain, 0);
+  assert.equal(f.runner.workflow.rows(f.job.id, 0)[0].state, 'done');
+  assert.equal(f.runner.workflow.rows(f.job.id, 0)[0].outcome, 'skipped');
+  assert.equal(d.listActionLogs(f.job.id)[0].state, 'skipped');
+  assert.equal(f.runner.autoReadbackCandidates(d.getJob(f.job.id)).length, 0);
 });
 
 test('人工会话中已提交的导航故障恢复为review，不恢复为可重发pending', async () => {
@@ -225,4 +236,51 @@ test('人工会话中恢复遇验证码后窗口关闭，仍有卡片与review�
   assert.equal(f.runner.workflow.rows(f.job.id, 0)[0].state, 'review');
   const status = f.runner.workflow.status(d.getJob(f.job.id)); assert.equal(status.cards.length, 1); assert.equal(status.cards[0].status, 'pending');
   assert.equal(d.getJob(f.job.id).cursor.verificationBarrier, true);
+});
+
+test('等待态禁止提交返回 409 而不是 500，立即重试重新执行一次未提交动作', async () => {
+  let sends = 0;
+  const f = fixture({ post: async (_a, _t, _text, options) => {
+    sends += 1;
+    if (sends === 1) throw fault();
+    options.onSubmit();
+    return { state: 'succeeded' };
+  } });
+  await f.runner.run(f.job.id);
+  assert.equal(d.getJob(f.job.id).cursor.navigationRecovery.state, 'waiting');
+  assert.throws(() => f.runner.assertMaySubmit(f.job.id),
+    error => error.statusCode === 409 && error.code === 'navigation_unavailable');
+  await f.runner.retryNavigation(f.job.id);
+  await until(() => d.getJob(f.job.id).status === 'completed');
+  assert.equal(sends, 2);
+});
+
+test('浏览器重开阈值按次数或分钟先到为准', () => {
+  d.setSetting('browser_recycle_v1', { enabled: true, maxActions: 20, maxMinutes: 10 });
+  const f = fixture();
+  const now = f.runner.now();
+  assert.equal(f.runner.browserRecycleDue({ uses: 19, startedAt: now }), false);
+  assert.equal(f.runner.browserRecycleDue({ uses: 20, startedAt: now }), true);
+  assert.equal(f.runner.browserRecycleDue({ uses: 1, startedAt: now - 10 * 60000 }), true);
+  d.setSetting('browser_recycle_v1', { enabled: false, maxActions: 20, maxMinutes: 10 });
+  assert.equal(f.runner.browserRecycleDue({ uses: 99, startedAt: now - 60 * 60000 }), false);
+});
+
+test('评论复用会话达到阈值时关闭旧浏览器并建立新会话', async () => {
+  d.setSetting('browser_recycle_v1', { enabled: true, maxActions: 5, maxMinutes: 10 });
+  let closes = 0;
+  const f = fixture({}, { kind: 'comment', count: 1 });
+  const step = { kind: 'comment', round: 0, topicId: f.topic.id, accountId: f.account.id, actionIndex: 0, segmentId: 'seg_test', unitIndex: 0 };
+  f.runner.leases = { acquire: () => () => {} };
+  f.runner.adapter.browserManager = { owner: 'runner', generation: 0, status: () => ({ busy: false }),
+    closeRunner: async () => { closes += 1; } };
+  const job = d.getJob(f.job.id);
+  const key = f.runner.workbenchCommentKey(job, step);
+  f.runner.workbenchCommentSession = { key, jobId: job.id, accountId: f.account.id, topicId: f.topic.id,
+    uses: 5, startedAt: f.runner.now(), release: () => {}, generation: null };
+  await f.runner.withAccountLease(job, f.account, async () => {}, { step });
+  assert.equal(closes, 1);
+  assert.equal(f.runner.workbenchCommentSession.uses, 1);
+  f.runner.workbenchCommentSession.release?.();
+  f.runner.workbenchCommentSession = null;
 });

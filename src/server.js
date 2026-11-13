@@ -10,10 +10,10 @@ import { config } from './config.js';
 import { resolveBlacklist, resolveEngageSettings } from './engage-profile-resolver.js';
 import {
   addCommentMaterials, addOriginalMaterials, addPostMaterials, addRepostMaterials, clearAccountRestrictions, clearAccountRestrictionsFromOpenJobs, createAccount, createTopic, deleteCommentMaterial, deleteCommentMaterials, deleteOriginalMaterial, deleteOriginalMaterials, deletePostMaterial, deletePostMaterials, deleteRepostMaterial, deleteRepostMaterials,
-  deleteTopic, deleteTopics, deleteAccount, getAccount, getActiveJob, getJob, getSetting, listAccounts, listActionLogs, listCommentMaterials, listRepostMaterials, listMaterialGroups, createMaterialGroup, deleteMaterialGroup, renameMaterialGroup, setMaterialsGroup,
+  db, deleteTopic, deleteTopics, deleteAccount, getAccount, getActiveJob, getJob, getSetting, listAccounts, listActionLogs, listCommentMaterials, listRepostMaterials, listMaterialGroups, createMaterialGroup, deleteMaterialGroup, renameMaterialGroup, setMaterialsGroup, updateJob,
   listActiveAccountRestrictions, listJobs, listOriginalMaterials, listPostMaterials, listRecordsByShanghaiDate, listSystemLogs, listTopics, log, reorderAccounts, seedAccountRestrictionsFromJobs, setSetting, updateAccount, updateAccountAuth, updateTopic
 } from './db.js';
-import { BrowserManager, browserManager } from './browser.js';
+import { BrowserManager, browserManager, forceCloseProfile } from './browser.js';
 import { createRunner } from './runner.js';
 import { AccountLeases } from './account-leases.js';
 import { WeiboAdapter } from './weibo-adapter.js';
@@ -27,6 +27,7 @@ import { FIXED_TOPIC, COMMENT_SECTIONS, isFixedTopic } from '../public/topic-pol
 import { currentLanAccess } from './lan-access.js';
 import { activate as activateLicense, licenseEnabled, licenseStatus } from './license.js';
 import { UpdateManager } from './update-manager.js';
+import { getBrowserRecycle, setBrowserRecycle } from './runtime-settings.js';
 
 if (config.topicMode === 'fixed') {
   const topic = listTopics().find(isFixedTopic);
@@ -49,7 +50,10 @@ function accessToken() {
 }
 const sessions = new Set();
 const sseClients = new Set();
-const serviceIdentity = { pid: process.pid, startedAt: new Date().toISOString(), revision: createHash('sha256').update(
+const supervised = process.env.WEIBO_CONSOLE_SUPERVISED === '1'
+  || Boolean(process.env.WEIBO_CONSOLE_MANAGED_LAUNCHER)
+  || (process.platform !== 'win32' && process.ppid === 1);
+const serviceIdentity = { pid: process.pid, startedAt: new Date().toISOString(), supervised, revision: createHash('sha256').update(
   ['server.js','runner.js','weibo-adapter.js','post-receipts.js','post-success-notice.js','db.js','task-reports.js','verification-workflow.js','network-recovery.js','task-progress.js','engage.js','account-leases.js','engage-profile-resolver.js'].map(file => fs.readFileSync(path.join(config.rootDir, 'src', file))).join('\n')
 ).digest('hex').slice(0, 16) };
 const leases = new AccountLeases();
@@ -206,6 +210,7 @@ function state() {
     logs: listSystemLogs(150, 'workbench'),
     browser: browserManager.status(),
     loginBrowser: loginBrowserManager.status(),
+    browserRecycle: getBrowserRecycle(),
     verificationVersion,
     features: { engageV2: true, typedMaterialGroups: true, originalPost: true, concurrentTasks: true },
     service: serviceIdentity
@@ -457,6 +462,22 @@ async function api(req, res, url) {
     return send(res, 200, { ok: true });
   }
 
+  if (url.pathname === '/api/service/restart' && req.method === 'POST') {
+    const input = await body(req);
+    const force = input?.force === true;
+    const busy = serviceBusyReason();
+    if (busy && !force) return send(res, 409, {
+      error: busy + '；如仍要重启，请确认后会中断当前操作', code: 'service_busy'
+    });
+    if (busy) pauseActiveJobsForRestart();
+    send(res, 202, { ok: true, restarting: true, forced: Boolean(busy) });
+    // Non-zero exit is intentional: launchd uses SuccessfulExit=false and the
+    // supervisor restarts on any unexpected exit, so a clean 0 would stay down.
+    const timer = setTimeout(() => { void shutdown({ exitCode: 1, deadlineMs: 10000 }); }, 200);
+    timer.unref?.();
+    return;
+  }
+
   if (url.pathname === '/api/login-session/cancel' && req.method === 'POST') {
     await loginService.cancel();
     broadcast('state', state());
@@ -619,6 +640,11 @@ async function api(req, res, url) {
     broadcast('state', state());
     return send(res, 200, input);
   }
+  if (url.pathname === '/api/settings/browser-recycle' && req.method === 'PUT') {
+    const input = setBrowserRecycle(await body(req));
+    broadcast('state', state());
+    return send(res, 200, input);
+  }
   if (url.pathname === '/api/settings/engage' && req.method === 'PUT') {
     const input = normalizeEngageSettings(await resolveEngageSettings(await body(req)));
     setSetting('engage_defaults', input);
@@ -716,9 +742,16 @@ async function api(req, res, url) {
     broadcast('state', state());
     return send(res, 200, result);
   }
+  const navigationRetryRoute = url.pathname.match(/^\/api\/jobs\/([^/]+)\/navigation\/retry$/);
+  if (navigationRetryRoute && req.method === 'POST') {
+    const result = await runner.retryNavigation(navigationRetryRoute[1]);
+    if (!result) return send(res, 404, { error: '任务不存在' });
+    broadcast('state', state());
+    return send(res, 200, { ...result, progress: taskProgress(result) });
+  }
   match = url.pathname.match(/^\/api\/jobs\/([^/]+)\/(pause|resume|stop)$/);
   if (match && req.method === 'POST') {
-    const job = runner[match[2]](match[1]);
+    const job = match[2] === 'stop' ? await runner.stopAndWait(match[1]) : runner[match[2]](match[1]);
     if (!job) return send(res, 404, { error: '任务不存在' });
     broadcast('state', state());
     return send(res, 200, { ...job, progress: taskProgress(job) });
@@ -783,22 +816,82 @@ server.listen(config.port, config.host, async () => {
 });
 
 let stopping = false;
-async function shutdown() {
+
+function serviceBusyReason() {
+  if (loginService.active) return '请先完成或取消扫码登录';
+  for (const worker of runners) {
+    if (worker.promise || worker.currentExecution) return '当前仍有任务或浏览器操作在运行';
+    if (worker.workflow.session) return '请先结束当前人工验证窗口';
+  }
+  for (const worker of runners) {
+    if (worker.adapter.browserManager?.status?.()?.busy) return '任务浏览器仍在运行';
+  }
+  const active = [getActiveJob('workbench'), getActiveJob('engage')].filter(Boolean);
+  if (active.some(job => job.status === 'running')) return '请先暂停正在运行的任务';
+  return '';
+}
+
+function pauseActiveJobsForRestart() {
+  for (const worker of runners) {
+    const job = worker.current();
+    if (!job || !['running', 'waiting', 'paused'].includes(job.status)) continue;
+    // Leave the step/action state untouched. Startup recovery knows how to
+    // settle a running row: submitted -> verification card, otherwise pending.
+    // Marking it review here without a card would create a new dead end.
+    worker.network.clear(job.id);
+    worker.navigation.clear(job.id);
+    updateJob(job.id, { status: 'paused', pausedByUser: true, waitReason: '服务已重启，请确认后继续',
+      cursor: { ...job.cursor, navigationRecovery: null } });
+  }
+}
+
+async function shutdown({ exitCode = 0, deadlineMs = 0 } = {}) {
     if (stopping) return;
     stopping = true;
     clearInterval(dailyStopTimer);
+    const hard = setTimeout(() => process.exit(exitCode), deadlineMs || 15000);
+    hard.unref?.();
     for (const worker of runners) { worker.network.clear(); worker.navigation.clear(); }
-    await loginService.cancel();
-    await browserManager.close();
-    await engageBrowserManager.close();
-    await loginBrowserManager.close();
-    for (const client of sseClients) client.end();
-    server.close(() => process.exit(0));
+    const profiles = [browserManager, engageBrowserManager, loginBrowserManager]
+      .map(manager => manager.profileDir).filter(Boolean);
+    try {
+      await loginService.cancel();
+      const closing = Promise.all([
+        browserManager.close(), engageBrowserManager.close(), loginBrowserManager.close()
+      ]);
+      let timer;
+      const timedOut = await Promise.race([
+        closing.then(() => false, () => false),
+        new Promise(resolve => { timer = setTimeout(() => resolve(true), Math.min(deadlineMs || 8000, 8000)); timer.unref?.(); })
+      ]);
+      clearTimeout(timer);
+      if (timedOut) {
+        log('warning', '关闭浏览器超过 8 秒，按 profile 强制结束');
+        await Promise.all(profiles.map(profile => forceCloseProfile(profile)));
+      }
+      for (const client of sseClients) client.end();
+    } catch (error) {
+      log('warning', '关闭服务资源失败：' + error.message);
+    }
+    server.close(() => process.exit(exitCode));
 }
-for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, shutdown);
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { void shutdown(); });
 // Only the private parent/child IPC channel can request service shutdown.
 process.on('message', message => {
   if (message?.type !== 'weibo-service-stop' || !process.send) return;
   const busy = loginService.active || loginBrowserManager.status().busy || runners.some(worker => worker.adapter.browserManager.status().busy || worker.workflow.busy() || worker.current()?.status === 'running' || worker.repairing);
   process.send({ type: 'weibo-service-stop-result', id: message.id, ok: !busy, error: busy ? '浏览器或任务仍在执行，请先安全暂停任务并结束会话' : undefined }, () => { if (!busy) void shutdown(); });
 });
+
+let crashing = false;
+function fatal(label, error) {
+  if (crashing) process.exit(1);
+  crashing = true;
+  try { log('error', `${label}：${error?.stack || error?.message || error}`); } catch {}
+  try { console.error(label, error); } catch {}
+  const timer = setTimeout(() => process.exit(1), 3000);
+  timer.unref?.();
+  void shutdown({ exitCode: 1, deadlineMs: 3000 }).finally(() => { clearTimeout(timer); process.exit(1); });
+}
+process.on('uncaughtException', error => fatal('未捕获异常', error));
+process.on('unhandledRejection', reason => fatal('未处理的 Promise 拒绝', reason));

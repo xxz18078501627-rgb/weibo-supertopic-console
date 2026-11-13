@@ -60,6 +60,25 @@ test('工作台发帖待核对在任务结束后进入只读复核候选，最�
   dbModule.updateJob(job.id, { cursor: { autoReadbacks: { 'uncertain-post': { attempts: 2 } } } });
   assert.deepEqual(runner.autoReadbackCandidates(getJob(job.id)), []);
 });
+
+test('自动只读复核只为已完成任务排队，已停止任务不再启动浏览器', () => {
+  const account = createAccount('停止复核账号');
+  const topic = createTopic({ name: '停止复核超话', url: 'https://weibo.com/p/100808stopreadback' });
+  addPostMaterials(['停止复核文案一', '停止复核文案二']);
+  const snapshot = createSnapshot({ rounds: 1, accountIds: [account.id], topicIds: [topic.id],
+    actionPlan: [{ type: 'post', count: 1, intervalSeconds: 0 }] }, listAccounts(), listTopics());
+  const job = createJob(snapshot);
+  const runner = new TaskRunner({ browserManager: {} }, { scope: 'workbench' });
+  dbModule.updateJob(job.id, { status: 'stopped', cursor: { autoReadbacks: {} } });
+  db.prepare('INSERT INTO action_logs(id,job_id,step_key,kind,account_id,state,error,started_at,submitted_at) VALUES(?,?,?,?,?,?,?,?,?)')
+    .run('stopped-uncertain-post', job.id, 'post-step', 'post', account.id, 'uncertain', '提交后结果无法确认', new Date().toISOString(), new Date().toISOString());
+  runner.scheduleAutoReadbacks(job.id);
+  assert.equal(runner.readbackTimers.has(job.id), false);
+  dbModule.updateJob(job.id, { status: 'completed' });
+  runner.scheduleAutoReadbacks(job.id);
+  assert.equal(runner.readbackTimers.has(job.id), true);
+  runner.cancelAutoReadbacks(job.id);
+});
 test('记录全天聚合、游标分页、异常去重与任务计数', async () => {
   const { recordView } = await import('../src/record-view.js');
   const stamp='2026-10-30T03:00:00.000Z';

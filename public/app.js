@@ -368,8 +368,11 @@ function renderOverview({ configFields = true } = {}) {
     const checked = connection?.lastCheckedAt ? "最近检测 " + time(connection.lastCheckedAt, true) : "等待首次检测";
     const navigation = job.cursor?.navigationRecovery;
     if (active && navigation?.state === "waiting") {
+      const limited = [418, 429, 403].includes(Number(navigation.httpStatus))
+        ? "微博返回 " + navigation.httpStatus + "（访问过于频繁）。" : "";
+      const probe = navigation.lastResult?.netCode === "TimeoutError" ? "上次检查：页面加载超时。" : "";
       $("#run-detail").textContent = job.pausedByUser ? "已改为手动暂停，页面恢复后不会自动开始。" :
-        "页面暂不可用，正在自动等待恢复。连续两次页面检查通过后接续，不会重复发送。" +
+        "页面暂不可用，正在自动等待恢复。" + limited + probe + "最近三次检查有两次通过就会接续，不会重复发送。" +
         (navigation.nextCheckAt ? "下次检查 " + time(navigation.nextCheckAt, true) : "");
     } else if (active && connection?.state === "offline") {
       $("#run-detail").textContent = job.pausedByUser ? "已改为手动暂停，联网后不会自动开始。" : "网络中断，任务已自动暂停。每 5 秒检测网络，连续两次连通后自动继续。" + checked;
@@ -408,7 +411,9 @@ function renderOverview({ configFields = true } = {}) {
 function controls(job) {
   if (editingJob)
     return `<button data-edit-action="save-resume" type="button">保存并继续运行</button><button data-edit-action="cancel" type="button">取消修改</button><button data-job-action="stop" data-job="${job.id}" type="button">停止任务</button>`;
-  if (job.status === 'paused' && !job.pausedByUser && (job.cursor?.networkRecovery?.state === 'offline' || job.cursor?.navigationRecovery?.state === 'waiting'))
+  if (job.status === 'paused' && !job.pausedByUser && job.cursor?.navigationRecovery?.state === 'waiting')
+    return `<button class="primary" data-job-action="retry-navigation" data-job="${job.id}">立即重试</button><button data-job-action="pause" data-job="${job.id}">改为手动暂停</button><button data-job-action="stop" data-job="${job.id}">停止</button>`;
+  if (job.status === 'paused' && !job.pausedByUser && job.cursor?.networkRecovery?.state === 'offline')
     return `<button data-job-action="pause" data-job="${job.id}">改为手动暂停</button><button data-job-action="stop" data-job="${job.id}">停止</button>`;
   if (
     state.verification?.jobId === job.id &&
@@ -532,6 +537,10 @@ function renderSettings() {
   $("#sync-to-home").checked = config.syncToHome === true;
   $("#comment-max-count-enabled").checked =
     config.commentMaxCountEnabled === true;
+  const recycle = state.browserRecycle || {};
+  if ($("#browser-recycle-enabled")) $("#browser-recycle-enabled").checked = recycle.enabled !== false;
+  if ($("#browser-recycle-actions")) $("#browser-recycle-actions").value = recycle.maxActions ?? 20;
+  if ($("#browser-recycle-minutes")) $("#browser-recycle-minutes").value = recycle.maxMinutes ?? 10;
   $("#comment-summary").textContent =
     { random: "普通随机", "zero-first": "零评论优先", "zero-only": "仅零评论" }[
       config.commentStrategy
@@ -1165,6 +1174,14 @@ document.addEventListener("click", async (e) => {
         return;
       }
       if (
+        b.dataset.jobAction === "retry-navigation"
+      ) {
+        await request(`/api/jobs/${b.dataset.job}/navigation/retry`, { method: "POST" });
+        toast("已请求立即重试");
+        await load({ keep: true });
+        return;
+      }
+      if (
         b.dataset.jobAction === "stop" &&
         !confirm("确定停止这项任务？未确认的操作会保留待核对。")
       )
@@ -1183,6 +1200,15 @@ document.addEventListener("click", async (e) => {
       sync();
       await request("/api/settings/task", { method: "PUT", body: config });
       toast("设置已保存");
+    }
+    if (b.id === "save-browser-recycle") {
+      const saved = await request("/api/settings/browser-recycle", { method: "PUT", body: {
+        enabled: $("#browser-recycle-enabled").checked,
+        maxActions: Number($("#browser-recycle-actions").value),
+        maxMinutes: Number($("#browser-recycle-minutes").value)
+      } });
+      state.browserRecycle = saved;
+      toast("运行保护已保存，从下一次操作开始生效");
     }
     if (b.id === "start-task") {
       if (editingJob) {
@@ -1900,6 +1926,50 @@ function pollUpdateSwitch(targetVersion) {
     }
   }, 800);
 }
+async function waitForServiceRestart(previousStartedAt) {
+  const started = Date.now();
+  while (Date.now() - started < 60000) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    try {
+      const response = await fetch('/api/health?restart=' + Date.now(), { cache: 'no-store' });
+      if (!response.ok) continue;
+      const health = await response.json();
+      if (health?.ok && health.service?.startedAt !== previousStartedAt) {
+        location.reload();
+        return;
+      }
+    } catch {}
+  }
+  $("#service-restart")?.classList.remove("busy");
+  toast("服务未在 60 秒内恢复，请用命令行重启");
+}
+async function restartService(force = false) {
+  const button = $("#service-restart");
+  const manualNote = state?.service?.supervised === false ? "当前服务不是后台自启模式，重启后需要手动重新启动。\n\n" : "";
+  if (!force && !confirm(manualNote + "重启本机服务？页面会断开几秒，任务进度保留。")) return;
+  button?.classList.add("busy");
+  const previousStartedAt = state?.service?.startedAt || "";
+  try {
+    const response = await fetch('/api/service/restart', {
+      method: 'POST', cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (response.status === 409 && data.code === 'service_busy' && !force) {
+      button?.classList.remove("busy");
+      if (confirm(data.error + "\n\n仍要强制重启吗？")) return restartService(true);
+      return;
+    }
+    if (!response.ok) throw new Error(data.error || "重启失败");
+    toast("服务正在重启，请稍候…");
+    await waitForServiceRestart(previousStartedAt);
+  } catch (error) {
+    button?.classList.remove("busy");
+    toast(error.message || "重启请求失败");
+  }
+}
+$("#service-restart")?.addEventListener("click", () => void restartService());
 for (const selector of ["#update-entry", "#update-entry-mobile"]) $(selector)?.addEventListener("click", () => { $("#update-dialog")?.showModal(); renderUpdateEntry(); void checkUpdate(false); });
 $("[data-close-update]")?.addEventListener("click", () => $("#update-dialog")?.close());
 $("#update-check")?.addEventListener("click", () => void checkUpdate(true));

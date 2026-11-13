@@ -19,6 +19,7 @@ import { VerificationWorkflow } from './verification-workflow.js';
 import { NetworkRecovery, NetworkOfflineError } from './network-recovery.js';
 import { taskProgress } from './task-progress.js';
 import { NavigationRecovery } from './navigation-recovery.js';
+import { getBrowserRecycle } from './runtime-settings.js';
 import { isNavigationError } from './navigation.js';
 
 function commentScanStats() {
@@ -225,7 +226,9 @@ export class TaskRunner extends EventEmitter {
       throw new DailyStopError();
     }
     if (job.cursor.networkRecovery?.state === 'offline') throw new NetworkOfflineError();
-    if (this.navigation.waiting(job)) throw Object.assign(new Error('页面恢复等待中，禁止提交'), { code: 'navigation_unavailable', navigationHandled: true });
+    if (this.navigation.waiting(job)) throw Object.assign(new Error('页面自检等待中，请点“立即重试”'), {
+      statusCode: 409, code: 'navigation_unavailable', navigationHandled: true
+    });
   }
 
   activeManualStep(jobId, step) {
@@ -409,14 +412,37 @@ export class TaskRunner extends EventEmitter {
     return null;
   }
 
+  browserRecycleDue(session) {
+    if (!session) return false;
+    const settings = getBrowserRecycle();
+    if (!settings.enabled) return false;
+    const uses = Number(session.uses || 0);
+    const startedAt = Number(session.startedAt || 0);
+    return uses >= settings.maxActions
+      || (startedAt > 0 && this.now() - startedAt >= settings.maxMinutes * 60000);
+  }
+
+  browserRecycleLabel() {
+    const settings = getBrowserRecycle();
+    return `${settings.maxActions} 次/${settings.maxMinutes} 分钟`;
+  }
+
   async withAccountLease(job, account, callback, { step, manual = false } = {}) {
     if (this.groupedEngage(job) && step && !manual) {
       const key = JSON.stringify([job.id, step.round, step.topicId, account.id]);
       if (this.engageSession && this.engageSession.key !== key) await this.releaseEngageSession();
+      if (this.browserRecycleDue(this.engageSession)) {
+        log('info', '转赞评浏览器达到重开阈值，关闭后重开：' + this.browserRecycleLabel(), {
+          jobId: job.id, accountId: account.id, uses: this.engageSession.uses
+        });
+        await this.releaseEngageSession();
+      }
       if (!this.engageSession) {
         const release = this.leases?.acquire(account, this.scope || job.scope || job.id);
-        this.engageSession = { key, jobId:job.id, round:step.round, link:step.topicId, accountId:account.id, release, identified:false };
+        this.engageSession = { key, jobId:job.id, round:step.round, link:step.topicId, accountId:account.id, release,
+          identified:false, uses: 0, startedAt: this.now() };
       }
+      this.engageSession.uses = Number(this.engageSession.uses || 0) + 1;
       // Keep the account's persistent context alive across recoverable
       // outcomes.  The workflow releases it only when the group is finished or
       // the task is paused/stopped; closing here caused empty verification or
@@ -429,10 +455,16 @@ export class TaskRunner extends EventEmitter {
       if (this.workbenchCommentSession && this.workbenchCommentSession.key !== commentKey) {
         await this.releaseWorkbenchCommentSession('账号、超话、轮次或评论段已变化');
       }
+      if (this.browserRecycleDue(this.workbenchCommentSession)) {
+        log('info', '工作台评论浏览器达到重开阈值，关闭后重开：' + this.browserRecycleLabel(), {
+          jobId: job.id, accountId: account.id, uses: this.workbenchCommentSession.uses
+        });
+        await this.releaseWorkbenchCommentSession('达到浏览器重开阈值');
+      }
       if (!this.workbenchCommentSession) {
         const release = this.leases.acquire(account, this.scope || job.scope || job.id);
         this.workbenchCommentSession = { key: commentKey, jobId: job.id, accountId: account.id,
-          topicId: step.topicId, release, uses: 0, generation: null };
+          topicId: step.topicId, release, uses: 0, startedAt: this.now(), generation: null };
         log('info', '工作台评论复用会话已建立', { jobId: job.id, accountId: account.id, topicId: step.topicId });
       }
       const session = this.workbenchCommentSession;
@@ -693,8 +725,8 @@ export class TaskRunner extends EventEmitter {
 
   scheduleAutoReadbacks(jobId = null) {
     const scope = this.scope || 'workbench';
-    const job = jobId ? getJob(jobId) : listJobs(20, scope).find(item => ['completed', 'stopped'].includes(item.status));
-    if (!job || !['completed', 'stopped'].includes(job.status) || (job.scope || 'workbench') !== scope) return;
+    const job = jobId ? getJob(jobId) : listJobs(20, scope).find(item => item.status === 'completed');
+    if (!job || job.status !== 'completed' || (job.scope || 'workbench') !== scope) return;
     if (this.readbackTimers.has(job.id)) return;
     if (!this.autoReadbackCandidates(job).length) return;
     const timer = setTimeout(() => void this.runAutoReadbacks(job.id), 1000);
@@ -702,7 +734,19 @@ export class TaskRunner extends EventEmitter {
     this.readbackTimers.set(job.id, timer);
   }
 
+  cancelAutoReadbacks(jobId = null) {
+    if (jobId === null) {
+      for (const timer of this.readbackTimers.values()) clearTimeout(timer);
+      this.readbackTimers.clear();
+      return;
+    }
+    const timer = this.readbackTimers.get(jobId);
+    if (timer) clearTimeout(timer);
+    this.readbackTimers.delete(jobId);
+  }
+
   autoReadbackCandidates(job) {
+    if (!job || job.status !== 'completed') return [];
     const ledger = job?.cursor?.autoReadbacks || {};
     const query = job?.scope === 'engage' || job?.config?.kind === 'engage'
       ? `SELECT * FROM action_logs WHERE job_id=? AND kind IN ('comment','repost')
@@ -717,7 +761,7 @@ export class TaskRunner extends EventEmitter {
     this.readbackTimers.delete(jobId);
     let job = getJob(jobId);
     const scope = this.scope || 'workbench';
-    if (!job || (job.scope || 'workbench') !== scope || !['completed', 'stopped'].includes(job.status)) return;
+    if (!job || (job.scope || 'workbench') !== scope || job.status !== 'completed') return;
     if (this.promise || this.currentExecution || this.workflow.busy()) {
       const timer = setTimeout(() => void this.runAutoReadbacks(jobId), 15000);
       timer.unref?.();
@@ -830,8 +874,8 @@ export class TaskRunner extends EventEmitter {
           const settled = getJob(jobId);
           if (settled && (this.scope === 'engage' || settled.config?.kind === 'engage')) {
             this.emitUpdate(settled);
-            if (['completed', 'stopped'].includes(settled.status)) this.scheduleAutoReadbacks(jobId);
-          } else if (settled && ['completed', 'stopped'].includes(settled.status)) {
+            if (settled.status === 'completed') this.scheduleAutoReadbacks(jobId);
+          } else if (settled && settled.status === 'completed') {
             this.emitUpdate(settled);
             this.scheduleAutoReadbacks(jobId);
           }
@@ -843,8 +887,15 @@ export class TaskRunner extends EventEmitter {
 
   async recover() {
     this.enforceDailyStop();
-    const job = this.current();
+    let job = this.current();
     if (!job) return job;
+    // Older builds left a waiting recovery on a manually paused job. Nobody
+    // could clear it: resume() re-armed the wait and continue() returned 500.
+    // Normalise it so the ordinary "继续" button can retry the step.
+    if (job.pausedByUser && this.navigation.waiting(job)) {
+      job = this.cancelNavigation(job.id, 'service_restart') || job;
+      this.emitUpdate(job);
+    }
     if (appConfig.topicMode === 'fixed' && validateSnapshot(job.config).length) {
       const paused = updateJob(job.id, { status: 'paused', pausedByUser: true, waitReason: validateSnapshot(job.config).join('；') });
       this.emitUpdate(paused); return paused;
@@ -882,6 +933,7 @@ export class TaskRunner extends EventEmitter {
     const job = getJob(jobId);
     if (!job || !['running', 'waiting', 'paused'].includes(job.status)) return job;
     this.network.clear();
+    this.cancelNavigation(jobId, 'user_pause');
     this.navigation.clear(jobId);
     this.clearVerificationRecovery(jobId);
     const updated = updateJob(jobId, { status: 'paused', pausedByUser: true, waitReason: '已手动暂停' });
@@ -892,17 +944,83 @@ export class TaskRunner extends EventEmitter {
   resume(jobId) {
     this.enforceDailyStop();
     if ((this.dailyStopEnabled() && this.dailyStopStatus().blocked) || this.isExpired(jobId)) throw new DailyStopError('任务已到每日截止时间，00:00后请新建任务');
-    const job = getJob(jobId);
+    let job = getJob(jobId);
     if (job && appConfig.topicMode === 'fixed' && validateSnapshot(job.config).length) throw Object.assign(new Error(validateSnapshot(job.config).join('；')), { statusCode: 400 });
     if (!job || job.status !== 'paused') return job;
     if (this.workflow.enabled(job) && (job.cursor.verificationBarrier || job.cursor.manualVerification)) throw Object.assign(new Error('请在待验证账号区完成验证后点击“继续运行”'), { statusCode: 409 });
+    // A previous page-recovery wait must not swallow this explicit resume.
+    if (this.navigation.waiting(job)) job = this.cancelNavigation(jobId, 'user_resume') || job;
     this.clearVerificationRecovery(jobId);
     const prepared = this.prepareVerificationRetry(job);
     const updated = updateJob(jobId, { status: 'running', pausedByUser: false, stopRequested: false, waitReason: null, cursor: prepared.cursor });
     this.emitUpdate(updated);
-    if (this.navigation.waiting(updated)) { this.emitUpdate(updateJob(jobId, { status: 'paused', waitReason: '微博页面暂不可用，正在自动检查恢复' })); this.navigation.arm(jobId); }
-    else if (prepared.cursor.networkRecovery?.state === 'offline') this.network.pause(jobId, prepared.cursor.networkRecovery.step);
+    if (prepared.cursor.networkRecovery?.state === 'offline') this.network.pause(jobId, prepared.cursor.networkRecovery.step);
     else this.run(jobId);
+    return getJob(jobId);
+  }
+
+  cancelNavigation(jobId, reason = 'user') {
+    const job = getJob(jobId);
+    if (!job) return job;
+    const recovery = job.cursor?.navigationRecovery;
+    if (!recovery || recovery.state !== 'waiting') return job;
+    this.navigation.clear(jobId);
+    return updateJob(jobId, { cursor: { ...job.cursor, navigationRecovery: {
+      ...recovery, state: 'cancelled', nextCheckAt: null, nextDelayMs: null,
+      cancelledAt: new Date(this.now()).toISOString(), cancelReason: reason
+    } } });
+  }
+
+  resetNavigationStep(jobId, step, message) {
+    if (!step) return;
+    const key = stepKeyFor(step);
+    const action = getStepAction(jobId, key);
+    if (action && !['succeeded', 'failed', 'skipped'].includes(action.state)) {
+      updateActionLog(action.id, { state: 'prepared', submittedAt: null, completedAt: null,
+        verificationPending: false, error: message });
+    }
+    db.prepare("UPDATE task_step_state SET state='pending',outcome=NULL WHERE job_id=? AND step_key=?").run(jobId, key);
+  }
+
+  async retryNavigation(jobId) {
+    this.enforceDailyStop();
+    const job = getJob(jobId);
+    if (!job) return null;
+    if (['stopped', 'completed'].includes(job.status)) throw Object.assign(new Error('任务已结束，请新建任务'), { statusCode: 409 });
+    if (this.isExpired(jobId)) throw new DailyStopError('任务已到每日截止时间，00:00后请新建任务');
+    const recovery = job.cursor?.navigationRecovery;
+    if (!recovery || recovery.state !== 'waiting') {
+      if (job.status === 'paused') return this.resume(jobId);
+      return job;
+    }
+    // A submitted action must never be re-sent. Force one read-only probe now;
+    // the recovery tick performs the actual verification.
+    if (recovery.submitted) {
+      const updated = updateJob(jobId, { cursor: { ...job.cursor, navigationRecovery: {
+        ...recovery, nextCheckAt: new Date(this.now()).toISOString(), nextDelayMs: 0
+      } } });
+      this.emitUpdate(updated);
+      this.navigation.arm(jobId);
+      return updated;
+    }
+    const row = this.workflow.enabled(job) ? this.workflow.row(jobId, recovery.step) : null;
+    if (row && ['deferred', 'review', 'network_review'].includes(row.state)) {
+      this.cancelNavigation(jobId, 'user_retry');
+      return this.workflow.continue(jobId);
+    }
+    this.cancelNavigation(jobId, 'user_retry');
+    const manager = this.adapter.browserManager;
+    try {
+      if (manager?.closeRunnerBounded) await manager.closeRunnerBounded(12000);
+      else await manager?.closeRunner?.();
+    } catch {}
+    this.resetNavigationStep(jobId, recovery.step, '用户点击立即重试，重新执行');
+    const fresh = getJob(jobId);
+    const updated = updateJob(jobId, { status: 'running', pausedByUser: false, stopRequested: false, waitReason: null,
+      cursor: { ...fresh.cursor, verificationBarrier: false, workflowPriority: null,
+        verificationAutoPaused: false, verificationPauseReason: null } });
+    this.emitUpdate(updated);
+    this.run(jobId);
     return getJob(jobId);
   }
 
@@ -1021,11 +1139,33 @@ export class TaskRunner extends EventEmitter {
     this.network.clear(jobId);
     this.navigation.clear(jobId);
     this.clearVerificationRecovery(jobId);
+    this.cancelAutoReadbacks(jobId);
+    if (this.workflow.enabled(job)) {
+      const updated = this.workflow.finalizeStop(jobId, '已手动停止');
+      this.emitUpdate(updated);
+      return updated;
+    }
     const updated = updateJob(jobId, { stopRequested: true, pausedByUser: false, waitReason: '正在安全停止' });
     this.emitUpdate(updated);
-    if (this.workflow.enabled(job) && this.workflow.session && this.currentExecution?.jobId === jobId) return updated;
     if (!this.promise) this.run(jobId);
     return updated;
+  }
+
+  async stopAndWait(jobId, { timeoutMs = 60000 } = {}) {
+    const stopped = this.stop(jobId);
+    if (!stopped) return null;
+    // Closing is serialized by BrowserManager. Await it here as well so the
+    // stop response means the task browser has actually been released.
+    try { await this.adapter.cancelTask?.(); } catch {}
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const job = getJob(jobId);
+      const browser = this.adapter.browserManager?.status?.();
+      if (job && job.status === 'stopped' && !this.promise && !this.currentExecution
+        && !this.workflow.session && !this.workflow.manualCleanupPromise && !browser?.busy) return job;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    return getJob(jobId);
   }
 
   async loop(jobId) {

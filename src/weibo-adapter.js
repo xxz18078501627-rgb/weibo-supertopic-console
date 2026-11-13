@@ -246,7 +246,7 @@ async function pageHasVisibleChallenge(page) {
 // Read-only description of what the browser is currently showing.  A 200
 // response alone is not proof that a usable Weibo page was painted: Chrome
 // error documents, blank tabs and empty shells all need to be rejected.
-async function inspectPageHealth(page) {
+async function inspectPageHealth(page, { allowLoadingConfig = false } = {}) {
   const url = String(page?.url?.() || '');
   if (isUnloadedPageUrl(url)) return { ok: false, unloaded: true, url };
   let snapshot;
@@ -270,7 +270,8 @@ async function inspectPageHealth(page) {
   } catch (error) {
     return { ok: false, unreadable: true, error, url };
   }
-  if (!snapshot || !snapshot.body || snapshot.readyState === 'loading' || snapshot.htmlLength < 50 || snapshot.textLength < 2) {
+  const stillLoading = snapshot?.readyState === 'loading' && !(allowLoadingConfig && snapshot?.hasConfig);
+  if (!snapshot || !snapshot.body || stillLoading || snapshot.htmlLength < 50 || snapshot.textLength < 2) {
     return { ok: false, empty: true, snapshot, url };
   }
   // Body text only counts for a short error document; a normal feed post may
@@ -730,7 +731,11 @@ export class WeiboAdapter {
     this.engageCatalogs = new Map();
   }
 
-  async cancelTask() { await this.browserManager.closeRunner?.(); }
+  async cancelTask() {
+    const manager = this.browserManager;
+    if (manager?.closeRunnerBounded) await manager.closeRunnerBounded(12000);
+    else await manager?.closeRunner?.();
+  }
   async probeConnectivity(account, { force = false, url = 'https://weibo.com/robots.txt', signal } = {}) {
     const started = Date.now(), manager = this.browserManager, sessions = new Set();
     const controller = new AbortController();
@@ -839,8 +844,8 @@ export class WeiboAdapter {
     if (signal?.aborted) return result('unavailable', { netCode: 'PROBE_CANCELLED' });
     if (manager.owner === 'login') return result('busy');
 
-    const classify = async page => {
-      const health = await inspectPageHealth(page);
+    const classify = async (page, { allowLoadingConfig = false } = {}) => {
+      const health = await inspectPageHealth(page, { allowLoadingConfig });
       if (!health.ok) {
         if (health.snapshot?.challengeHint && await pageHasVisibleChallenge(page)) return result('verification');
         return result('unavailable', {
@@ -861,6 +866,23 @@ export class WeiboAdapter {
       if (!/^\d+$/.test(uid) || uid === '0') return result('authentication');
       if (account?.uid && String(account.uid) !== uid) return result('authentication');
       return result('ready');
+    };
+
+    // DOMContentLoaded is not a reliable readiness signal on weibo.com:
+    // long-lived scripts can keep it pending far beyond the old 9 s budget
+    // even though $CONFIG/uid are already usable. Navigate to commit, then
+    // poll the document until it can be classified or the budget ends.
+    const classifyLoaded = async page => {
+      const deadline = Date.now() + 10000;
+      let last = result('unavailable', { netCode: 'PROBE_PAGE_NOT_READY' });
+      while (true) {
+        if (controller.signal.aborted) return aborted();
+        last = await classify(page, { allowLoadingConfig: true });
+        if (last.state !== 'unavailable') return last;
+        if (['PROBE_ERROR_PAGE', 'PROBE_UNEXPECTED_HOST', 'PROBE_UNEXPECTED_REDIRECT', 'PROBE_PAGE_UNLOADED', 'PROBE_URL_REJECTED'].includes(last.netCode)) return last;
+        if (Date.now() >= deadline) return last;
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
     };
 
     if (manager.owner === 'manual') {
@@ -897,7 +919,7 @@ export class WeiboAdapter {
       if (controller.signal.aborted) onAbort();
       else controller.signal.addEventListener('abort', onAbort, { once: true });
     });
-    timer = setTimeout(() => controller.abort(), 10000);
+    timer = setTimeout(() => controller.abort(), 25000);
     try {
       let context = manager.context;
       if (!context) {
@@ -931,7 +953,7 @@ export class WeiboAdapter {
         try {
           // Never just hit robots.txt: this must load the real document so the
           // page classification below can reject blank/error/non-business pages.
-          await gotoChecked(tempPage, target.href, { stage: 'probe', timeout: 9000 });
+          await gotoChecked(tempPage, target.href, { stage: 'probe', waitUntil: 'commit', timeout: 12000 });
         } catch (error) {
           if (!contextValid()) return result('busy');
           if (isNavigationError(error)) return result('unavailable', { netCode: error.netCode, httpStatus: error.httpStatus });
@@ -941,7 +963,7 @@ export class WeiboAdapter {
         if (controller.signal.aborted) return aborted();
         if (!contextValid()) return result('busy');
         try {
-          const classified = await classify(tempPage);
+          const classified = await classifyLoaded(tempPage);
           return contextValid() ? classified : result('busy');
         }
         catch { return result('unavailable', { netCode: 'PROBE_PAGE_UNREADABLE' }); }

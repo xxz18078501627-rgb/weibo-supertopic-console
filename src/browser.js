@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { chromium } from 'playwright';
 import { config } from './config.js';
@@ -10,6 +11,35 @@ export class BrowserBusyError extends Error {}
 // small process-local lock in addition to Chromium's own profile lock.  It
 // gives callers a useful conflict instead of a flaky launch failure.
 const profileOwners = new Map();
+
+function profilesRoot() {
+  return path.resolve(config.dataDir, 'profiles');
+}
+
+function isOwnedProfile(profileDir) {
+  if (!profileDir) return false;
+  let root;
+  try { root = fs.realpathSync.native(profilesRoot()); } catch { root = profilesRoot(); }
+  let target;
+  try { target = fs.realpathSync.native(profileDir); } catch { target = path.resolve(profileDir); }
+  return target === root || target.startsWith(root + path.sep);
+}
+
+// Playwright's context.close() has no timeout and can wait forever when the
+// renderer is wedged.  Only kill processes whose command line contains this
+// app's own per-account profile directory; never touch the user's Chrome.
+export function forceCloseProfile(profileDir) {
+  if (!isOwnedProfile(profileDir)) return Promise.resolve(false);
+  const target = path.resolve(profileDir);
+  if (process.platform === 'win32') {
+    const quoted = target.replaceAll("'", "''");
+    const script = `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${quoted}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+    return new Promise(resolve => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script],
+      { timeout: 8000, windowsHide: true }, error => resolve(!error)));
+  }
+  const binary = process.platform === 'darwin' ? '/usr/bin/pkill' : 'pkill';
+  return new Promise(resolve => execFile(binary, ['-f', '--', target], { timeout: 5000 }, error => resolve(!error)));
+}
 
 function activateChrome(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return Promise.resolve();
@@ -53,6 +83,29 @@ export class BrowserManager {
     const closing = this.queue.then(() => this.owner === 'runner' ? this.closeLocked() : undefined);
     this.queue = closing.catch(() => {});
     return closing;
+  }
+
+  async closeRunnerBounded(timeoutMs = 12000) {
+    const profileDir = this.profileDir;
+    const closing = this.closeRunner();
+    let timer;
+    const timedOut = await Promise.race([
+      closing.then(() => false, () => false),
+      new Promise(resolve => { timer = setTimeout(() => resolve(true), timeoutMs); timer.unref?.(); })
+    ]);
+    clearTimeout(timer);
+    if (!timedOut) return true;
+    await forceCloseProfile(profileDir);
+    // A hung close leaves the serialized queue pending forever, which would
+    // block every later probe.  Forget the lock and start a fresh queue.
+    this.generation++;
+    this.context = null;
+    this.accountId = null;
+    this.owner = null;
+    if (this.profileDir && profileOwners.get(this.profileDir) === this) profileOwners.delete(this.profileDir);
+    this.profileDir = null;
+    this.queue = Promise.resolve();
+    return false;
   }
 
   closeManual(expected = this.context) {

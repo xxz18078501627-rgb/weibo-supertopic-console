@@ -367,3 +367,24 @@ test('gotoChecked 抛错仍保留可观察主文档状态，不记录子资源�
   await assert.rejects(() => gotoChecked(page, 'https://weibo.com/?token=secret'), error => error.httpStatus === 503 && !error.message.includes('secret'));
   assert.equal(detached, true);
 });
+
+test('probeNavigation 在 DOMContentLoaded 未完成但 $CONFIG 可用时判 ready', async () => {
+  const page = makePage({ state: snapshot({ readyState: 'loading', hasConfig: true, uid: '1234' }) });
+  const context = { pages: () => [page], newPageCalls: 0, async newPage() { this.newPageCalls += 1; return page; }, async close() {} };
+  const manager = managerFor({ owner: null, context: null, accountId: null });
+  manager.open = async () => { manager.owner = 'runner'; manager.accountId = 'a1'; manager.generation += 1; manager.context = context; return context; };
+  const adapter = new WeiboAdapter(manager);
+  const result = await adapter.probeNavigation({ id: 'a1', uid: '1234' }, {});
+  assert.equal(result.state, 'ready');
+});
+
+test('probeNavigation 把 HTTP 418 作为限流状态返回', async () => {
+  const page = makePage({ goto: async () => response(418) });
+  const context = { pages: () => [page], newPageCalls: 0, async newPage() { this.newPageCalls += 1; return page; }, async close() {} };
+  const manager = managerFor({ owner: null, context: null, accountId: null });
+  manager.open = async () => { manager.owner = 'runner'; manager.accountId = 'a1'; manager.generation += 1; manager.context = context; return context; };
+  const adapter = new WeiboAdapter(manager);
+  const result = await adapter.probeNavigation({ id: 'a1', uid: '1234' }, {});
+  assert.equal(result.state, 'unavailable');
+  assert.equal(result.httpStatus, 418);
+});

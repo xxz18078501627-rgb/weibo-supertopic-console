@@ -305,9 +305,49 @@ test('人工发送中停止会安全收尾，已确认成功保留且不再执�
       return { state: 'succeeded' };
     }, openVerification: async () => ({ isClosed: () => false }), hasTaskChallenge: async () => false });
   await runner.run(job.id); manual = true;
-  runner.workflow.requestManual(job.id, '1001'); await until(() => Boolean(finish));
-  runner.stop(job.id); finish(); await until(() => !runner.workflow.session);
+  const manualAttempt = runner.workflow.requestManual(job.id, '1001'); await until(() => Boolean(finish));
+  const stopping = runner.stopAndWait(job.id); finish();
+  await Promise.allSettled([manualAttempt, runner.promise, stopping]);
   assert.equal(getJob(job.id).status, 'stopped'); assert.equal(getJob(job.id).metrics.success, 2);
+  assert.equal(runner.autoReadbackCandidates(getJob(job.id)).length, 0);
+});
+
+test('停止把剩余待执行、待验证和待核对步骤统一跳过，并等到浏览器空闲', async () => {
+  const { job } = fixture([{ type: 'post', count: 2 }]);
+  let busy = true, cancels = 0, readbacks = 0;
+  const browserManager = { status: () => ({ busy }), closeRunner: async () => { busy = false; } };
+  const runner = new TaskRunner({
+    ensureIdentity: async () => ({}), browserManager,
+    cancelTask: async () => { cancels += 1; busy = false; },
+    verifyPost: async () => { readbacks += 1; return { state: 'uncertain' }; }
+  }, { scope: 'workbench' });
+  runner.workflow.ensureSteps(job);
+  const rows = runner.workflow.rows(job.id, 0);
+  const action = state => database.createActionLog({ jobId: job.id, stepKey: rows[state.row].step_key,
+    kind: 'post', accountId: rows[state.row].account_id, topicId: rows[state.row].topic_id, state: state.value });
+  action({ row: 0, value: 'succeeded' });
+  action({ row: 1, value: 'prepared' });
+  const deferredId = action({ row: 2, value: 'verification_wait' });
+  const uncertainId = action({ row: 3, value: 'uncertain' });
+  db.prepare('UPDATE action_logs SET submitted_at=? WHERE id=?').run(new Date().toISOString(), uncertainId);
+  db.prepare("UPDATE task_step_state SET state='done',outcome='succeeded' WHERE job_id=? AND step_key=?").run(job.id, rows[0].step_key);
+  db.prepare("UPDATE task_step_state SET state='deferred' WHERE job_id=? AND step_key=?").run(job.id, rows[2].step_key);
+  db.prepare("UPDATE task_step_state SET state='review',outcome='uncertain' WHERE job_id=? AND step_key=?").run(job.id, rows[3].step_key);
+  const now = new Date().toISOString();
+  db.prepare("INSERT INTO verification_cards(job_id,round_index,identity,account_id,status,triggered_at,updated_at) VALUES(?,0,?,?,'pending',?,?)")
+    .run(job.id, rows[3].identity, rows[3].account_id, now, now);
+  const stopped = await runner.stopAndWait(job.id);
+  assert.equal(stopped.status, 'stopped');
+  assert.equal(busy, false);
+  assert.ok(cancels >= 1);
+  assert.equal(readbacks, 0);
+  const after = runner.workflow.rows(job.id, 0);
+  assert.equal(after[0].outcome, 'succeeded');
+  assert.ok(after.slice(1).every(item => item.state === 'done' && item.outcome === 'skipped'));
+  for (const id of [deferredId, uncertainId]) assert.equal(database.getActionLog(id).state, 'skipped');
+  assert.equal(db.prepare('SELECT status FROM verification_cards WHERE job_id=?').get(job.id).status, 'resolved');
+  assert.equal(runner.autoReadbackCandidates(stopped).length, 0);
+  assert.equal(runner.readbackTimers.has(job.id), false);
 });
 
 test('人工续发保存异常时暂停，再次点验证仍会直接触发发帖', async () => {
@@ -1367,6 +1407,69 @@ test('签到验证只阻塞签到，评论继续；继续运行只补签到', as
   assert.equal(calls.filter(call => call.startsWith('comment:')).length, commentCount, '继续运行不应重复评论');
   assert.equal(calls.filter(call => call === 'checkin:A').length, 2, '只应补做一次签到');
 });
+function deferredCheckinFixture() {
+  const { accounts, job } = fixture([{ type: 'checkin', count: 1 }, { type: 'comment', count: 1 }]);
+  const runner = new TaskRunner({}, { scope: 'workbench' });
+  runner.run = async () => {};
+  runner.workflow.ensureSteps(job);
+  const rows = runner.workflow.rows(job.id, 0).filter(row => row.account_id === accounts[0].id);
+  const checkin = rows.find(row => row.kind === 'checkin');
+  const comment = rows.find(row => row.kind === 'comment');
+  const checkinAction = database.createActionLog({ jobId: job.id, stepKey: checkin.step_key, kind: 'checkin',
+    accountId: checkin.account_id, topicId: checkin.topic_id, state: 'uncertain' });
+  database.updateActionLog(checkinAction, { state: 'uncertain', submittedAt: new Date().toISOString(),
+    verificationPending: 0, error: '点击签到后未验收到“已签到”状态' });
+  const commentAction = database.createActionLog({ jobId: job.id, stepKey: comment.step_key, kind: 'comment',
+    accountId: comment.account_id, topicId: comment.topic_id, state: 'succeeded' });
+  database.updateActionLog(commentAction, { state: 'succeeded' });
+  db.prepare("UPDATE task_step_state SET state='done',outcome='succeeded' WHERE job_id=? AND step_key=?").run(job.id, comment.step_key);
+  runner.workflow.deferUnconfirmedCheckin(job.id, { round: checkin.round_index, topicId: checkin.topic_id,
+    accountId: checkin.account_id, kind: 'checkin', actionIndex: checkin.action_index,
+    segmentId: checkin.segment_id, unitIndex: checkin.unit_index }, '点击签到后未验收到“已签到”状态');
+  return { job, runner, checkin, comment };
+}
+
+test('签到未确认时评论成功不能把验证卡改成已验证', () => {
+  const { job, runner, checkin, comment } = deferredCheckinFixture();
+  assert.equal(getStepAction(job.id, checkin.step_key).verification_pending, 1);
+  assert.equal(runner.workflow.markActionVerificationPassed(job.id, comment.step_key), false);
+  const card = db.prepare('SELECT status,verification_result,source,verified_at FROM verification_cards WHERE job_id=? AND identity=?')
+    .get(job.id, checkin.identity);
+  assert.equal(card.status, 'pending');
+  assert.equal(card.verification_result, 'pending');
+  assert.equal(card.source, 'checkin_unconfirmed');
+  assert.equal(card.verified_at, null);
+  const view = runner.workflow.status(job).cards.find(item => item.identity === checkin.identity);
+  assert.equal(view.currentKind, 'checkin');
+  assert.equal(view.currentActionable, true);
+  assert.equal(view.canOpen, true);
+});
+
+test('已误判为已验证的签到卡会在状态刷新时恢复为待验证', () => {
+  const { job, runner, checkin } = deferredCheckinFixture();
+  db.prepare("UPDATE verification_cards SET status='ready',verification_result='passed',source='action_receipt',verified_at=?,checkin_result='unknown' WHERE job_id=? AND identity=?")
+    .run(new Date().toISOString(), job.id, checkin.identity);
+  const view = runner.workflow.status(job);
+  const card = view.cards.find(item => item.identity === checkin.identity);
+  assert.equal(card.status, 'pending');
+  assert.equal(card.verificationResult, 'pending');
+  assert.equal(card.source, 'checkin_unconfirmed');
+  assert.equal(getStepAction(job.id, checkin.step_key).verification_pending, 1);
+  assert.equal(card.currentActionable, true);
+});
+
+test('继续运行会重新排队未确认的签到而不是被 submitted_at 跳过', () => {
+  const { job, runner, checkin } = deferredCheckinFixture();
+  db.prepare("UPDATE verification_cards SET status='ready',verification_result='passed',source='manual_retry',verified_at=?,checkin_result='pending' WHERE job_id=? AND identity=?")
+    .run(new Date().toISOString(), job.id, checkin.identity);
+  db.prepare("UPDATE jobs SET status='waiting' WHERE id=?").run(job.id);
+  runner.workflow.continue(job.id);
+  const action = getStepAction(job.id, checkin.step_key);
+  assert.equal(action.state, 'prepared');
+  assert.equal(action.submitted_at, null);
+  assert.equal(db.prepare('SELECT state FROM task_step_state WHERE job_id=? AND step_key=?').get(job.id, checkin.step_key).state, 'pending');
+});
+
 test('结束验证能立即打断签到等待，不会卡住会话', async () => {
   const { job } = fixture([{ type: 'checkin', count: 1 }]);
   const runner = new TaskRunner({ ensureIdentity: async () => ({}),

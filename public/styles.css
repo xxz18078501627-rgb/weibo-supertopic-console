@@ -1227,3 +1227,15 @@ body:not(:has(#page-overview.active)) .lan-access-button{display:none}
   #page-overview #save-task{grid-row:auto;grid-column:auto;justify-self:stretch}
   #page-overview #start-task{grid-column:1/-1;grid-row:4;width:100%;margin-left:0!important}
 }
+
+/* 左侧栏底部：重启服务入口与更新入口同一组。 */
+.side-tools{margin-top:auto;display:grid;gap:8px}
+.side-tools .update-entry{margin-top:0}
+.service-restart{width:100%;display:flex;align-items:center;gap:10px;padding:11px 12px;border:1px solid #efd5df;border-radius:14px;background:rgba(255,250,252,.82);color:var(--ink);text-align:left}
+.service-restart:hover{background:#fff5f6!important;border-color:#dfa9b5!important}
+.service-restart-icon{width:30px;height:30px;border-radius:10px;display:grid;place-items:center;background:#fff1f6;color:var(--danger);font-size:17px;font-weight:800;flex:none}
+.service-restart>span:nth-child(2){display:grid;gap:1px;min-width:0;flex:1}
+.service-restart b{font-size:12px;color:var(--ink)}
+.service-restart small{font-size:10.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.service-restart.busy{opacity:.65;pointer-events:none}
+.side-tools+.side-foot{margin-top:10px}

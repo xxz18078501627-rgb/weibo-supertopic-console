@@ -63,6 +63,7 @@ test('访问口令、配置流程和手机导航可用', async () => {
   await page.locator('#material-add').click();
   await page.waitForFunction(() => document.querySelector('#comment-count')?.textContent === '2');
   assert.equal((await page.request.get(`http://127.0.0.1:${port}/api/post-materials`).then(r => r.json())).length, 2);
+  assert.equal(await page.locator('#service-restart').isVisible(), true);
 
   await page.setViewportSize({ width: 390, height: 844 });
   assert.equal(await page.locator('#mobile-nav').isVisible(), true);
@@ -74,6 +75,13 @@ test('访问口令、配置流程和手机导航可用', async () => {
   await page.locator('#post-decoration-mode').selectOption('emoji-and-number');
   await page.locator('#post-emoji-position').selectOption('prefix');
   await page.locator('#comment-decoration-mode').selectOption('number');
+  await page.locator('#browser-recycle-actions').fill('15');
+  await page.locator('#save-browser-recycle').click();
+  await page.waitForTimeout(200);
+  const runtimeState = await page.request.get(`http://127.0.0.1:${port}/api/state`).then(r => r.json());
+  assert.equal(runtimeState.browserRecycle.maxActions, 15);
+  await page.locator('#browser-recycle-actions').fill('20');
+  await page.locator('#save-browser-recycle').click();
   await page.getByRole('button', { name: '设为默认', exact: true }).click();
   await page.waitForTimeout(150);
   const state = await page.request.get(`http://127.0.0.1:${port}/api/state`).then(r => r.json());
@@ -2213,7 +2221,8 @@ test('页面故障自动等待与手动暂停提示明确，不显示网络正�
     await page.addInitScript(() => { window.EventSource = class extends EventTarget { close() {} }; });
     await page.reload();
     await page.waitForFunction(() => document.querySelector('#run-detail')?.textContent.includes('页面暂不可用'));
-    assert.match(await page.locator('#run-detail').innerText(), /连续两次页面检查/);
+    assert.match(await page.locator('#run-detail').innerText(), /最近三次检查有两次通过/);
+    assert.equal(await page.locator('#run-controls [data-job-action="retry-navigation"]').count(), 1);
     assert.equal(await page.locator('#run-controls [data-job-action="resume"]').count(), 0);
     assert.match(await page.locator('#run-controls').innerText(), /改为手动暂停/);
     manual = true; await page.reload();

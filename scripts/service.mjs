@@ -96,7 +96,7 @@ export function windowsTaskXml(launcher, sid) {
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
 <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${esc(sid)}</UserId></LogonTrigger></Triggers>
 <Principals><Principal id="Author"><UserId>${esc(sid)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
-<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
+<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
 <Actions Context="Author"><Exec><Command>${esc(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe'))}</Command><Arguments>${esc('"' + launcher + '"')}</Arguments><WorkingDirectory>${esc(root)}</WorkingDirectory></Exec></Actions>
 </Task>`;
 }
@@ -235,6 +235,13 @@ function status() {
   console.log(fs.existsSync(macPlistPath()) ? '已安装：' + macPlistPath() : '未安装');
 }
 
+// launchctl 在服务没有加载到当前 GUI 会话时返回 113 并提示找不到服务。
+// 更新后、重新登录或服务曾被手动启动过都会出现这种情况。
+function launchAgentMissing(error) {
+  const text = `${error?.stderr || ''} ${error?.stdout || ''} ${error?.message || ''}`;
+  return Number(error?.status) === 113 || /Could not find service|not find service/i.test(text);
+}
+
 export async function main() {
   if (action === 'install') await install();
   else if (action === 'uninstall') await uninstall();
@@ -245,7 +252,15 @@ export async function main() {
     const previous = process.platform === 'win32' ? await stopWindows() : await assertIdle();
     if (process.platform === 'darwin') {
       const domain = `gui/${process.getuid()}`;
-      execFileSync('/bin/launchctl', ['kickstart', '-k', `${domain}/${label}`]);
+      try {
+        execFileSync('/bin/launchctl', ['kickstart', '-k', `${domain}/${label}`]);
+      } catch (error) {
+        if (!launchAgentMissing(error)) throw error;
+        // 自动更新不能把应用留在停止状态：服务没有加载时按安装流程
+        // 重新写入并 bootstrap 登录自启项，再等待健康检查通过。
+        await install();
+        return;
+      }
     } else if (process.platform === 'win32') {
       windowsLauncher();
       startWindowsRunner();

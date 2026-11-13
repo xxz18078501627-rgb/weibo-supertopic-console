@@ -413,6 +413,15 @@ export class VerificationWorkflow {
     if (!row || !action || action.state !== 'succeeded') return false;
     const card = this.card(jobId, row.round_index, row.identity);
     if (!card || card.verification_result === 'passed') return false;
+    // A deferred check-in is a pending verification. A comment/post receipt
+    // only proves that unrelated action worked; it must not clear the check-in
+    // card or claim that the user completed verification.
+    const pendingCheckin = db.prepare(`SELECT COUNT(*) n FROM task_step_state s
+      LEFT JOIN action_logs a ON a.job_id=s.job_id AND a.step_key=s.step_key
+      WHERE s.job_id=? AND s.round_index=? AND s.identity=? AND s.kind='checkin'
+        AND s.ever_verification=1 AND s.state IN ('deferred','running','review','network_review')
+        AND COALESCE(a.state,'') NOT IN ('succeeded','failed','skipped','cancelled')`).get(jobId, row.round_index, row.identity).n;
+    if (pendingCheckin) return false;
     const otherPending = db.prepare(`SELECT COUNT(*) n FROM task_step_state s
       JOIN action_logs a ON a.job_id=s.job_id AND a.step_key=s.step_key
       WHERE s.job_id=? AND s.round_index=? AND s.identity=? AND s.step_key<>?
@@ -474,6 +483,7 @@ export class VerificationWorkflow {
     db.exec('BEGIN IMMEDIATE');
     try {
     const job = getJob(jobId), row = this.row(jobId, step);
+    if (job.status === 'stopped') { db.exec('COMMIT'); return; }
     const action = getStepAction(jobId, stepKey(step));
     if (['post','original','comment','repost','like','comment_like'].includes(step.kind) && action?.state === 'succeeded') {
       db.prepare("UPDATE task_step_state SET state='done',outcome='succeeded' WHERE job_id=? AND step_key=?").run(jobId, stepKey(step));
@@ -552,6 +562,11 @@ export class VerificationWorkflow {
         VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id,round_index,identity) DO UPDATE SET status='pending',reason=excluded.reason,source=excluded.source,updated_at=excluded.updated_at,
         blocked_kinds_json=excluded.blocked_kinds_json,attempts=verification_cards.attempts+1`)
         .run(jobId, step.round, row.identity, step.accountId, 'pending', JSON.stringify(blocked), reason, 'checkin_unconfirmed', this.time(), this.time());
+      // A deferred check-in is still waiting for verification even though it
+      // has no receipt. Keep the action flag in sync so later successful
+      // actions cannot mistake the card for a cleared challenge.
+      const action = getStepAction(jobId, stepKey(step));
+      if (action && action.state !== 'succeeded') updateActionLog(action.id, { verificationPending: true });
       this.setCursor(jobId, { workflowPriority: { identity: row.identity, topicId: step.topicId }, notice: '签到结果未确认，已登记为待验证账号' });
       if (alreadyVerified) {
         db.prepare("UPDATE verification_cards SET status='ready',verification_result='passed',verified_at=?,checkin_result='pending',reason=? WHERE job_id=? AND round_index=? AND identity=?").run(prior.verified_at, '安全验证已通过；签到结果尚未确认，可继续补做', jobId, step.round, row.identity);
@@ -807,6 +822,7 @@ export class VerificationWorkflow {
       if (!job || ['stopped', 'completed'].includes(job.status)) return;
       if (job.stopRequested) { this.finalizeStop(jobId, '已手动停止'); return; }
       if (job.status === 'paused') return;
+      job = this.repairMisclassifiedCheckinCards(job);
       if (job.cursor.manualVerification && !this.session) {
         this.recoverOrphanedManual(job);
         return;
@@ -980,34 +996,104 @@ export class VerificationWorkflow {
     return restored;
   }
 
+  // Before this fix, a successful comment could flip a check-in card to
+  // "passed" via action_receipt even though the check-in itself was still
+  // deferred. Restore those cards so the account can be handled again.
+  repairMisclassifiedCheckinCards(job) {
+    if (!this.enabled(job) || ['completed', 'stopped'].includes(job.status)
+      || this.session || job.cursor?.manualVerification) return job;
+    const round = Number(job.cursor.workflowRound || 0);
+    const rows = db.prepare(`SELECT c.identity,c.round_index,s.step_key,a.id action_id
+      FROM verification_cards c
+      JOIN task_step_state s ON s.job_id=c.job_id AND s.round_index=c.round_index AND s.identity=c.identity
+      JOIN action_logs a ON a.job_id=s.job_id AND a.step_key=s.step_key
+      WHERE c.job_id=? AND c.round_index=? AND c.verification_result='passed'
+        AND c.source='action_receipt' AND c.checkin_result<>'succeeded'
+        AND s.kind='checkin' AND s.state='deferred' AND a.state='uncertain'`).all(job.id, round);
+    if (!rows.length) return job;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of rows) {
+        updateActionLog(row.action_id, { verificationPending: true });
+        db.prepare(`UPDATE verification_cards SET status='pending',verification_result='pending',
+          verified_at=NULL,source='checkin_unconfirmed',checkin_result='unknown',reason=?,updated_at=?
+          WHERE job_id=? AND round_index=? AND identity=?`).run(
+          '签到结果未确认，请重新验证并补做签到', this.time(), job.id, row.round_index, row.identity);
+      }
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+    log('info', `已恢复 ${rows.length} 张被其他动作误判通过的签到验证卡`, { jobId: job.id });
+    return getJob(job.id);
+  }
+
   status(job) {
     job = this.recoverOrphanedManual(job);
     if (!this.enabled(job)) return null;
     job = this.repairManualUnconfirmed(job);
     job = this.repairMisclassifiedManualPosts(job);
     job = this.repairTransientPostSetupFailures(job);
+    job = this.repairMisclassifiedCheckinCards(job);
     this.reconcileSucceededVerificationActions(job.id);
     const round = Math.min(Number(job.cursor.workflowRound || 0), Math.max(0, Number(job.config.rounds || 1) - 1));
-    const cards = db.prepare('SELECT * FROM verification_cards WHERE job_id=? AND round_index=? ORDER BY triggered_at').all(job.id, round).map(card => {
-      const account = job.config.accountIdentities?.[card.account_id] || getAccount(card.account_id) || {};
-      const allIdentityRows = this.rows(job.id, round).filter(row => row.identity === card.identity);
+    const cardRows = db.prepare('SELECT * FROM verification_cards WHERE job_id=? AND round_index=? ORDER BY triggered_at').all(job.id, round);
+    const allRows = this.rows(job.id, round);
+    const rowsByIdentity = new Map();
+    for (const row of allRows) {
+      if (!rowsByIdentity.has(row.identity)) rowsByIdentity.set(row.identity, []);
+      rowsByIdentity.get(row.identity).push(row);
+    }
+    const actionsByStep = new Map(db.prepare(`SELECT a.step_key,a.id,a.state,a.verification_pending,a.error
+      FROM action_logs a JOIN task_step_state s ON s.job_id=a.job_id AND s.step_key=a.step_key
+      WHERE s.job_id=? AND s.round_index=?`).all(job.id, round).map(action => [action.step_key, action]));
+    const accountById = new Map(db.prepare('SELECT id,name,nickname,uid FROM accounts').all().map(account => [account.id, account]));
+    const topicNames = new Map(listTopics().map(topic => [topic.id, topic.name]));
+    const cards = cardRows.map(card => {
+      const account = job.config.accountIdentities?.[card.account_id] || accountById.get(card.account_id) || {};
+      const allIdentityRows = rowsByIdentity.get(card.identity) || [];
       const identityRows = allIdentityRows.filter(row => !this.isCompanionRow(job, row));
+      const remainingStepCount = allIdentityRows.filter(row => ['deferred','running','pending','review','network_review'].includes(row.state)).length;
+      const visible = card.status !== 'resolved' && !(card.checkin_result === 'succeeded' && remainingStepCount === 0);
+      const base = { identity: card.identity, accountId: card.account_id,
+        name: account.name || account.nickname || card.account_id, uid: account.uid || '',
+        status: card.status, reason: card.reason, source: card.source || 'verification_detected',
+        attempts: card.attempts, verificationResult: card.verification_result, verifiedAt: card.verified_at,
+        triggeredAt: card.triggered_at, checkinResult: card.checkin_result,
+        remainingStepCount, remainingCheckins: 0, visible, steps: [],
+        currentStepKey: null, currentKind: null, currentActionable: false, canOpen: false };
+      // Workflow summaries omit step details for hidden workbench cards to
+      // keep polling cheap. Engage callers still consume the completed card's
+      // per-step outcomes, so preserve that established response shape.
+      if (!visible && job.config.kind !== 'engage') return base;
       const steps = identityRows.map(row => {
-        const action = getStepAction(job.id, row.step_key);
-        return { key: row.step_key, kind: row.kind, topicId: row.topic_id, topicName: job.config.topicIdentities?.[row.topic_id]?.name || listTopics().find(topic => topic.id === row.topic_id)?.name || row.topic_id,
+        const action = actionsByStep.get(row.step_key);
+        return { key: row.step_key, kind: row.kind, topicId: row.topic_id,
+          topicName: job.config.topicIdentities?.[row.topic_id]?.name || topicNames.get(row.topic_id) || row.topic_id,
           state: row.state, outcome: row.outcome, actionId: action?.id || null, needsReview: row.state === 'review',
           verificationPending: Boolean(action?.verification_pending), reason: action?.error || '' };
       });
-      const remainingStepCount = allIdentityRows.filter(row => ['deferred','running','pending','review','network_review'].includes(row.state)).length;
       const remainingCheckins = identityRows.filter(row => row.kind === 'checkin' && row.ever_verification && ['deferred','running','pending','review','network_review'].includes(row.state)).length;
-      const visible = card.status !== 'resolved' && !(card.checkin_result === 'succeeded' && remainingStepCount === 0);
-      const currentStep = this.manualRow(job.id, round, card.identity);
-      const currentActionable = Boolean(currentStep && (getStepAction(job.id, currentStep.step_key)?.verification_pending || ['review','network_review'].includes(currentStep.state) || getStepAction(job.id, currentStep.step_key)?.error === '用户确认未发布，允许补做'));
+      const candidates = identityRows.filter(row => row.ever_verification && ['deferred','review','network_review'].includes(row.state));
+      const awaiting = candidates.filter(row => actionsByStep.get(row.step_key)?.verification_pending);
+      const actionable = candidates.filter(row => actionsByStep.has(row.step_key));
+      const actionableRow = row => {
+        const action = actionsByStep.get(row.step_key);
+        return Boolean(action && ((row.kind === 'checkin' && action.state === 'uncertain')
+          || action.verification_pending || ['review','network_review'].includes(row.state)
+          || action.error === '用户确认未发布，允许补做'));
+      };
+      let currentStep = null;
+      if (this.runner.workbenchVerification(job)) {
+        const eligible = actionable.filter(actionableRow);
+        currentStep = awaiting[0] || eligible[0] || null;
+      } else currentStep = awaiting[0] || actionable[0] || candidates[0] || null;
+      const currentActionable = Boolean(currentStep && actionableRow(currentStep));
       // A grouped engage card may be opened while the mainline is running.
       // requestManual first moves the mainline to a safe paused state, so the
       // old "barrier only" gate would make mid-run verification impossible.
       const manualAvailable = !this.session && !job.cursor.manualVerification;
-      return { currentActionable, canOpen: currentActionable && manualAvailable, currentStepKey: currentStep?.step_key || null, currentKind: currentStep?.kind || null, identity: card.identity, accountId: card.account_id, name: account.name || account.nickname || card.account_id, uid: account.uid || '', status: card.status, reason: card.reason, source: card.source || 'verification_detected', attempts: card.attempts, verificationResult: card.verification_result, verifiedAt: card.verified_at, triggeredAt: card.triggered_at, checkinResult: card.checkin_result, remainingStepCount, remainingCheckins, visible, steps };
+      return { ...base, currentActionable, canOpen: currentActionable && manualAvailable,
+        currentStepKey: currentStep?.step_key || null, currentKind: currentStep?.kind || null,
+        remainingCheckins, steps };
     });
     return { jobId: job.id, round, jobStatus: job.status, cards, session: job.cursor.manualVerification || null, barrier: Boolean(job.cursor.verificationBarrier),
       mainlineBusy: Boolean(this.runner.promise || this.runner.currentExecution),
@@ -1137,6 +1223,7 @@ export class VerificationWorkflow {
     let job = getJob(jobId);
     if (!this.enabled(job) || ['completed', 'stopped'].includes(job.status)) throw conflict('当前任务不能进入验证');
     this.ensureSteps(job);
+    job = this.repairMisclassifiedCheckinCards(job);
     const card = this.card(jobId, Number(job.cursor.workflowRound || 0), identity);
     if (!card) throw conflict('找不到待验证账号');
     const row = this.manualRow(jobId, Number(job.cursor.workflowRound || 0), identity, requestedStepKey);
@@ -1970,6 +2057,11 @@ export class VerificationWorkflow {
   }
 
   continue(jobId) {
+    const pending = getJob(jobId);
+    // An explicit "继续运行" is a user retry, not a background submission.
+    // Clear a stale navigation wait first so assertMaySubmit does not turn the
+    // button into a 500.
+    if (pending && this.runner.navigation.waiting(pending)) this.runner.cancelNavigation(jobId, 'user_continue');
     this.runner.assertMaySubmit(jobId);
     const job = getJob(jobId), status = this.status(job);
     if (!status?.canContinue) throw conflict('请等待当前浏览器操作或验证会话结束');
@@ -1978,7 +2070,8 @@ export class VerificationWorkflow {
     for (const row of this.rows(jobId, round).filter(item => item.kind === 'checkin' && item.state === 'deferred')) {
       const action = getStepAction(jobId, row.step_key);
       if (this.card(jobId, round, row.identity)?.verification_result === 'passed' && ['uncertain','verification_wait'].includes(action?.state)) {
-        updateActionLog(action.id, { state: 'prepared', error: '用户点击继续运行，先读取签到状态后补做' });
+        updateActionLog(action.id, { state: 'prepared', submittedAt: null, completedAt: null,
+          verificationPending: true, error: '用户点击继续运行，先读取签到状态后补做' });
       }
     }
     const cards = db.prepare('SELECT identity,blocked_kinds_json,status,verification_result,verified_at FROM verification_cards WHERE job_id=? AND round_index=?').all(jobId, round);
@@ -2019,23 +2112,26 @@ export class VerificationWorkflow {
       this.session.cancelled = true; clearTimeout(this.session.timer); this.session.wake?.();
       void this.cleanupManualSession(this.session, reason, { rejectOpen: true });
     }
-    for (const row of db.prepare("SELECT * FROM task_step_state WHERE job_id=? AND state IN ('pending','running','deferred','network_review')").all(jobId)) {
+    for (const row of db.prepare("SELECT * FROM task_step_state WHERE job_id=? AND state IN ('pending','running','deferred','network_review','review')").all(jobId)) {
       const action = getStepAction(jobId, row.step_key);
       if (['succeeded','failed','skipped'].includes(action?.state)) {
         db.prepare("UPDATE task_step_state SET state='done',outcome=? WHERE job_id=? AND step_key=?").run(action.state, jobId, row.step_key);
-      } else if (['submitted','uncertain'].includes(action?.state)) {
-        updateActionLog(action.id, { state: 'uncertain', error: `${reason}，提交结果待核对` });
-        db.prepare("UPDATE task_step_state SET state='review',outcome='uncertain' WHERE job_id=? AND step_key=?").run(jobId, row.step_key);
-        this.runner.confirmSequence(jobId, stepFrom(row));
       } else {
-        if (action && !['succeeded','failed','skipped'].includes(action.state)) updateActionLog(action.id, { state: 'cancelled', error: reason });
-        this.runner.releaseSequence(jobId, stepFrom(row));
-        db.prepare("UPDATE task_step_state SET state='cancelled',outcome=NULL WHERE job_id=? AND step_key=?").run(jobId, row.step_key);
+        const submitted = Boolean(action?.submitted_at || ['submitted','uncertain'].includes(action?.state));
+        if (action) updateActionLog(action.id, { state: 'skipped', verificationPending: false,
+          error: `${reason}，剩余操作已跳过，不再执行浏览器复核` });
+        if (submitted) this.runner.confirmSequence(jobId, stepFrom(row));
+        else this.runner.releaseSequence(jobId, stepFrom(row));
+        db.prepare("UPDATE task_step_state SET state='done',outcome='skipped' WHERE job_id=? AND step_key=?").run(jobId, row.step_key);
       }
     }
+    db.prepare("UPDATE verification_cards SET status='resolved',reason=?,updated_at=? WHERE job_id=?")
+      .run(`${reason}，剩余操作已跳过`, this.time(), jobId);
     job = getJob(jobId);
-    const updated = updateJob(jobId, { status: 'stopped', stopRequested: true, pausedByUser: false, waitReason: null, metrics: this.metrics(jobId), cursor: { ...job.cursor, stopReason: reason, manualVerification: null, verificationBarrier: false, ...(job.cursor.dailyStop ? { dailyStop: { ...job.cursor.dailyStop, stoppedAt: this.time() } } : {}) } });
+    const updated = updateJob(jobId, { status: 'stopped', stopRequested: true, pausedByUser: false, waitReason: null, metrics: this.metrics(jobId), cursor: { ...job.cursor, stopReason: reason, manualVerification: null, verificationBarrier: false,
+      autoReadbacks: {}, networkRecovery: null, ...(job.cursor.dailyStop ? { dailyStop: { ...job.cursor.dailyStop, stoppedAt: this.time() } } : {}) } });
     for (const round of runningRounds(jobId)) finishRound(jobId, round, 'stopped');
+    this.runner.cancelAutoReadbacks?.(jobId);
     this.runner.emitUpdate(updated); void Promise.resolve(this.runner.adapter.cancelTask?.()).catch(() => {});
     return updated;
   }

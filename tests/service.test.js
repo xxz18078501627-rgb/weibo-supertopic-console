@@ -99,7 +99,7 @@ function checkLogs({ root, data }) {
 test('后台 runner 保留路径、端口和数据，分别写日志并传递退出码', async () => {
   const item = fixture();
   try {
-    assert.equal(await run(process.execPath, [path.join(item.root, 'scripts', 'service-runner.mjs'), '54321', item.data], { cwd: os.tmpdir() }), 7);
+    assert.equal(await run(process.execPath, [path.join(item.root, 'scripts', 'service-runner.mjs'), '54321', item.data], { cwd: os.tmpdir(), env: { ...process.env, WEIBO_CONSOLE_SUPERVISE: '0' } }), 7);
     checkLogs(item);
   } finally { fs.rmSync(item.base, { recursive: true, force: true }); }
 });
@@ -123,7 +123,7 @@ test('Windows 原生脚本宿主能启动中文与空格目录中的 runner 并�
   const item = fixture();
   try {
     const launcher = windowsLauncher({ directory: item.data, projectRoot: item.root, listenPort: 54321 });
-    assert.equal(await run('cscript.exe', ['//Nologo', launcher], { cwd: os.tmpdir() }), 7);
+    assert.equal(await run('cscript.exe', ['//Nologo', launcher], { cwd: os.tmpdir(), env: { ...process.env, WEIBO_CONSOLE_SUPERVISE: '0' } }), 7);
     checkLogs(item);
   } finally { fs.rmSync(item.base, { recursive: true, force: true }); }
 });

@@ -38,7 +38,9 @@ export function createVerificationUI({ getState, request, refresh, toast, panelI
     const offline = verificationKey === 'engageVerification' && state.engageNetwork?.state === 'offline';
     const blocked = state.dailyStop?.blocked || closed || offline;
     const pendingCards = verification.cards.some(card => card.visible !== false && (card.status === 'pending' || card.verificationResult !== 'passed'));
-    const continueReason = closed ? '任务已结束' : state.dailyStop?.blocked ? '已到每日截止时间' : offline ? '网络断开，等待恢复' : verification.session ? '请先结束当前验证会话' : !verification.canContinue ? '请等待当前浏览器操作结束' : pendingCards ? '先执行已验证账号和未受阻操作，其余账号继续等待验证' : '';
+    const jobForVerification = verificationKey === 'engageVerification' ? state.engageJob : state.activeJob;
+    const navWaiting = jobForVerification?.cursor?.navigationRecovery?.state === 'waiting';
+    const continueReason = closed ? '任务已结束' : state.dailyStop?.blocked ? '已到每日截止时间' : offline ? '网络断开，等待恢复' : verification.session ? '请先结束当前验证会话' : !verification.canContinue ? '请等待当前浏览器操作结束' : navWaiting ? '页面自检等待中，点击将立即重试' : pendingCards ? '先执行已验证账号和未受阻操作，其余账号继续等待验证' : '';
     const busy = Boolean(verification.session || opening);
     const scroller = panel.querySelector('.verify-rows');
     const previousScroll = scroller ? scroller.scrollTop : 0;

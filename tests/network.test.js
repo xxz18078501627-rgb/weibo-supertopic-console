@@ -257,7 +257,7 @@ test('进度按全部轮次和最终步骤计算，验证待核对和补做不�
   assert.equal(taskProgress(d.updateJob(job.id, { status: 'completed' })).percent, 100);
 });
 
-test('修改计划撤销未提交步骤后重算，停止不消除剩余分母，旧任务兼容游标', () => {
+test('修改计划撤销未提交步骤后重算，停止保留分母并把剩余步骤跳过，旧任务兼容游标', () => {
   const { job, runner } = fixture();
   const first = d.updateJob(job.id, { config: { ...job.config, actionPlan: [{ type: 'post', count: 4, intervalSeconds: 0 }] } });
   runner.workflow.ensureSteps(first);
@@ -268,7 +268,9 @@ test('修改计划撤销未提交步骤后重算，停止不消除剩余分母�
   assert.equal(taskProgress(d.getJob(job.id)).total, 2); assert.equal(taskProgress(d.getJob(job.id)).percent, 50);
   assert.equal(taskProgress(d.getJob(job.id)).planAdjusted, true);
   runner.workflow.finalizeStop(job.id, '测试停止');
-  assert.equal(taskProgress(d.getJob(job.id)).total, 2); assert.equal(taskProgress(d.getJob(job.id)).percent, 50);
+  assert.equal(taskProgress(d.getJob(job.id)).total, 2); assert.equal(taskProgress(d.getJob(job.id)).percent, 99.9);
+  assert.equal(runner.workflow.rows(job.id, 0).find(item => item.step_key === row.step_key).outcome, 'succeeded');
+  assert.equal(runner.workflow.rows(job.id, 0).filter(item => item.outcome === 'skipped').length, 1);
   const legacy = d.createJob({ ...first.config, schedulerVersion: 1 });
   d.updateJob(legacy.id, { cursor: { stepIndex: 1 } });
   assert.equal(taskProgress(d.getJob(legacy.id)).percent, 25);
