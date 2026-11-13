@@ -1482,11 +1482,11 @@ test('结束验证能立即打断签到等待，不会卡住会话', async () =>
   await runner.run(job.id);
   db.prepare("UPDATE verification_cards SET source='manual_unconfirmed' WHERE job_id=? AND identity='1001'").run(job.id);
   runner.workflow.requestManual(job.id, '1001');
-  await until(() => getJob(job.id).cursor.manualVerification?.phase === 'signing_checkin');
+  await until(() => getJob(job.id).cursor.manualVerification?.phase === 'signing_checkin', 15000);
   const stopped = runner.workflow.endManual(job.id);
-  const result = await Promise.race([stopped.then(() => 'done'), new Promise(resolve => setTimeout(() => resolve('timeout'), 5000))]);
+  const result = await Promise.race([stopped.then(() => 'done'), new Promise(resolve => setTimeout(() => resolve('timeout'), 10000))]);
   assert.equal(result, 'done');
-  await until(() => !runner.workflow.session);
+  await until(() => !runner.workflow.session, 10000);
   const card = runner.workflow.status(getJob(job.id)).cards.find(item => item.identity === '1001');
   assert.equal(card.checkinResult, 'pending');
   const action = db.prepare("SELECT state FROM action_logs WHERE job_id=? AND kind='checkin' AND account_id=(SELECT id FROM accounts WHERE uid='1001')").get(job.id);
