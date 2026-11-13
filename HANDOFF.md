@@ -267,7 +267,7 @@
 | 项 | 值 |
 | --- | --- |
 | 代码版本 | `1.1.4`（未发布，工作区） |
-| 服务 | 运行中，`http://localhost:4178`，v1.1.4，pid 49919，supervised=true，2026-11-14 00:26 启动 |
+| 服务 | 运行中，`http://localhost:4178`，v1.1.4，pid 51181，supervised=true，2026-11-14 00:34 启动 |
 | 启动方式 | launchd `com.local.weibo-super-topic-console`，`runs = 5`，`last exit code = 0` |
 | 代码 HEAD | `c7d711e docs: prepare the 1.1.4 release notes and handoff` |
 | 工作区 | 干净；仅 `license-server/`（独立云端签发服务）未跟踪 |
