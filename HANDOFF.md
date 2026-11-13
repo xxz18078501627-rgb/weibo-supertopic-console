@@ -13,7 +13,7 @@
 
 - 这是一个**只在本机运行**的微博多账号任务控制台：用 Chrome 自动完成超话签到、发帖、原创、评论，以及指定微博的转发/评论/点赞（转赞评）。
 - 入口是 <http://localhost:4178>，由 launchd 开机自启；Node 24 + Playwright + 本机 Chrome；数据在本机 SQLite 和 `data/profiles/`，不上传服务器。
-- 当前代码版本是 **v1.1.4**；1.1.3 之后的停止语义、签到卡误判、导航恢复、浏览器重开、服务重启和进程自愈改动仍在工作区，发布前不要对外说「已发布」。
+- 已发布 **v1.1.4**（tag `45fecb5`）：<https://github.com/xxz18078501627-rgb/weibo-supertopic-console/releases/tag/v1.1.4>。本机服务已加载该版本。
 - 真实账号数据、登录态、访问口令、激活码都在 `data/` 和 `~/Library/Application Support/ZhibingStudio/`，**只读、不外传、不打包**。
 - 改任务调度、适配器、回执、验证 UI 前，先读第 4 节的验证契约；测试必须用临时数据目录和模拟页面，不在真实账号上试发送。
 
@@ -269,7 +269,7 @@
 | 代码版本 | `1.1.4`（未发布，工作区） |
 | 服务 | 运行中，`http://localhost:4178`，v1.1.4，pid 51181，supervised=true，2026-11-14 00:34 启动 |
 | 启动方式 | launchd `com.local.weibo-super-topic-console`，`runs = 5`，`last exit code = 0` |
-| 代码 HEAD | `c7d711e docs: prepare the 1.1.4 release notes and handoff` |
+| 代码 HEAD | 发布后文档提交；发布 tag `v1.1.4` = `45fecb5` |
 | 工作区 | 干净；仅 `license-server/`（独立云端签发服务）未跟踪 |
 | 数据规模 | 95 个账号、154 个任务、21,891 条动作流水、1 个超话、1,042 张验证卡；库约 124 MB |
 | 运行中任务 | 当前无；昨晚任务已在 23:59 日停时停止 |
@@ -282,7 +282,8 @@
 - 浏览器定时重开：`settings.browser_recycle_v1`，默认 20 次/10 分钟，高级页可改。
 - 左侧栏“重启服务”：`POST /api/service/restart`；非零退出，launchd/监督器自动拉起，页面轮询健康后刷新。
 - `scripts/service-runner.mjs` 增加监督重启（1/5/15/60 秒）；server 增加未捕获异常/未处理拒绝处理，退出后由监督器拉起。
-- 全量 `npm test` 387 通过、1 跳过；`npm run test:e2e` 77 通过；代码提交 `6852f26`，文档提交 `c7d711e`，尚未推送/发版。
+- 全量 `npm test` 387 通过、1 跳过；`npm run test:e2e` 77 通过；已推送 main、打 tag `v1.1.4`，Release workflow 三平台打包并发布成功。
+- Release 资产：mac-arm64 / mac-x64 DMG、windows-x64 EXE、三平台 update.zip 与 manifest、通用 zip、Mac/Windows 教程。
 
 ### 未提交改动（2026-11-12，尚未发布）
 
