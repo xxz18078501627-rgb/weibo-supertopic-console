@@ -1,6 +1,6 @@
 # 制饼工坊 Mac 安装与更新
 
-适用版本：`v1.1.3`
+适用版本：`v1.1.4`
 
 软件只在本机运行，网页地址固定为 <http://localhost:4178>。安装不需要管理员权限。
 
@@ -12,8 +12,8 @@
 uname -m
 ```
 
-- 显示 `arm64`：下载 `weibo-console-1.1.3-mac-arm64.dmg`。
-- 显示 `x86_64`：下载 `weibo-console-1.1.3-mac-x64.dmg`。
+- 显示 `arm64`：下载 `weibo-console-1.1.4-mac-arm64.dmg`。
+- 显示 `x86_64`：下载 `weibo-console-1.1.4-mac-x64.dmg`。
 
 下载页：<https://github.com/xxz18078501627-rgb/weibo-supertopic-console/releases/latest>
 
@@ -42,7 +42,7 @@ uname -m
 3. 点击“检查更新”。
 4. 点击“下载更新”，等待下载和校验完成。
 5. 保持“更新后重启”开启，点击“更新并重启”。
-6. 页面重新打开后，再检查一次版本应为 `1.1.3`。
+6. 页面重新打开后，再检查一次版本应为 `1.1.4`。
 
 更新只替换程序，不会删除账号、文案、任务、记录、激活状态或微博登录目录。
 
@@ -51,7 +51,7 @@ uname -m
 把文件名换成实际下载的文件，在“终端”运行：
 
 ```bash
-shasum -a 256 weibo-console-1.1.3-mac-arm64.dmg
+shasum -a 256 weibo-console-1.1.4-mac-arm64.dmg
 ```
 
 结果与同平台 `.manifest.json` 中的 `installerSha256` 一致即可。校验不一致时不要安装，请重新下载。

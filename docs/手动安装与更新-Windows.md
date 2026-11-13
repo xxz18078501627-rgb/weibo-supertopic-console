@@ -1,6 +1,6 @@
 # 制饼工坊 Windows 安装与更新
 
-适用版本：`v1.1.3`，支持 Windows 10/11 x64。
+适用版本：`v1.1.4`，支持 Windows 10/11 x64。
 
 软件只在本机运行，网页地址固定为 <http://localhost:4178>。安装不需要管理员权限。
 
@@ -9,7 +9,7 @@
 下载：
 
 ```text
-weibo-console-1.1.3-windows-x64.exe
+weibo-console-1.1.4-windows-x64.exe
 ```
 
 下载页：<https://github.com/xxz18078501627-rgb/weibo-supertopic-console/releases/latest>
@@ -38,7 +38,7 @@ weibo-console-1.1.3-windows-x64.exe
 3. 点击“检查更新”。
 4. 点击“下载更新”，等待下载和校验完成。
 5. 保持“更新后重启”开启，点击“更新并重启”。
-6. 页面重新打开后，再检查一次版本应为 `1.1.3`。
+6. 页面重新打开后，再检查一次版本应为 `1.1.4`。
 
 更新只替换程序，不会删除账号、文案、任务、记录、激活状态或微博登录目录。
 
@@ -47,7 +47,7 @@ weibo-console-1.1.3-windows-x64.exe
 在安装包所在目录打开 PowerShell：
 
 ```powershell
-Get-FileHash .\weibo-console-1.1.3-windows-x64.exe -Algorithm SHA256
+Get-FileHash .\weibo-console-1.1.4-windows-x64.exe -Algorithm SHA256
 ```
 
 结果与同平台 `.manifest.json` 中的 `installerSha256` 一致即可。校验不一致时不要安装，请重新下载。
